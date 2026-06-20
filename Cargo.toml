@@ -1,0 +1,44 @@
+[package]
+name = "werk1112"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "werk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.98"
+axum = "0.8.4"
+crc32fast = "1.5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.142"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-stream = "0.1.17"
+candle-core = { version = "=0.9.2", default-features = false }
+candle-nn = { version = "=0.9.2", default-features = false }
+candle-transformers = { version = "=0.9.2", default-features = false }
+clap = { version = "4.5.28", features = ["derive", "env"] }
+indicatif = "0.17.11"
+tower = { version = "0.5.2", features = ["util"] }
+tokenizers = "0.21.4"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cudnn = ["candle-core/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+
+# Release backend bundles. CPU is always available. External backends such as
+# Vulkan/llama.cpp and MLX are discovered by the binary and do not require
+# Cargo features in this crate.
+release-windows = ["cuda"]
+release-linux = ["cuda"]
+release-macos-apple-silicon = ["metal"]
+release-macos-intel = ["metal"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
