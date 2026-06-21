@@ -323,6 +323,8 @@ fn generate_with_loaded_model(
         finish_reason,
         timings: GenerationTimings {
             load_seconds: 0.0,
+            warmup_seconds: 0.0,
+            first_token_seconds: 0.0,
             prompt_seconds,
             decode_seconds,
             total_seconds: tokenize_started.elapsed().as_secs_f64(),

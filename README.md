@@ -14,7 +14,7 @@ This is an early V1 skeleton:
 
 - Development builds are CPU-only by default.
 - CUDA, CUDNN, Metal, and MKL are opt-in Cargo features for source builds.
-- Release artifacts should bundle companion backends for their target OS; compiled GPU backends are enabled only by the target aliases that require that toolchain.
+- Release artifacts are one binary per target OS; the default Windows/Linux artifacts are CUDA-first because the current Rust llama.cpp binding cannot compile CUDA and Vulkan into the same binary.
 - `/v1/models` returns installed model manifests in an OpenAI-style model list.
 - `/v1/chat/completions` accepts OpenAI-style chat requests.
 - Streaming uses `text/event-stream` with `chat.completion.chunk` payloads and a final `data: [DONE]`.
@@ -23,14 +23,14 @@ This is an early V1 skeleton:
 - Local GGUF and safetensors model imports are copied into a managed model store.
 - Hugging Face pulls use `git clone` for now, so install `git` and `git-lfs` for real model repos.
 
-Current generation support includes Candle-native GGUF/safetensors paths plus external backend hooks. GGUF metadata is parsed and routed to Candle quantized loaders for supported architectures: `llama`, `qwen2`, `phi`, `phi2`, `phi3`, and `gemma3`. Safetensors HF-style directories are loaded through Candle for supported architectures: `llama`, `gemma`, `gemma2`, `qwen2`, `mistral`, and `phi3`. GGUF can also run through an external llama.cpp Vulkan backend. MLX model directories can run through an external `mlx-lm` backend.
+Current generation support uses in-process llama.cpp Rust bindings as the hot path for GGUF models, with Candle kept for safetensors and fallback GGUF execution. GGUF metadata is parsed for model storage and can still be loaded through Candle quantized loaders for supported architectures: `llama`, `qwen2`, `phi`, `phi2`, `phi3`, and `gemma3`. Safetensors HF-style directories are loaded through Candle for supported architectures: `llama`, `gemma`, `gemma2`, `qwen2`, `mistral`, and `phi3`. MLX model directories can run through an external `mlx-lm` backend.
 
 ## Format Support
 
 | Format | Typical Use | Import/List/Inspect | Backend Status |
 | --- | --- | --- | --- |
 | Safetensors | Hugging Face training/fine-tuning standard | Yes | Implemented through Candle for selected architectures including Llama |
-| GGUF | llama.cpp, Ollama, LM Studio, CPU inference | Yes | Implemented through Candle quantized loaders; also supported through external llama.cpp/Vulkan backend |
+| GGUF | llama.cpp, Ollama, LM Studio, CPU inference | Yes | Primary path is in-process llama.cpp; Candle remains available as fallback for supported architectures |
 | PyTorch (`.pt`, `.pth`, `pytorch_model.bin`) | Training, research, checkpoints | Yes | Backend pending |
 | ONNX (`.onnx`) | Framework-independent inference | Yes | ONNX Runtime backend pending |
 | MLX (`.npz`, MLX-style dirs) | Apple Silicon / MLX-LM | Yes | Implemented through external `mlx-lm` backend when configured |
@@ -80,8 +80,8 @@ Release backend bundles:
 
 | Bundle | Compiled backend support | Companion backend support |
 | --- | --- | --- |
-| `release-windows` | CPU, CUDA | AMD/Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
-| `release-linux` | CPU, CUDA | Vulkan via bundled/discoverable `llama-cli`; VLM through a capable external backend |
+| `release-windows` | CPU, CUDA | GGUF via in-process llama.cpp; VLM through a capable backend integration |
+| `release-linux` | CPU, CUDA | GGUF via in-process llama.cpp; VLM through a capable backend integration |
 | `release-macos-apple-silicon` | CPU | MLX via `mlx-lm`; VLM through a capable external backend |
 
 Raw Cargo equivalents:
@@ -92,7 +92,7 @@ cargo build --release --locked --target x86_64-unknown-linux-gnu --features rele
 cargo build --release --locked --target aarch64-apple-darwin --features release-macos-apple-silicon
 ```
 
-Windows and Linux release builds compile Candle CUDA, so they require a working NVIDIA driver and CUDA toolkit on the build machine. If `cargo build-windows` fails with ``nvcc --version` failed` / `program not found`, the CUDA toolkit is not on `PATH` in that PowerShell session. If a CUDA build fails with `fatal error: cuda_fp8.h: No such file or directory`, the active CUDA toolkit is too old or the wrong `nvcc` is first in `PATH`. Candle CUDA kernels may require headers that are not present in CUDA 11.x. Point the build at a newer installed toolkit:
+Windows and Linux release builds compile llama.cpp CUDA, so they require a working NVIDIA driver, CUDA toolkit, C/C++ toolchain, and libclang on the build machine. If `cargo build-windows` fails with ``nvcc --version` failed` / `program not found`, the CUDA toolkit is not on `PATH` in that PowerShell session. On Windows with CUDA 13.x, CCCL can fail with `MSVC/cl.exe with traditional preprocessor is used`; the native Windows setup below passes `/Zc:preprocessor` to MSVC through the `CL` environment variable. Point the build at the intended installed toolkit:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.0
@@ -113,7 +113,7 @@ export CUDA_COMPUTE_CAP=86
 cargo build-linux
 ```
 
-For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. For the portable CPU/Vulkan-capable binary:
+For a local install, use the same rule. `--locked` keeps the checked-in dependency graph, and `--force` replaces an existing `werk` install. For the portable CPU-only development binary:
 
 ```bash
 cargo install --path . --locked --force
@@ -122,6 +122,9 @@ cargo install --path . --locked --force
 For a CUDA-enabled local install, make sure the newer CUDA toolkit is first:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y clang libclang-dev
+
 export CUDA_HOME=/usr/local/cuda-13.0
 export CUDA_ROOT=/usr/local/cuda-13.0
 export CUDA_PATH=/usr/local/cuda-13.0
@@ -132,12 +135,22 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 cargo install --path . --locked --force --features cuda
 ```
 
-Native Windows CUDA / PowerShell:
+If you are building inside WSL with Ubuntu's CUDA 11.5 package, `nvcc` may fail inside `llama_cpp_sys` with errors from `/usr/include/c++/11/bits/std_function.h`. That means CUDA 11.5 is using GCC 11 as the host compiler. The repository Cargo config defaults Linux CUDA builds to GCC/G++ 10, so install those once:
+
+```bash
+sudo apt-get install -y gcc-10 g++-10
+
+cargo install --path . --locked --force --features cuda
+```
+
+To override that default, set `CC_x86_64_unknown_linux_gnu` or `CXX_x86_64_unknown_linux_gnu` in your shell before running Cargo.
+
+Native Windows CUDA / Developer PowerShell:
 
 1. Install Rust for Windows with `rustup`.
-2. Install Visual Studio Build Tools with the C++ build tools.
-3. Install Git, Git LFS, and a Windows CUDA Toolkit new enough to provide `cuda_fp8.h`.
-4. Open native Windows PowerShell, not a WSL shell.
+2. Install Visual Studio Build Tools with the `Desktop development with C++` workload.
+3. Install Git, Git LFS, LLVM/libclang, and a Windows CUDA Toolkit.
+4. Open native Windows Developer PowerShell, not a WSL shell.
 5. Build from a Windows filesystem path such as `C:\dev\werk1112`, not from `\\wsl$\...`.
 
 If `rustup default stable-x86_64-pc-windows-msvc` says the toolchain may not be able to run on this system, the command is being run from WSL/Linux. Close that shell and run the Windows release build from PowerShell on Windows.
@@ -161,13 +174,43 @@ rustup default stable-x86_64-pc-windows-msvc
 git lfs install
 nvidia-smi
 
-$env:CUDA_HOME = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0"
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+$vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsInstall) {
+  throw "Visual Studio C++ build tools not found. Install Visual Studio Build Tools with Desktop development with C++."
+}
+
+Import-Module (Join-Path $vsInstall "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+
+$cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+$env:CUDA_HOME = Get-ChildItem $cudaRoot -Directory |
+  Sort-Object Name -Descending |
+  Select-Object -First 1 -ExpandProperty FullName
+
+if (-not $env:CUDA_HOME) {
+  throw "CUDA Toolkit not found under $cudaRoot. Install the CUDA Toolkit, not only the NVIDIA driver."
+}
+
 $env:CUDA_ROOT = $env:CUDA_HOME
 $env:CUDA_PATH = $env:CUDA_HOME
 $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_HOME
 $env:CUDA_COMPUTE_CAP = "86"
 $env:Path = "$env:CUDA_HOME\bin;$env:Path"
+$env:CL = "/Zc:preprocessor"
 
+if (-not (Test-Path "$env:CUDA_HOME\bin\nvcc.exe")) {
+  throw "nvcc.exe not found in $env:CUDA_HOME\bin. Check the CUDA Toolkit installation."
+}
+
+where.exe cl
+$clPath = (Get-Command cl.exe).Source
+if ($clPath -notmatch "\\Hostx64\\x64\\cl\.exe$") {
+  throw "MSVC is not in x64 mode. Re-run Enter-VsDevShell with -arch=x64 -host_arch=x64, or open the x64 Native Tools shell."
+}
+$env:NVCC_CCBIN = Split-Path $clPath
+cl
+where.exe nvcc
 nvcc --version
 cargo build-windows
 ```
@@ -180,16 +223,18 @@ target/x86_64-unknown-linux-gnu/release/werk
 target/aarch64-apple-darwin/release/werk
 ```
 
-External backends must be shipped in the artifact or discoverable when selected. For example, the Vulkan backend uses a `llama-cli` binary beside `werk` or the path in `WERK_LLAMA_CLI`. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
+Runtime backend setup should be a black box for end users. GGUF execution is compiled into `werk` through the Rust `llama_cpp` binding, so there is no separate llama-server process, no Node tooling, and no first-run backend provisioning. Source builds still need the native toolchain required by llama.cpp: libclang, a C/C++ compiler, and `nvcc` for CUDA builds. `llama_cpp_sys` cannot compile CUDA and Vulkan into the same binary, so the release aliases build the CUDA artifact; Vulkan remains available for custom non-CUDA builds with `--features vulkan`. `WERK_LLAMA_CTX`, `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH`, and `WERK_LLAMA_MAIN_GPU` are advanced tuning overrides. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
 
 Additional low-level acceleration features are available for custom builds:
 
 ```bash
-cargo build --release --locked --features cuda,cudnn
 cargo build --release --locked --features mkl
+cargo build --release --locked --features cuda,candle-cuda,cudnn
 ```
 
-Build features decide what Candle acceleration support is compiled into the binary. Backend selection is a separate CLI option and is the preferred way to choose how a process runs:
+The `candle-cuda` and `cudnn` features are only for Candle experiments and non-GGUF CUDA fallback. They compile Candle CUDA kernels and may require CUDA headers such as `cuda_fp8.h`, which are not present in Ubuntu's CUDA 11.5 package. Normal GGUF CUDA builds should use only `--features cuda`.
+
+Build features decide what Candle and llama.cpp acceleration support is compiled into the binary. Backend selection is a separate CLI option and is the preferred way to choose how a process runs:
 
 ```bash
 werk --backend auto chat gemma-2b-it
@@ -201,22 +246,22 @@ werk --backend mlx chat mlx-model
 werk --backend cuda serve --model gemma-2b-it
 ```
 
-`--backend auto` uses the target default order: Windows tries CUDA first, Linux tries CPU first, and macOS Apple Silicon tries MLX first. If that backend is unavailable, it falls back through the other target backends.
+`--backend auto` uses the target default order: Windows and Linux try llama.cpp CUDA, llama.cpp Vulkan, llama.cpp CPU, Candle CUDA if compiled, then Candle CPU for GGUF; macOS Apple Silicon tries MLX first. If a backend is unavailable, it falls back through the other target backends.
 
-`--backend cuda` and `--backend metal` use Candle devices and require binaries built with the matching Cargo features. `--backend mlx` and `--backend vulkan` are backend choices, not Candle devices. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
+For GGUF models, `--backend cuda`, `--backend vulkan`, and `--backend cpu` use the in-process llama.cpp backend when it is compiled into the binary. For non-GGUF models, `--backend cuda` uses Candle CUDA only when the `candle-cuda` feature is compiled; otherwise it falls back to Candle CPU. `--backend metal` remains Candle-only. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
 ## End-User Releases
 
-Release artifacts should be produced with the target Cargo alias on the target platform. A complete artifact is the Cargo-built `werk` binary plus the companion backend files for that platform, such as `llama-cli` for Vulkan or an MLX environment for Apple Silicon. End users should not need Rust, Cargo, Visual Studio, or `nvcc`; those are build-machine requirements only.
+Release artifacts should be produced with the target Cargo alias on the target platform. A complete GGUF artifact is the Cargo-built `werk` binary; llama.cpp is linked into that binary through Rust. End users should not need Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`; those are build-machine/source-install requirements only.
 
-Do not ship one artifact per backend. Ship one artifact per target platform that can run all supported backends for that target, then let the user choose with `--backend`.
+Do not ship one artifact per backend unless a backend cannot be co-compiled. The current Windows/Linux release artifact is CUDA-first; Vulkan requires a separate custom non-CUDA build because `llama_cpp_sys` rejects CUDA and Vulkan in the same binary.
 
 Each target artifact should include the supported backends for that build, and users can select one explicitly with `--backend`:
 
 | Platform | Cargo command | Included backend support | Auto default |
 | --- | --- | --- | --- |
-| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA, AMD/Vulkan via llama.cpp | CUDA |
-| Linux x64 | `cargo build-linux` | CPU, CUDA, Vulkan via llama.cpp | CPU |
+| Windows 10/11 x64 | `cargo build-windows` | CPU, CUDA via in-process llama.cpp | llama.cpp CUDA |
+| Linux x64 | `cargo build-linux` | CPU, CUDA via in-process llama.cpp | llama.cpp CUDA |
 | macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
 
 Backend selection is per process. There is no persisted setup step.
@@ -230,9 +275,9 @@ werk --backend metal chat model-id
 werk --backend cpu chat model-id
 ```
 
-`auto` prefers the platform default: Windows uses CUDA first, Linux uses CPU first, and macOS Apple Silicon uses MLX first. If the preferred backend is unavailable, `auto` falls back through the target's other supported backends.
+`auto` prefers the platform default: Windows and Linux use llama.cpp CUDA first for GGUF, then Vulkan, CPU, and Candle fallbacks. macOS Apple Silicon uses MLX first. If the preferred backend is unavailable, `auto` falls back through the target's other supported backends.
 
-MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. Vulkan is implemented as an external llama.cpp backend for GGUF models. Release artifacts should bundle the external backend pieces they need. During development, `WERK_LLAMA_CLI` can point to a specific llama.cpp binary, and `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
+MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through in-process llama.cpp bindings, but CUDA and Vulkan are separate build modes. There is no managed llama.cpp checkout/build under `WERK_HOME`; source builds compile llama.cpp through Cargo. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 
 VLM support means multimodal model/request support, not a separate backend. VLM-capable models should be routed through a backend that supports image inputs, such as llama.cpp multimodal GGUF builds or MLX VLM backends as those integrations are wired.
 
@@ -480,7 +525,6 @@ Text deltas are intentionally chunked. They are not one event per token.
 
 - Extend safetensors execution coverage beyond `gemma`, `gemma2`, `qwen2`, `mistral`, and `phi3`.
 - Add richer chat template support from tokenizer/model metadata.
-- Add more GGUF architectures as Candle support allows.
+- Keep improving GGUF performance through in-process llama.cpp defaults and runtime tuning.
 - Add backends for ONNX Runtime, MLX, TensorRT, OpenVINO, TensorFlow, CoreML, and direct PyTorch checkpoint execution/conversion.
-- Add optional llama.cpp backend behind the existing backend trait if broad GGUF compatibility becomes more important than Rust-only execution.
 - Add embeddings and tool-call response support after the chat/models baseline is stable.

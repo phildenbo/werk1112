@@ -295,6 +295,8 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 timings: GenerationTimings {
                     load_seconds: 0.0,
+                    warmup_seconds: 0.0,
+                    first_token_seconds: 0.0,
                     prompt_seconds: 0.01,
                     decode_seconds: 0.01,
                     total_seconds: 0.02,
@@ -315,6 +317,8 @@ mod tests {
                     completion_tokens: 1,
                     timings: GenerationTimings {
                         load_seconds: 0.0,
+                        warmup_seconds: 0.0,
+                        first_token_seconds: 0.0,
                         prompt_seconds: 0.01,
                         decode_seconds: 0.01,
                         total_seconds: 0.02,

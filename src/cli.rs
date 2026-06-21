@@ -1,21 +1,24 @@
 use anyhow::{Result, anyhow, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_stream::StreamExt;
 
 use crate::{
     api::{ApiState, serve},
     backend::{
-        CandleBackend, CandleDeviceMode, GenerateRequest, GenerateStreamEvent, GenerationBackend,
-        GenerationTimings, LlamaCppBackend, MlxBackend, StreamGranularity, probe_device,
+        CandleBackend, CandleDeviceMode, ChatGenerationSession, GenerateRequest,
+        GenerateStreamEvent, GenerationBackend, GenerationTimings, LlamaCppBackend, LlamaCppMode,
+        LlamaFastBackend, LlamaFastRuntimeReport, LlamaKvCacheType, LlamaRuntimeOptions,
+        MlxBackend, StreamGranularity, probe_device,
     },
     banner::print_banner,
     model_store::{ModelFormat, ModelManifest, ModelStore, PullProgress},
@@ -51,9 +54,12 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, metal, mlx, or vulkan"
+        help = "Backend for this process: auto, cpu, cuda, llama-highlevel, metal, mlx, or vulkan"
     )]
     pub backend: BackendArg,
+
+    #[command(flatten)]
+    pub llama: LlamaRuntimeArgs,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -78,9 +84,149 @@ pub enum BackendArg {
     Auto,
     Cpu,
     Cuda,
+    LlamaHighlevel,
     Metal,
     Mlx,
     Vulkan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KvCacheTypeArg {
+    F16,
+    F32,
+    Q8_0,
+}
+
+impl From<KvCacheTypeArg> for LlamaKvCacheType {
+    fn from(value: KvCacheTypeArg) -> Self {
+        match value {
+            KvCacheTypeArg::F16 => Self::F16,
+            KvCacheTypeArg::F32 => Self::F32,
+            KvCacheTypeArg::Q8_0 => Self::Q8_0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args, Default)]
+pub struct LlamaRuntimeArgs {
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_CTX",
+        help = "llama.cpp context size; 0 uses the model default"
+    )]
+    pub ctx_size: Option<usize>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_BATCH",
+        help = "llama.cpp logical prompt batch size"
+    )]
+    pub batch_size: Option<usize>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_UBATCH",
+        help = "llama.cpp physical compute micro-batch size"
+    )]
+    pub ubatch_size: Option<u32>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_GPU_LAYERS",
+        help = "llama.cpp GPU layers; high values mean all layers"
+    )]
+    pub gpu_layers: Option<i32>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_MAIN_GPU",
+        help = "llama.cpp main GPU index"
+    )]
+    pub main_gpu: Option<i32>,
+
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "WERK_LLAMA_KV_CACHE_TYPE",
+        help = "llama.cpp KV cache type: f16, f32, or q8-0"
+    )]
+    pub kv_cache_type: Option<KvCacheTypeArg>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_FLASH_ATTN",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool),
+        help = "Request llama.cpp flash attention when the native runtime exposes it"
+    )]
+    pub flash_attn: Option<bool>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_KV_OFFLOAD",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool),
+        help = "Control llama.cpp K/Q/V and KV-cache GPU offload"
+    )]
+    pub kv_offload: Option<bool>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_WARMUP_TOKENS",
+        help = "Synthetic tokens decoded when creating a llama.cpp context; 0 disables prewarm"
+    )]
+    pub warmup_tokens: Option<usize>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_THREADS",
+        help = "llama.cpp generation CPU helper threads"
+    )]
+    pub threads: Option<u32>,
+
+    #[arg(
+        long,
+        global = true,
+        env = "WERK_LLAMA_THREADS_BATCH",
+        help = "llama.cpp prompt-eval CPU helper threads"
+    )]
+    pub threads_batch: Option<u32>,
+}
+
+impl LlamaRuntimeArgs {
+    fn to_options(&self) -> LlamaRuntimeOptions {
+        LlamaRuntimeOptions {
+            ctx_size: self.ctx_size,
+            batch_size: self.batch_size,
+            ubatch_size: self.ubatch_size,
+            gpu_layers: self.gpu_layers,
+            main_gpu: self.main_gpu,
+            kv_cache_type: self.kv_cache_type.map(Into::into),
+            flash_attn: self.flash_attn,
+            kv_offload: self.kv_offload,
+            warmup_tokens: self.warmup_tokens,
+            threads: self.threads,
+            threads_batch: self.threads_batch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+pub enum BenchCompareArg {
+    None,
+    Legacy,
 }
 
 impl From<StreamGranularityArg> for StreamGranularity {
@@ -188,6 +334,57 @@ pub enum Commands {
         verbose: bool,
     },
 
+    #[command(about = "Benchmark an installed model backend")]
+    Bench {
+        #[arg(help = "Installed model id")]
+        model: String,
+
+        #[arg(long, help = "Prompt text for the benchmark")]
+        prompt: String,
+
+        #[arg(
+            long,
+            alias = "tokens",
+            default_value_t = 256,
+            help = "Maximum generated tokens per run"
+        )]
+        max_tokens: usize,
+
+        #[arg(long, default_value_t = 5, help = "Measured runs")]
+        runs: usize,
+
+        #[arg(long, default_value_t = 1, help = "Warmup runs before measurement")]
+        warmups: usize,
+
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            help = "Benchmark sampling temperature; 0 uses greedy decoding"
+        )]
+        temperature: f64,
+
+        #[arg(long, help = "Benchmark nucleus sampling top-p")]
+        top_p: Option<f64>,
+
+        #[arg(long, default_value_t = 42, help = "Benchmark RNG seed")]
+        seed: u64,
+
+        #[arg(long, value_enum, default_value_t = BenchCompareArg::None, help = "Also benchmark another backend family")]
+        compare: BenchCompareArg,
+
+        #[arg(long, help = "Print resolved llama.cpp runtime settings")]
+        print_native_info: bool,
+
+        #[arg(long, help = "Print machine-readable benchmark JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Inspect Werk runtime diagnostics")]
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommands,
+    },
+
     #[command(about = "Copy a local model file or directory into the managed model store")]
     Import {
         #[arg(help = "Model file or directory to copy")]
@@ -231,6 +428,15 @@ pub enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum DoctorCommands {
+    #[command(about = "Print llama.cpp performance/runtime diagnostics for an installed model")]
+    Perf {
+        #[arg(help = "Installed model id")]
+        model: String,
+    },
+}
+
 pub async fn run_from_env() -> Result<()> {
     run(Cli::parse()).await
 }
@@ -239,6 +445,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let model_home = cli.model_home;
     let device_override = cli.device;
     let backend_override = cli.backend;
+    let llama_options = cli.llama.to_options();
     let command = cli.command.unwrap_or(Commands::Serve {
         host: "127.0.0.1".to_string(),
         port: 11434,
@@ -254,13 +461,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
-            if let Some(model) = model.as_deref() {
-                store.get(&model)?;
-                println!("Default model available: {model}");
-            }
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
-            let backend = build_generation_backend(store.clone(), backend_choice)?;
+            let backend =
+                build_generation_backend(store.clone(), backend_choice, llama_options.clone())?;
+            if let Some(model) = model.as_deref() {
+                let manifest = store.get(model)?;
+                backend.prepare(&manifest)?;
+                println!("Default model available: {model}");
+            }
             serve(
                 addr,
                 ApiState::new_with_default_model(store, backend, model),
@@ -281,7 +490,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
-            let backend = build_generation_backend(store, backend_choice)?;
+            let backend = build_generation_backend(store, backend_choice, llama_options.clone())?;
             let prompt = messages_to_prompt_for_model(
                 &manifest,
                 &[ChatMessage {
@@ -327,7 +536,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let store = ModelStore::resolve(model_home)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let manifest = store.get(&model)?;
-            let backend = build_generation_backend(store, backend_choice)?;
+            let backend = build_generation_backend(store, backend_choice, llama_options.clone())?;
             chat_loop(
                 backend,
                 manifest,
@@ -341,6 +550,51 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Bench {
+            model,
+            prompt,
+            max_tokens,
+            runs,
+            warmups,
+            temperature,
+            top_p,
+            seed,
+            compare,
+            print_native_info,
+            json,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            let backend_choice = resolve_backend(backend_override, device_override)?;
+            let manifest = store.get(&model)?;
+            let report = bench_model(
+                store,
+                manifest,
+                backend_choice,
+                llama_options.clone(),
+                prompt,
+                max_tokens,
+                runs,
+                warmups,
+                temperature,
+                top_p,
+                seed,
+                compare,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_bench_report(&report, print_native_info);
+            }
+            Ok(())
+        }
+        Commands::Doctor { command } => match command {
+            DoctorCommands::Perf { model } => {
+                let store = ModelStore::resolve(model_home)?;
+                let backend_choice = resolve_backend(backend_override, device_override)?;
+                let manifest = store.get(&model)?;
+                print_perf_doctor(&store, &manifest, backend_choice, &llama_options)
+            }
+        },
         Commands::Import { path, name } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.import_path(&path, &name)?;
@@ -425,6 +679,8 @@ fn should_print_startup_banner_for(
         Commands::Chat { .. } => stdin_is_terminal,
         Commands::Import { .. }
         | Commands::Pull { .. }
+        | Commands::Bench { .. }
+        | Commands::Doctor { .. }
         | Commands::List
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
@@ -442,6 +698,11 @@ async fn chat_loop(
     stream_granularity: StreamGranularity,
     verbose: bool,
 ) -> Result<()> {
+    let chat_session = backend.start_chat_session(&manifest, seed)?;
+    if chat_session.is_none() {
+        backend.prepare(&manifest)?;
+    }
+
     println!(
         "Chatting with {}. Type /exit or /quit to stop.",
         manifest.id
@@ -492,12 +753,20 @@ async fn chat_loop(
         let mut prompt_tokens = 0usize;
         let mut completion_tokens = 0usize;
         let mut timings = None;
-        let mut stream = backend.generate_stream(manifest.clone(), request);
+        let mut last_flush = Instant::now();
+        let mut stream = if let Some(session) = chat_session.as_ref() {
+            session.generate_stream(request)
+        } else {
+            backend.generate_stream(manifest.clone(), request)
+        };
         while let Some(event) = stream.next().await {
             match event {
                 Ok(GenerateStreamEvent::TextChunk(chunk)) => {
                     print!("{chunk}");
-                    io::stdout().flush()?;
+                    if chunk.contains('\n') || last_flush.elapsed() >= Duration::from_millis(16) {
+                        io::stdout().flush()?;
+                        last_flush = Instant::now();
+                    }
                     assistant.push_str(&chunk);
                 }
                 Ok(GenerateStreamEvent::Done {
@@ -517,6 +786,7 @@ async fn chat_loop(
                 }
             }
         }
+        io::stdout().flush()?;
         println!();
         if verbose && let Some(timings) = timings {
             let mut stdout = io::stdout().lock();
@@ -534,6 +804,346 @@ async fn chat_loop(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct BenchReport {
+    model: String,
+    prompt: String,
+    max_tokens: usize,
+    warmups: usize,
+    runs: usize,
+    temperature: f64,
+    top_p: Option<f64>,
+    seed: u64,
+    compare: BenchCompareArg,
+    results: Vec<BenchBackendReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchBackendReport {
+    backend: &'static str,
+    runtime: Option<LlamaFastRuntimeReport>,
+    samples: Vec<BenchSample>,
+    median_eval_tokens_per_second: Option<f64>,
+    median_total_seconds: Option<f64>,
+    median_first_token_seconds: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchSample {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    load_seconds: f64,
+    warmup_seconds: f64,
+    first_token_seconds: f64,
+    total_seconds: f64,
+    prompt_seconds: f64,
+    decode_seconds: f64,
+    eval_tokens_per_second: f64,
+}
+
+fn bench_model(
+    store: ModelStore,
+    manifest: ModelManifest,
+    backend_choice: BackendChoice,
+    runtime_options: LlamaRuntimeOptions,
+    prompt: String,
+    max_tokens: usize,
+    runs: usize,
+    warmups: usize,
+    temperature: f64,
+    top_p: Option<f64>,
+    seed: u64,
+    compare: BenchCompareArg,
+) -> Result<BenchReport> {
+    if runs == 0 {
+        bail!("--runs must be greater than 0");
+    }
+
+    let prompt_spec = messages_to_prompt_for_model(
+        &manifest,
+        &[ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(prompt.clone())),
+            name: None,
+        }],
+    );
+    let choices = benchmark_choices(backend_choice, &manifest, compare);
+    let mut results = Vec::with_capacity(choices.len());
+
+    for choice in choices {
+        let backend_label = backend_label(choice);
+        let runtime = runtime_report_for_choice(choice, &runtime_options);
+        let result = run_benchmark_choice(
+            store.clone(),
+            &manifest,
+            choice,
+            runtime_options.clone(),
+            &prompt_spec.prompt,
+            &prompt_spec.stop,
+            max_tokens,
+            runs,
+            warmups,
+            temperature,
+            top_p,
+            seed,
+        );
+        results.push(match result {
+            Ok(samples) => BenchBackendReport {
+                backend: backend_label,
+                runtime,
+                median_eval_tokens_per_second: median(
+                    samples
+                        .iter()
+                        .map(|sample| sample.eval_tokens_per_second)
+                        .collect(),
+                ),
+                median_total_seconds: median(
+                    samples.iter().map(|sample| sample.total_seconds).collect(),
+                ),
+                median_first_token_seconds: median(
+                    samples
+                        .iter()
+                        .map(|sample| sample.first_token_seconds)
+                        .collect(),
+                ),
+                samples,
+                error: None,
+            },
+            Err(err) => BenchBackendReport {
+                backend: backend_label,
+                runtime,
+                samples: Vec::new(),
+                median_eval_tokens_per_second: None,
+                median_total_seconds: None,
+                median_first_token_seconds: None,
+                error: Some(err.to_string()),
+            },
+        });
+    }
+
+    Ok(BenchReport {
+        model: manifest.id,
+        prompt,
+        max_tokens,
+        warmups,
+        runs,
+        temperature,
+        top_p,
+        seed,
+        compare,
+        results,
+    })
+}
+
+fn run_benchmark_choice(
+    store: ModelStore,
+    manifest: &ModelManifest,
+    choice: BackendChoice,
+    runtime_options: LlamaRuntimeOptions,
+    prompt: &str,
+    stop: &[String],
+    max_tokens: usize,
+    runs: usize,
+    warmups: usize,
+    temperature: f64,
+    top_p: Option<f64>,
+    seed: u64,
+) -> Result<Vec<BenchSample>> {
+    let backend = build_concrete_backend(store, choice, runtime_options)?;
+    backend.prepare(manifest)?;
+    let session = backend.start_chat_session(manifest, Some(seed))?;
+
+    let mut samples = Vec::with_capacity(runs);
+    for index in 0..warmups + runs {
+        let request = GenerateRequest {
+            prompt: prompt.to_string(),
+            image_urls: Vec::new(),
+            max_tokens,
+            temperature: Some(temperature),
+            top_p,
+            stop: stop.to_vec(),
+            seed: Some(seed),
+            stream_granularity: StreamGranularity::Chunk,
+        };
+        let response = if let Some(session) = session.as_ref() {
+            session.generate(request)?
+        } else {
+            backend.generate(manifest, request)?
+        };
+
+        if index >= warmups {
+            samples.push(BenchSample {
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+                load_seconds: response.timings.load_seconds,
+                warmup_seconds: response.timings.warmup_seconds,
+                first_token_seconds: response.timings.first_token_seconds,
+                total_seconds: response.timings.total_seconds,
+                prompt_seconds: response.timings.prompt_seconds,
+                decode_seconds: response.timings.decode_seconds,
+                eval_tokens_per_second: rate(
+                    response.completion_tokens,
+                    response.timings.decode_seconds,
+                ),
+            });
+        }
+    }
+    Ok(samples)
+}
+
+fn benchmark_choices(
+    choice: BackendChoice,
+    manifest: &ModelManifest,
+    compare: BenchCompareArg,
+) -> Vec<BackendChoice> {
+    if manifest.format != ModelFormat::Gguf {
+        return vec![choice];
+    }
+
+    match choice {
+        BackendChoice::Auto => {
+            let mode = preferred_llama_mode();
+            benchmark_llama_choices(mode, compare)
+        }
+        BackendChoice::GgufPreferred { llama, .. } | BackendChoice::LlamaFast(llama) => {
+            benchmark_llama_choices(llama, compare)
+        }
+        BackendChoice::LlamaHighlevel(_) => vec![choice],
+        _ => vec![choice],
+    }
+}
+
+fn benchmark_llama_choices(mode: LlamaCppMode, compare: BenchCompareArg) -> Vec<BackendChoice> {
+    let mut choices = vec![BackendChoice::LlamaFast(mode)];
+    if compare == BenchCompareArg::Legacy {
+        choices.push(BackendChoice::LlamaHighlevel(mode));
+    }
+    choices
+}
+
+fn print_bench_report(report: &BenchReport, print_native_info: bool) {
+    println!("Benchmark: {}", report.model);
+    println!(
+        "runs: {}, warmups: {}, max tokens: {}, temperature: {}, seed: {}",
+        report.runs, report.warmups, report.max_tokens, report.temperature, report.seed
+    );
+    for result in &report.results {
+        println!();
+        println!("backend: {}", result.backend);
+        if print_native_info && let Some(runtime) = &result.runtime {
+            print_runtime_report(runtime);
+        }
+        if let Some(error) = &result.error {
+            println!("error: {error}");
+            continue;
+        }
+        if let Some(rate) = result.median_eval_tokens_per_second {
+            println!("median eval rate: {rate:.2} tokens/s");
+        }
+        if let Some(total) = result.median_total_seconds {
+            println!("median total: {}", format_duration(total));
+        }
+        if let Some(first_token) = result.median_first_token_seconds {
+            println!("median first token: {}", format_duration(first_token));
+        }
+        for (index, sample) in result.samples.iter().enumerate() {
+            println!(
+                "  run {:>2}: {:>7.2} tok/s, {} token(s), first {}, total {}",
+                index + 1,
+                sample.eval_tokens_per_second,
+                sample.completion_tokens,
+                format_duration(sample.first_token_seconds),
+                format_duration(sample.total_seconds)
+            );
+        }
+    }
+}
+
+fn runtime_report_for_choice(
+    choice: BackendChoice,
+    runtime_options: &LlamaRuntimeOptions,
+) -> Option<LlamaFastRuntimeReport> {
+    match choice {
+        BackendChoice::LlamaFast(mode) | BackendChoice::GgufPreferred { llama: mode, .. } => {
+            Some(LlamaFastBackend::runtime_report(mode, runtime_options))
+        }
+        _ => None,
+    }
+}
+
+fn print_perf_doctor(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    backend_choice: BackendChoice,
+    runtime_options: &LlamaRuntimeOptions,
+) -> Result<()> {
+    let selected = selected_backend_for_manifest(store, backend_choice, manifest)?;
+    println!("Werk1112 performance diagnostics");
+    println!("model: {}", manifest.id);
+    println!("format: {:?}", manifest.format);
+    println!(
+        "architecture: {}",
+        manifest.architecture.as_deref().unwrap_or("unknown")
+    );
+    println!("selected backend: {}", backend_label(selected));
+
+    if let Some(report) = runtime_report_for_choice(selected, runtime_options) {
+        print_runtime_report(&report);
+    } else {
+        println!("runtime: {}", backend_label(selected));
+        println!("note: detailed llama.cpp diagnostics are available only for llama-fast backends");
+    }
+
+    Ok(())
+}
+
+fn print_runtime_report(report: &LlamaFastRuntimeReport) {
+    println!("runtime: {} {}", report.runtime, report.native_commit);
+    println!("compiled: {}", report.compiled);
+    println!("modern sampler: {}", report.modern_sampler);
+    println!("flash attention supported: {}", report.flash_attn_supported);
+    if let Some(requested) = report.flash_attn_requested {
+        println!("flash attention requested: {requested}");
+    }
+    if let Some(cap) = &report.cuda_compute_cap {
+        println!("CUDA_COMPUTE_CAP: {cap}");
+    }
+    println!(
+        "ctx/batch/ubatch: {}/{}/{}",
+        report.ctx_size, report.batch_size, report.ubatch_size
+    );
+    println!(
+        "threads: generation {}, batch {}",
+        report.threads, report.threads_batch
+    );
+    println!(
+        "gpu layers/main gpu: {}/{}",
+        report.gpu_layers, report.main_gpu
+    );
+    println!(
+        "KV cache: {}, offload: {}",
+        report.kv_cache_type, report.kv_offload
+    );
+    println!("warmup tokens: {}", report.warmup_tokens);
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
 }
 
 fn write_verbose_stats<W: Write>(
@@ -554,6 +1164,14 @@ fn write_verbose_stats<W: Write>(
         "load duration:",
         format_duration(timings.load_seconds)
     )?;
+    if timings.warmup_seconds > 0.0 {
+        writeln!(
+            writer,
+            "{:<22}{}",
+            "warmup duration:",
+            format_duration(timings.warmup_seconds)
+        )?;
+    }
     writeln!(
         writer,
         "{:<22}{} token(s)",
@@ -582,6 +1200,14 @@ fn write_verbose_stats<W: Write>(
         "eval duration:",
         format_duration(timings.decode_seconds)
     )?;
+    if timings.first_token_seconds > 0.0 {
+        writeln!(
+            writer,
+            "{:<22}{}",
+            "first token:",
+            format_duration(timings.first_token_seconds)
+        )?;
+    }
     writeln!(
         writer,
         "{:<22}{:.2} tokens/s",
@@ -622,20 +1248,35 @@ fn trim_float(mut value: String) -> String {
 #[derive(Debug, Clone, Copy)]
 enum BackendChoice {
     Auto,
+    GgufPreferred {
+        llama: LlamaCppMode,
+        candle: CandleDeviceMode,
+    },
     Candle(CandleDeviceMode),
+    LlamaFast(LlamaCppMode),
+    LlamaHighlevel(LlamaCppMode),
     Mlx,
-    Vulkan,
 }
 
 struct AutoBackend {
     store: ModelStore,
+    runtime_options: LlamaRuntimeOptions,
+    backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
+}
+
+struct GgufPreferredBackend {
+    store: ModelStore,
+    gguf_backend: BackendChoice,
+    fallback_backend: BackendChoice,
+    runtime_options: LlamaRuntimeOptions,
     backends: Mutex<HashMap<&'static str, Arc<dyn GenerationBackend>>>,
 }
 
 impl AutoBackend {
-    fn new(store: ModelStore) -> Self {
+    fn new(store: ModelStore, runtime_options: LlamaRuntimeOptions) -> Self {
         Self {
             store,
+            runtime_options,
             backends: Mutex::new(HashMap::new()),
         }
     }
@@ -646,7 +1287,7 @@ impl AutoBackend {
             if !backend_supports_manifest(backend, manifest) {
                 continue;
             }
-            if !backend_available(backend) {
+            if !backend_available_for_store(&self.store, backend) {
                 unavailable.push(backend_label(backend));
                 continue;
             }
@@ -679,7 +1320,8 @@ impl AutoBackend {
             return Ok(backend);
         }
 
-        let backend = build_concrete_backend(self.store.clone(), backend)?;
+        let backend =
+            build_concrete_backend(self.store.clone(), backend, self.runtime_options.clone())?;
         self.backends
             .lock()
             .map_err(|_| anyhow!("auto backend cache mutex poisoned"))?
@@ -689,6 +1331,108 @@ impl AutoBackend {
 }
 
 impl GenerationBackend for AutoBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for(manifest)?.prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for(manifest)?
+            .start_chat_session(manifest, seed)
+    }
+
+    fn generate(
+        &self,
+        manifest: &ModelManifest,
+        request: GenerateRequest,
+    ) -> Result<crate::backend::GenerateResponse> {
+        self.backend_for(manifest)?.generate(manifest, request)
+    }
+
+    fn generate_stream(
+        &self,
+        manifest: ModelManifest,
+        request: GenerateRequest,
+    ) -> crate::backend::GenerateStream {
+        match self.backend_for(&manifest) {
+            Ok(backend) => backend.generate_stream(manifest, request),
+            Err(err) => Box::pin(tokio_stream::iter(vec![Err(err.to_string())])),
+        }
+    }
+}
+
+impl GgufPreferredBackend {
+    fn new(
+        store: ModelStore,
+        llama: LlamaCppMode,
+        candle: CandleDeviceMode,
+        runtime_options: LlamaRuntimeOptions,
+    ) -> Self {
+        Self {
+            store,
+            gguf_backend: BackendChoice::LlamaFast(llama),
+            fallback_backend: BackendChoice::Candle(candle),
+            runtime_options,
+            backends: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn backend_for(&self, manifest: &ModelManifest) -> Result<Arc<dyn GenerationBackend>> {
+        let backend = if manifest.format == ModelFormat::Gguf {
+            self.gguf_backend
+        } else {
+            self.fallback_backend
+        };
+        if !backend_supports_manifest(backend, manifest) {
+            bail!(
+                "backend {} does not support model '{}' with format {:?}",
+                backend_label(backend),
+                manifest.id,
+                manifest.format
+            );
+        }
+        self.cached_backend(backend)
+    }
+
+    fn cached_backend(&self, backend: BackendChoice) -> Result<Arc<dyn GenerationBackend>> {
+        let key = backend_label(backend);
+        if let Some(backend) = self
+            .backends
+            .lock()
+            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
+            .get(key)
+            .cloned()
+        {
+            return Ok(backend);
+        }
+
+        let backend =
+            build_concrete_backend(self.store.clone(), backend, self.runtime_options.clone())?;
+        self.backends
+            .lock()
+            .map_err(|_| anyhow!("backend cache mutex poisoned"))?
+            .insert(key, backend.clone());
+        Ok(backend)
+    }
+}
+
+impl GenerationBackend for GgufPreferredBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.backend_for(manifest)?.prepare(manifest)
+    }
+
+    fn start_chat_session(
+        &self,
+        manifest: &ModelManifest,
+        seed: Option<u64>,
+    ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
+        self.backend_for(manifest)?
+            .start_chat_session(manifest, seed)
+    }
+
     fn generate(
         &self,
         manifest: &ModelManifest,
@@ -712,11 +1456,36 @@ impl GenerationBackend for AutoBackend {
 fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
     match backend {
         BackendArg::Auto => BackendChoice::Auto,
-        BackendArg::Cpu => BackendChoice::Candle(CandleDeviceMode::Cpu),
-        BackendArg::Cuda => BackendChoice::Candle(CandleDeviceMode::Cuda),
+        BackendArg::Cpu => BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cpu,
+            candle: CandleDeviceMode::Cpu,
+        },
+        BackendArg::Cuda => BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cuda,
+            candle: candle_cuda_fallback_mode(),
+        },
         BackendArg::Metal => BackendChoice::Candle(CandleDeviceMode::Metal),
         BackendArg::Mlx => BackendChoice::Mlx,
-        BackendArg::Vulkan => BackendChoice::Vulkan,
+        BackendArg::Vulkan => BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
+        BackendArg::LlamaHighlevel => BackendChoice::LlamaHighlevel(preferred_llama_mode()),
+    }
+}
+
+fn preferred_llama_mode() -> LlamaCppMode {
+    if cfg!(feature = "cuda") {
+        LlamaCppMode::Cuda
+    } else if cfg!(feature = "vulkan") {
+        LlamaCppMode::Vulkan
+    } else {
+        LlamaCppMode::Cpu
+    }
+}
+
+fn candle_cuda_fallback_mode() -> CandleDeviceMode {
+    if cfg!(feature = "candle-cuda") {
+        CandleDeviceMode::Cuda
+    } else {
+        CandleDeviceMode::Cpu
     }
 }
 
@@ -736,30 +1505,47 @@ fn resolve_backend(
 fn build_generation_backend(
     store: ModelStore,
     backend: BackendChoice,
+    runtime_options: LlamaRuntimeOptions,
 ) -> Result<Arc<dyn GenerationBackend>> {
     match backend {
-        BackendChoice::Auto => Ok(Arc::new(AutoBackend::new(store))),
-        backend => build_concrete_backend(store, backend),
+        BackendChoice::Auto => Ok(Arc::new(AutoBackend::new(store, runtime_options))),
+        backend => build_concrete_backend(store, backend, runtime_options),
     }
 }
 
 fn build_concrete_backend(
     store: ModelStore,
     backend: BackendChoice,
+    runtime_options: LlamaRuntimeOptions,
 ) -> Result<Arc<dyn GenerationBackend>> {
     match backend {
         BackendChoice::Auto => bail!("auto backend cannot be built as a concrete backend"),
+        BackendChoice::GgufPreferred { llama, candle } => Ok(Arc::new(GgufPreferredBackend::new(
+            store,
+            llama,
+            candle,
+            runtime_options,
+        ))),
         BackendChoice::Candle(mode) => Ok(Arc::new(CandleBackend::new_with_device(store, mode)?)),
+        BackendChoice::LlamaFast(mode) => Ok(Arc::new(LlamaFastBackend::new_with_options(
+            store,
+            mode,
+            runtime_options,
+        ))),
+        BackendChoice::LlamaHighlevel(mode) => Ok(Arc::new(LlamaCppBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
-        BackendChoice::Vulkan => Ok(Arc::new(LlamaCppBackend::new_vulkan(store))),
     }
 }
 
 fn target_default_order() -> &'static [BackendChoice] {
-    if cfg!(windows) {
+    if cfg!(any(windows, target_os = "linux")) {
         &[
+            BackendChoice::LlamaFast(LlamaCppMode::Cuda),
+            BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
+            BackendChoice::LlamaFast(LlamaCppMode::Cpu),
+            BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda),
+            BackendChoice::LlamaHighlevel(LlamaCppMode::Cpu),
             BackendChoice::Candle(CandleDeviceMode::Cuda),
-            BackendChoice::Vulkan,
             BackendChoice::Candle(CandleDeviceMode::Cpu),
         ]
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -773,7 +1559,8 @@ fn target_default_order() -> &'static [BackendChoice] {
         &[
             BackendChoice::Candle(CandleDeviceMode::Cpu),
             BackendChoice::Candle(CandleDeviceMode::Cuda),
-            BackendChoice::Vulkan,
+            BackendChoice::LlamaFast(LlamaCppMode::Vulkan),
+            BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan),
         ]
     }
 }
@@ -781,6 +1568,10 @@ fn target_default_order() -> &'static [BackendChoice] {
 fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -> bool {
     match backend {
         BackendChoice::Auto => false,
+        BackendChoice::GgufPreferred { .. } => matches!(
+            manifest.format,
+            ModelFormat::Gguf | ModelFormat::SafeTensors
+        ),
         BackendChoice::Candle(_) => matches!(
             manifest.format,
             ModelFormat::Gguf | ModelFormat::SafeTensors
@@ -788,30 +1579,105 @@ fn backend_supports_manifest(backend: BackendChoice, manifest: &ModelManifest) -
         BackendChoice::Mlx => {
             matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors)
         }
-        BackendChoice::Vulkan => manifest.format == ModelFormat::Gguf,
+        BackendChoice::LlamaFast(_) | BackendChoice::LlamaHighlevel(_) => {
+            manifest.format == ModelFormat::Gguf
+        }
     }
 }
 
-fn backend_available(backend: BackendChoice) -> bool {
+fn backend_available_for_store(_store: &ModelStore, backend: BackendChoice) -> bool {
     match backend {
         BackendChoice::Auto => true,
+        BackendChoice::GgufPreferred { .. } => true,
         BackendChoice::Candle(CandleDeviceMode::Auto) => true,
         BackendChoice::Candle(CandleDeviceMode::Cpu) => true,
         BackendChoice::Candle(mode) => probe_device(mode).is_ok(),
         BackendChoice::Mlx => MlxBackend::probe().is_ok(),
-        BackendChoice::Vulkan => LlamaCppBackend::probe_vulkan().is_ok(),
+        BackendChoice::LlamaFast(mode) => LlamaFastBackend::probe(mode).is_ok(),
+        BackendChoice::LlamaHighlevel(mode) => LlamaCppBackend::probe(mode).is_ok(),
+    }
+}
+
+fn selected_backend_for_manifest(
+    store: &ModelStore,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+) -> Result<BackendChoice> {
+    match backend {
+        BackendChoice::Auto => {
+            let mut unavailable = Vec::new();
+            for candidate in target_default_order().iter().copied() {
+                if !backend_supports_manifest(candidate, manifest) {
+                    continue;
+                }
+                if backend_available_for_store(store, candidate) {
+                    return Ok(candidate);
+                }
+                unavailable.push(backend_label(candidate));
+            }
+            bail!(
+                "no available backend for model '{}' with format {:?}; unavailable candidates: {}",
+                manifest.id,
+                manifest.format,
+                unavailable.join(", ")
+            )
+        }
+        BackendChoice::GgufPreferred { llama, candle } => {
+            let selected = if manifest.format == ModelFormat::Gguf {
+                BackendChoice::LlamaFast(llama)
+            } else {
+                BackendChoice::Candle(candle)
+            };
+            if backend_supports_manifest(selected, manifest) {
+                Ok(selected)
+            } else {
+                bail!(
+                    "backend {} does not support model '{}' with format {:?}",
+                    backend_label(selected),
+                    manifest.id,
+                    manifest.format
+                )
+            }
+        }
+        selected => {
+            if backend_supports_manifest(selected, manifest) {
+                Ok(selected)
+            } else {
+                bail!(
+                    "backend {} does not support model '{}' with format {:?}",
+                    backend_label(selected),
+                    manifest.id,
+                    manifest.format
+                )
+            }
+        }
     }
 }
 
 fn backend_label(backend: BackendChoice) -> &'static str {
     match backend {
         BackendChoice::Auto => "auto",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cuda,
+            ..
+        } => "cuda",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Cpu,
+            ..
+        } => "cpu",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Vulkan,
+            ..
+        } => "vulkan",
         BackendChoice::Candle(CandleDeviceMode::Auto) => "candle-auto",
-        BackendChoice::Candle(CandleDeviceMode::Cpu) => "cpu",
-        BackendChoice::Candle(CandleDeviceMode::Cuda) => "cuda",
+        BackendChoice::Candle(CandleDeviceMode::Cpu) => "candle-cpu",
+        BackendChoice::Candle(CandleDeviceMode::Cuda) => "candle-cuda",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
-        BackendChoice::Vulkan => "vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama-fast-cuda",
+        BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama-fast-vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama-fast-cpu",
+        BackendChoice::LlamaHighlevel(mode) => mode.label(),
     }
 }
 
@@ -1040,6 +1906,54 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--backend",
+            "cuda",
+            "--ctx-size",
+            "2048",
+            "--kv-cache-type",
+            "q8-0",
+            "bench",
+            "tiny",
+            "--prompt",
+            "hello",
+            "--runs",
+            "3",
+            "--warmups",
+            "1",
+            "--temperature",
+            "0.2",
+            "--compare",
+            "legacy",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.backend, BackendArg::Cuda);
+        assert_eq!(cli.llama.ctx_size, Some(2048));
+        assert_eq!(cli.llama.kv_cache_type, Some(KvCacheTypeArg::Q8_0));
+        match cli.command.unwrap() {
+            Commands::Bench {
+                model,
+                prompt,
+                runs,
+                warmups,
+                temperature,
+                compare,
+                json,
+                ..
+            } => {
+                assert_eq!(model, "tiny");
+                assert_eq!(prompt, "hello");
+                assert_eq!(runs, 3);
+                assert_eq!(warmups, 1);
+                assert_eq!(temperature, 0.2);
+                assert_eq!(compare, BenchCompareArg::Legacy);
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
     }
 
     #[test]
@@ -1054,8 +1968,38 @@ mod tests {
         ));
         assert!(matches!(
             backend_arg_to_choice(BackendArg::Vulkan),
-            BackendChoice::Vulkan
+            BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
         ));
+        assert!(matches!(
+            backend_arg_to_choice(BackendArg::LlamaHighlevel),
+            BackendChoice::LlamaHighlevel(_)
+        ));
+        assert!(matches!(
+            backend_arg_to_choice(BackendArg::Cuda),
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Cuda,
+                candle
+            } if candle == candle_cuda_fallback_mode()
+        ));
+    }
+
+    #[test]
+    fn linux_and_windows_auto_prefer_llama_fast_for_gguf() {
+        if cfg!(any(windows, target_os = "linux")) {
+            let order = target_default_order();
+            assert!(matches!(
+                order[0],
+                BackendChoice::LlamaFast(LlamaCppMode::Cuda)
+            ));
+            assert!(matches!(
+                order[1],
+                BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
+            ));
+            assert!(matches!(
+                order[2],
+                BackendChoice::LlamaFast(LlamaCppMode::Cpu)
+            ));
+        }
     }
 
     #[test]
@@ -1093,6 +2037,21 @@ mod tests {
         };
         assert!(should_print_startup_banner_for(&chat, true, true));
         assert!(!should_print_startup_banner_for(&chat, true, false));
+
+        let bench = Commands::Bench {
+            model: "tiny".to_string(),
+            prompt: "hello".to_string(),
+            max_tokens: 128,
+            runs: 1,
+            warmups: 0,
+            temperature: 0.0,
+            top_p: None,
+            seed: 42,
+            compare: BenchCompareArg::None,
+            print_native_info: false,
+            json: true,
+        };
+        assert!(!should_print_startup_banner_for(&bench, true, true));
 
         assert!(!should_print_startup_banner_for(
             &Commands::List,

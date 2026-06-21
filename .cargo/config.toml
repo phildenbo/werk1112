@@ -6,3 +6,5 @@ build-macos-apple-silicon = "build --release --locked --target aarch64-apple-dar
 
 [env]
 CUDA_COMPUTE_CAP = { value = "86", force = false }
+CC_x86_64_unknown_linux_gnu = { value = "gcc-10", force = false }
+CXX_x86_64_unknown_linux_gnu = { value = "g++-10", force = false }

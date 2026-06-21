@@ -56,7 +56,7 @@ impl ModelFormat {
     pub fn backend_status(&self) -> &'static str {
         match self {
             Self::Gguf => {
-                "implemented via Candle quantized GGUF loaders for selected architectures"
+                "implemented via in-process llama.cpp; Candle fallback supports selected architectures"
             }
             Self::SafeTensors => {
                 "implemented via Candle safetensors loaders for selected architectures"
@@ -369,7 +369,9 @@ impl ModelStore {
             bail!("model file does not exist: {}", absolute_path.display());
         }
 
-        validate_selected_model_file(&manifest.format, &selected_path)?;
+        let selected_format = detect_format_for_model_path(&selected_path);
+        validate_selected_model_file(&selected_format, &selected_path)?;
+        manifest.format = selected_format;
         manifest.model_path = Some(selected_path);
         manifest.architecture = detect_architecture(
             &self.model_dir(&manifest.id),
@@ -377,6 +379,7 @@ impl ModelStore {
             manifest.model_path.as_deref(),
             manifest.config_path.as_deref(),
         );
+        manifest.backend = manifest.format.backend_hint().to_string();
         write_json_pretty(&self.model_dir(&manifest.id).join(MANIFEST_FILE), &manifest)?;
         Ok(manifest)
     }
@@ -995,6 +998,46 @@ fn validate_selected_model_file(format: &ModelFormat, path: &str) -> Result<()> 
     Ok(())
 }
 
+fn detect_format_for_model_path(path: &str) -> ModelFormat {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("gguf") {
+        ModelFormat::Gguf
+    } else if extension.eq_ignore_ascii_case("safetensors") {
+        ModelFormat::SafeTensors
+    } else if ["pt", "pth", "bin"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        ModelFormat::PyTorch
+    } else if extension.eq_ignore_ascii_case("onnx") {
+        ModelFormat::Onnx
+    } else if ["engine", "plan"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        ModelFormat::TensorRt
+    } else if extension.eq_ignore_ascii_case("xml") {
+        ModelFormat::OpenVino
+    } else if ["pb", "ckpt"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        ModelFormat::TensorFlow
+    } else if ["mlmodel", "mlpackage"]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    {
+        ModelFormat::CoreMl
+    } else if extension.eq_ignore_ascii_case("npz") {
+        ModelFormat::Mlx
+    } else {
+        ModelFormat::Unknown
+    }
+}
+
 fn detect_architecture(
     model_dir: &Path,
     format: &ModelFormat,
@@ -1248,6 +1291,32 @@ mod tests {
             persisted.model_path.as_deref(),
             Some("files/tinyllama.Q2_K.gguf")
         );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn set_model_file_can_switch_mixed_repo_between_gguf_and_safetensors() {
+        let tmp = test_dir("mixed-format-selection");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        fs::write(source.join("model.safetensors"), b"safe").unwrap();
+        fs::write(source.join("model.Q4_0.gguf"), b"gguf").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "mixed").unwrap();
+        assert_eq!(manifest.format, ModelFormat::Gguf);
+
+        let manifest = store.set_model_file("mixed", "model.safetensors").unwrap();
+        assert_eq!(manifest.format, ModelFormat::SafeTensors);
+        assert_eq!(manifest.backend, "candle");
+        assert_eq!(manifest.architecture.as_deref(), Some("llama"));
+        assert_eq!(manifest.model_path.as_deref(), Some("files/model.safetensors"));
+
+        let manifest = store.set_model_file("mixed", "model.Q4_0.gguf").unwrap();
+        assert_eq!(manifest.format, ModelFormat::Gguf);
+        assert_eq!(manifest.model_path.as_deref(), Some("files/model.Q4_0.gguf"));
 
         let _ = fs::remove_dir_all(tmp);
     }
