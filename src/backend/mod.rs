@@ -1,3 +1,4 @@
+mod burn;
 mod candle;
 mod external;
 mod llama_fast;
@@ -7,6 +8,7 @@ use anyhow::Result;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+pub use burn::{BurnBackend, BurnRuntimeMode};
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
 pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
@@ -15,7 +17,449 @@ pub use llama_server::{
     install_managed_llama_server, llama_server_help_ok, managed_backend_dir,
 };
 
-use crate::model_store::ModelManifest;
+use crate::model_store::{ModelFormat, ModelManifest};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendRuntime {
+    Candle,
+    LlamaServer,
+    LlamaLegacy,
+    LlamaHighlevel,
+    Burn,
+    OnnxRuntime,
+    TensorRt,
+    OpenVino,
+    CoreMl,
+    Mlx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendAccelerator {
+    Auto,
+    Cpu,
+    Cuda,
+    Vulkan,
+    Wgpu,
+    Metal,
+    Mlx,
+    DirectMl,
+    TensorRt,
+    OpenVino,
+    CoreMl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuntimeId {
+    LlamaServerCuda,
+    LlamaServerVulkan,
+    LlamaServerCpu,
+    CandleCuda,
+    CandleMetal,
+    CandleCpu,
+    BurnCuda,
+    BurnWgpu,
+    BurnCpu,
+    Mlx,
+    OnnxRuntimeCuda,
+    OnnxRuntimeDirectMl,
+    OnnxRuntimeCpu,
+    TensorRt,
+    OpenVino,
+    CoreMl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    pub text_generation: bool,
+    pub vision_language: bool,
+    pub embeddings: bool,
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeDescriptor {
+    pub id: RuntimeId,
+    pub runtime: BackendRuntime,
+    pub display_name: &'static str,
+    pub supported_formats: &'static [ModelFormat],
+    pub supported_architectures: &'static [&'static str],
+    pub accelerators: &'static [BackendAccelerator],
+    pub capabilities: RuntimeCapabilities,
+    pub priority: i32,
+    pub implemented: bool,
+    pub install_target: Option<&'static str>,
+}
+
+const TEXT_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: false,
+    embeddings: false,
+    streaming: true,
+};
+
+const TEXT_NON_STREAMING: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: false,
+    embeddings: false,
+    streaming: false,
+};
+
+const MLX_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: true,
+    embeddings: false,
+    streaming: false,
+};
+
+const GGUF_FORMATS: &[ModelFormat] = &[ModelFormat::Gguf];
+const SAFETENSORS_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors];
+const CANDLE_FORMATS: &[ModelFormat] = &[ModelFormat::Gguf, ModelFormat::SafeTensors];
+const MLX_FORMATS: &[ModelFormat] = &[ModelFormat::Mlx, ModelFormat::SafeTensors];
+const ONNX_FORMATS: &[ModelFormat] = &[ModelFormat::Onnx];
+const TENSORRT_FORMATS: &[ModelFormat] = &[ModelFormat::TensorRt];
+const OPENVINO_FORMATS: &[ModelFormat] = &[ModelFormat::OpenVino];
+const COREML_FORMATS: &[ModelFormat] = &[ModelFormat::CoreMl];
+
+const ANY_ARCH: &[&str] = &[];
+const CANDLE_ARCHES: &[&str] = &[
+    "llama", "gemma", "gemma2", "gemma3", "qwen2", "mistral", "phi", "phi2", "phi3",
+];
+const BURN_PLACEHOLDER_ARCHES: &[&str] = &["phi3", "qwen2", "gemma", "gemma2"];
+
+pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
+    RuntimeDescriptor {
+        id: RuntimeId::LlamaServerCuda,
+        runtime: BackendRuntime::LlamaServer,
+        display_name: "llama.cpp server CUDA",
+        supported_formats: GGUF_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 1000,
+        implemented: true,
+        install_target: Some("llama-cuda"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::LlamaServerVulkan,
+        runtime: BackendRuntime::LlamaServer,
+        display_name: "llama.cpp server Vulkan",
+        supported_formats: GGUF_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Vulkan],
+        capabilities: TEXT_STREAMING,
+        priority: 900,
+        implemented: true,
+        install_target: Some("llama-vulkan"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::LlamaServerCpu,
+        runtime: BackendRuntime::LlamaServer,
+        display_name: "llama.cpp server CPU",
+        supported_formats: GGUF_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 800,
+        implemented: true,
+        install_target: Some("llama-cpu"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::CandleCuda,
+        runtime: BackendRuntime::Candle,
+        display_name: "Candle CUDA",
+        supported_formats: CANDLE_FORMATS,
+        supported_architectures: CANDLE_ARCHES,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 700,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::CandleMetal,
+        runtime: BackendRuntime::Candle,
+        display_name: "Candle Metal",
+        supported_formats: CANDLE_FORMATS,
+        supported_architectures: CANDLE_ARCHES,
+        accelerators: &[BackendAccelerator::Metal],
+        capabilities: TEXT_STREAMING,
+        priority: 650,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::CandleCpu,
+        runtime: BackendRuntime::Candle,
+        display_name: "Candle CPU",
+        supported_formats: CANDLE_FORMATS,
+        supported_architectures: CANDLE_ARCHES,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 100,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::BurnCuda,
+        runtime: BackendRuntime::Burn,
+        display_name: "Burn CUDA",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: BURN_PLACEHOLDER_ARCHES,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 760,
+        implemented: false,
+        install_target: Some("burn-cuda"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::BurnWgpu,
+        runtime: BackendRuntime::Burn,
+        display_name: "Burn WGPU/Vulkan",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: BURN_PLACEHOLDER_ARCHES,
+        accelerators: &[BackendAccelerator::Wgpu, BackendAccelerator::Vulkan],
+        capabilities: TEXT_STREAMING,
+        priority: 675,
+        implemented: false,
+        install_target: Some("burn-wgpu"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::BurnCpu,
+        runtime: BackendRuntime::Burn,
+        display_name: "Burn CPU",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: BURN_PLACEHOLDER_ARCHES,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 90,
+        implemented: false,
+        install_target: Some("burn-cpu"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::Mlx,
+        runtime: BackendRuntime::Mlx,
+        display_name: "MLX",
+        supported_formats: MLX_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Mlx],
+        capabilities: MLX_CAPABILITIES,
+        priority: 850,
+        implemented: true,
+        install_target: Some("mlx"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeCuda,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime CUDA",
+        supported_formats: ONNX_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 900,
+        implemented: false,
+        install_target: Some("onnxruntime"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeDirectMl,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime DirectML",
+        supported_formats: ONNX_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::DirectMl],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 850,
+        implemented: false,
+        install_target: Some("onnxruntime"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeCpu,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime CPU",
+        supported_formats: ONNX_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 100,
+        implemented: false,
+        install_target: Some("onnxruntime"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::TensorRt,
+        runtime: BackendRuntime::TensorRt,
+        display_name: "TensorRT",
+        supported_formats: TENSORRT_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::TensorRt, BackendAccelerator::Cuda],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 1000,
+        implemented: false,
+        install_target: Some("tensorrt"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OpenVino,
+        runtime: BackendRuntime::OpenVino,
+        display_name: "OpenVINO",
+        supported_formats: OPENVINO_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::OpenVino],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 1000,
+        implemented: false,
+        install_target: Some("openvino"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::CoreMl,
+        runtime: BackendRuntime::CoreMl,
+        display_name: "CoreML",
+        supported_formats: COREML_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::CoreMl, BackendAccelerator::Metal],
+        capabilities: TEXT_NON_STREAMING,
+        priority: 1000,
+        implemented: false,
+        install_target: Some("coreml"),
+    },
+];
+
+pub fn runtime_registry() -> &'static [RuntimeDescriptor] {
+    RUNTIME_REGISTRY
+}
+
+pub fn runtime_descriptor(id: RuntimeId) -> &'static RuntimeDescriptor {
+    RUNTIME_REGISTRY
+        .iter()
+        .find(|runtime| runtime.id == id)
+        .expect("runtime descriptor exists")
+}
+
+pub fn runtime_supports_model(
+    descriptor: &RuntimeDescriptor,
+    format: &ModelFormat,
+    architecture: Option<&str>,
+) -> bool {
+    if !descriptor
+        .supported_formats
+        .iter()
+        .any(|item| item == format)
+    {
+        return false;
+    }
+    if descriptor.supported_architectures.is_empty() {
+        return true;
+    }
+    architecture
+        .map(|architecture| {
+            descriptor
+                .supported_architectures
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(architecture))
+        })
+        .unwrap_or(true)
+}
+
+pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) -> bool {
+    match runtime {
+        BackendRuntime::Candle => matches!(format, ModelFormat::Gguf | ModelFormat::SafeTensors),
+        BackendRuntime::Burn => matches!(format, ModelFormat::SafeTensors),
+        BackendRuntime::LlamaServer
+        | BackendRuntime::LlamaLegacy
+        | BackendRuntime::LlamaHighlevel => matches!(format, ModelFormat::Gguf),
+        BackendRuntime::OnnxRuntime => matches!(format, ModelFormat::Onnx),
+        BackendRuntime::TensorRt => matches!(format, ModelFormat::TensorRt),
+        BackendRuntime::OpenVino => matches!(format, ModelFormat::OpenVino),
+        BackendRuntime::CoreMl => matches!(format, ModelFormat::CoreMl),
+        BackendRuntime::Mlx => matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors),
+    }
+}
+
+pub fn backend_supports_images(runtime: BackendRuntime) -> bool {
+    matches!(runtime, BackendRuntime::Mlx)
+}
+
+pub fn backend_supports_accelerator(
+    runtime: BackendRuntime,
+    accelerator: BackendAccelerator,
+) -> bool {
+    match runtime {
+        BackendRuntime::Candle => matches!(
+            accelerator,
+            BackendAccelerator::Auto
+                | BackendAccelerator::Cpu
+                | BackendAccelerator::Cuda
+                | BackendAccelerator::Metal
+        ),
+        BackendRuntime::LlamaServer
+        | BackendRuntime::LlamaLegacy
+        | BackendRuntime::LlamaHighlevel => matches!(
+            accelerator,
+            BackendAccelerator::Cpu | BackendAccelerator::Cuda | BackendAccelerator::Vulkan
+        ),
+        BackendRuntime::Burn => matches!(
+            accelerator,
+            BackendAccelerator::Cpu
+                | BackendAccelerator::Cuda
+                | BackendAccelerator::Wgpu
+                | BackendAccelerator::Vulkan
+        ),
+        BackendRuntime::OnnxRuntime => matches!(
+            accelerator,
+            BackendAccelerator::Cpu | BackendAccelerator::Cuda | BackendAccelerator::DirectMl
+        ),
+        BackendRuntime::TensorRt => matches!(
+            accelerator,
+            BackendAccelerator::TensorRt | BackendAccelerator::Cuda
+        ),
+        BackendRuntime::OpenVino => matches!(accelerator, BackendAccelerator::OpenVino),
+        BackendRuntime::CoreMl => {
+            matches!(
+                accelerator,
+                BackendAccelerator::CoreMl | BackendAccelerator::Metal
+            )
+        }
+        BackendRuntime::Mlx => matches!(accelerator, BackendAccelerator::Mlx),
+    }
+}
+
+pub fn explain_backend_rejection(
+    runtime: BackendRuntime,
+    format: &ModelFormat,
+    has_images: bool,
+) -> Option<&'static str> {
+    if !backend_supports_format(runtime, format) {
+        return Some(match runtime {
+            BackendRuntime::Candle => "Candle supports GGUF and safetensors only",
+            BackendRuntime::LlamaServer => "llama.cpp server supports GGUF only",
+            BackendRuntime::LlamaLegacy | BackendRuntime::LlamaHighlevel => {
+                "llama.cpp legacy backends support GGUF only"
+            }
+            BackendRuntime::Burn => "Burn placeholder supports selected HF safetensors only",
+            BackendRuntime::OnnxRuntime => "ONNX Runtime supports ONNX only",
+            BackendRuntime::TensorRt => "TensorRT supports TensorRT engine files only",
+            BackendRuntime::OpenVino => "OpenVINO supports OpenVINO IR only",
+            BackendRuntime::CoreMl => "CoreML supports CoreML models only",
+            BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
+        });
+    }
+    if has_images && !backend_supports_images(runtime) {
+        return Some("backend is text-only");
+    }
+    None
+}
+
+pub fn select_backend_for_request<T, F>(
+    candidates: &[T],
+    format: &ModelFormat,
+    has_images: bool,
+    mut runtime_for: F,
+) -> Option<T>
+where
+    T: Copy,
+    F: FnMut(T) -> BackendRuntime,
+{
+    candidates.iter().copied().find(|candidate| {
+        explain_backend_rejection(runtime_for(*candidate), format, has_images).is_none()
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {
