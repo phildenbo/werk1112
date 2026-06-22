@@ -1823,6 +1823,7 @@ mod tests {
         };
         let request = GenerateRequest {
             prompt: "Write a sentence about Rust.".to_string(),
+            messages: Vec::new(),
             image_urls: Vec::new(),
             max_tokens: 32,
             temperature: None,

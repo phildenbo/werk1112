@@ -19,10 +19,11 @@ use crate::{
         GenerateRequest, GenerateStreamEvent, GenerationBackend, GenerationTimings,
         LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport, LlamaKvCacheType,
         LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery, MlxBackend, RuntimeId,
-        StreamGranularity, backend_doctor_checks, backend_supports_accelerator,
+        StreamGranularity, VllmBackend, backend_doctor_checks, backend_supports_accelerator,
         backend_supports_format, backend_supports_images as runtime_supports_images,
-        install_managed_llama_server, llama_server_help_ok, managed_backend_dir, probe_device,
-        runtime_descriptor, runtime_registry, runtime_supports_model,
+        install_managed_llama_server, install_managed_vllm, llama_server_help_ok,
+        managed_backend_dir, managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
+        runtime_supports_model, vllm_doctor_checks,
     },
     banner::print_banner,
     model_store::{ModelFormat, ModelManifest, ModelStore, PullProgress},
@@ -244,25 +245,8 @@ pub enum BackendInstallArg {
     LlamaCuda,
     LlamaVulkan,
     LlamaCpu,
-    #[value(name = "burn")]
-    Burn,
-    BurnCuda,
-    BurnWgpu,
-    BurnCpu,
     #[value(name = "vllm")]
     Vllm,
-    #[value(name = "sglang")]
-    Sglang,
-    #[value(name = "onnxruntime")]
-    Onnxruntime,
-    #[value(name = "mlx")]
-    Mlx,
-    #[value(name = "tensorrt")]
-    TensorRt,
-    #[value(name = "openvino")]
-    OpenVino,
-    #[value(name = "coreml")]
-    CoreMl,
 }
 
 impl BackendInstallArg {
@@ -271,36 +255,7 @@ impl BackendInstallArg {
             Self::LlamaCuda => Some(LlamaCppMode::Cuda),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::Burn
-            | Self::BurnCuda
-            | Self::BurnWgpu
-            | Self::BurnCpu
-            | Self::Vllm
-            | Self::Sglang
-            | Self::Onnxruntime
-            | Self::Mlx
-            | Self::TensorRt
-            | Self::OpenVino
-            | Self::CoreMl => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::LlamaCuda => "llama-cuda",
-            Self::LlamaVulkan => "llama-vulkan",
-            Self::LlamaCpu => "llama-cpu",
-            Self::Burn => "burn",
-            Self::BurnCuda => "burn-cuda",
-            Self::BurnWgpu => "burn-wgpu",
-            Self::BurnCpu => "burn-cpu",
-            Self::Vllm => "vllm",
-            Self::Sglang => "sglang",
-            Self::Onnxruntime => "onnxruntime",
-            Self::Mlx => "mlx",
-            Self::TensorRt => "tensorrt",
-            Self::OpenVino => "openvino",
-            Self::CoreMl => "coreml",
+            Self::Vllm => None,
         }
     }
 }
@@ -629,16 +584,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             let backend_to_build =
                 backend_to_build_for_request(backend_choice, selected_backend, &manifest);
             let backend = build_generation_backend(store, backend_to_build, llama_options.clone())?;
-            let prompt = messages_to_prompt_for_model(
-                &manifest,
-                &[ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(MessageContent::Text(prompt)),
-                    name: None,
-                }],
-            );
+            let messages = vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(prompt)),
+                name: None,
+            }];
+            let prompt = messages_to_prompt_for_model(&manifest, &messages);
             let request = GenerateRequest {
                 prompt: prompt.prompt,
+                messages,
                 image_urls: images,
                 max_tokens,
                 temperature,
@@ -769,8 +723,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                             display_llama_mode(mode),
                             executable.display()
                         );
-                    } else {
-                        println!("Backend installer pending for {}.", target.label());
+                    } else if target == BackendInstallArg::Vllm {
+                        let python = install_managed_vllm(&store)?;
+                        println!("Installed vLLM backend: {}", python.display());
                     }
                     Ok(())
                 }
@@ -938,6 +893,7 @@ async fn chat_loop(
         let prompt = messages_to_prompt_for_model(&manifest, &messages);
         let request = GenerateRequest {
             prompt: prompt.prompt,
+            messages: messages.clone(),
             image_urls: images.clone(),
             max_tokens,
             temperature,
@@ -1181,6 +1137,11 @@ fn run_benchmark_choice(
     for index in 0..warmups + runs {
         let request = GenerateRequest {
             prompt: prompt.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(prompt.to_string())),
+                name: None,
+            }],
             image_urls: Vec::new(),
             max_tokens,
             temperature: Some(temperature),
@@ -1337,6 +1298,35 @@ fn print_backend_list(store: &ModelStore) {
     }
 
     println!();
+    println!("vLLM discovery");
+    let discovery = VllmBackend::discover(store);
+    let vllm_path = discovery
+        .attempts
+        .iter()
+        .find(|attempt| attempt.usable)
+        .and_then(|attempt| attempt.path.as_ref())
+        .or_else(|| {
+            discovery
+                .attempts
+                .iter()
+                .find(|attempt| attempt.label == "managed venv")
+                .and_then(|attempt| attempt.path.as_ref())
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| managed_vllm_dir(store).join("venv").display().to_string());
+    println!(
+        "{:<8} {:<16} {:<7} {}",
+        "BACKEND", "SOURCE", "EXISTS", "PATH"
+    );
+    println!(
+        "{:<8} {:<16} {:<7} {}",
+        "vLLM",
+        discovery.source,
+        yes_no(discovery.command.is_some()),
+        vllm_path
+    );
+
+    println!();
     println!(
         "{:<24} {:<12} {:<12} {:<8} INSTALL",
         "RUNTIME", "STATE", "ACCEL", "VLM"
@@ -1400,6 +1390,14 @@ fn print_backend_doctor(store: &ModelStore) {
     );
     println!();
     for check in backend_doctor_checks(store) {
+        println!(
+            "{:<24} {:<7} {}",
+            check.name,
+            if check.ok { "ok" } else { "missing" },
+            check.detail
+        );
+    }
+    for check in vllm_doctor_checks(store) {
         println!(
             "{:<24} {:<7} {}",
             check.name,
@@ -1570,6 +1568,7 @@ enum BackendChoice {
     LlamaFast(LlamaCppMode),
     LlamaHighlevel(LlamaCppMode),
     Mlx,
+    Vllm,
 }
 
 struct AutoBackend {
@@ -1841,6 +1840,7 @@ fn build_concrete_backend(
         ))),
         BackendChoice::LlamaHighlevel(mode) => Ok(Arc::new(LlamaCppBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
+        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
     }
 }
 
@@ -1867,17 +1867,7 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::CandleMetal => Some(BackendChoice::Candle(CandleDeviceMode::Metal)),
         RuntimeId::CandleCpu => Some(BackendChoice::Candle(CandleDeviceMode::Cpu)),
         RuntimeId::Mlx => Some(BackendChoice::Mlx),
-        RuntimeId::BurnCuda
-        | RuntimeId::BurnWgpu
-        | RuntimeId::BurnCpu
-        | RuntimeId::OnnxRuntimeCuda
-        | RuntimeId::OnnxRuntimeDirectMl
-        | RuntimeId::OnnxRuntimeCpu
-        | RuntimeId::TensorRt
-        | RuntimeId::OpenVino
-        | RuntimeId::CoreMl
-        | RuntimeId::ExternalVllm
-        | RuntimeId::ExternalSglang => None,
+        RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
     }
 }
 
@@ -1891,6 +1881,7 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         BackendChoice::Candle(CandleDeviceMode::Cpu)
         | BackendChoice::Candle(CandleDeviceMode::Auto) => Some(RuntimeId::CandleCpu),
         BackendChoice::Mlx => Some(RuntimeId::Mlx),
+        BackendChoice::Vllm => Some(RuntimeId::VllmCuda),
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
         | BackendChoice::LlamaFast(_)
@@ -1985,6 +1976,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
         BackendChoice::LlamaFast(_) => BackendRuntime::LlamaLegacy,
         BackendChoice::LlamaHighlevel(_) => BackendRuntime::LlamaHighlevel,
         BackendChoice::Mlx => BackendRuntime::Mlx,
+        BackendChoice::Vllm => BackendRuntime::Vllm,
     }
 }
 
@@ -2005,6 +1997,7 @@ fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
         | BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => BackendAccelerator::Vulkan,
         BackendChoice::Candle(CandleDeviceMode::Metal) => BackendAccelerator::Metal,
         BackendChoice::Mlx => BackendAccelerator::Mlx,
+        BackendChoice::Vllm => BackendAccelerator::Cuda,
     }
 }
 
@@ -2016,6 +2009,7 @@ fn backend_available_for_store(store: &ModelStore, backend: BackendChoice) -> bo
         BackendChoice::Candle(CandleDeviceMode::Cpu) => true,
         BackendChoice::Candle(mode) => probe_device(mode).is_ok(),
         BackendChoice::Mlx => MlxBackend::probe().is_ok(),
+        BackendChoice::Vllm => VllmBackend::probe(store).is_ok(),
         BackendChoice::LlamaServer(mode) => LlamaServerBackend::probe(store, mode).is_ok(),
         BackendChoice::LlamaFast(mode) => LlamaFastBackend::probe(mode).is_ok(),
         BackendChoice::LlamaHighlevel(mode) => LlamaCppBackend::probe(mode).is_ok(),
@@ -2049,7 +2043,7 @@ fn selected_backend_for_request(
             ensure_backend_supports_images(selected, has_images)?;
             Ok(selected)
         }
-        BackendChoice::LlamaServer(_) | BackendChoice::Mlx => {
+        BackendChoice::LlamaServer(_) | BackendChoice::Mlx | BackendChoice::Vllm => {
             let Some(runtime_id) = backend_to_runtime_id(backend) else {
                 bail!(
                     "backend {} is not represented in the runtime planner",
@@ -2144,6 +2138,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         | BackendChoice::LlamaServer(LlamaCppMode::Cpu) => RequestedBackend::Cpu,
         BackendChoice::Candle(_) => RequestedBackend::Candle,
         BackendChoice::Mlx => RequestedBackend::Mlx,
+        BackendChoice::Vllm => RequestedBackend::Cuda,
         BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
         BackendChoice::LlamaHighlevel(_) => RequestedBackend::LlamaHighlevel,
     }
@@ -2313,6 +2308,7 @@ fn availability_rejection_reason(
             "Candle Metal is unavailable".to_string()
         }
         BackendChoice::Mlx => "mlx-lm is unavailable".to_string(),
+        BackendChoice::Vllm => VllmBackend::missing_message(store),
         _ => "backend is unavailable".to_string(),
     }
 }
@@ -2413,6 +2409,7 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Cuda) => "candle-cuda",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
+        BackendChoice::Vllm => "vllm-cuda",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama-server-cuda",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama-server-vulkan",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama-server-cpu",
@@ -2443,6 +2440,7 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Cuda) => "Candle CUDA",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "Candle Metal",
         BackendChoice::Mlx => "MLX",
+        BackendChoice::Vllm => "vLLM CUDA",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama.cpp server CUDA",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama.cpp server Vulkan",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama.cpp server CPU",
@@ -2700,27 +2698,11 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
-        let cli = Cli::try_parse_from(["werk", "backend", "install", "burn-wgpu"]).unwrap();
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "vllm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
                 command: BackendCommands::Install { target },
-            } => assert_eq!(target, BackendInstallArg::BurnWgpu),
-            command => panic!("unexpected command: {command:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["werk", "backend", "install", "burn"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Backend {
-                command: BackendCommands::Install { target },
-            } => assert_eq!(target, BackendInstallArg::Burn),
-            command => panic!("unexpected command: {command:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["werk", "backend", "install", "tensorrt"]).unwrap();
-        match cli.command.unwrap() {
-            Commands::Backend {
-                command: BackendCommands::Install { target },
-            } => assert_eq!(target, BackendInstallArg::TensorRt),
+            } => assert_eq!(target, BackendInstallArg::Vllm),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -2872,41 +2854,32 @@ mod tests {
     }
 
     #[test]
-    fn auto_safetensors_prefers_candle_cuda_then_cpu_on_linux_and_windows() {
+    fn auto_safetensors_prefers_vllm_then_candle_on_linux_and_windows() {
         if cfg!(any(windows, target_os = "linux")) {
             let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
             let order = auto_candidates_for_manifest(&manifest);
-            assert!(matches!(
-                order[0],
-                BackendChoice::Candle(CandleDeviceMode::Cuda)
-            ));
+            assert!(matches!(order[0], BackendChoice::Vllm));
             assert!(matches!(
                 order[1],
-                BackendChoice::Candle(CandleDeviceMode::Cpu)
+                BackendChoice::Candle(CandleDeviceMode::Cuda)
             ));
         }
     }
 
     #[test]
-    fn runtime_registry_exposes_pending_native_runtimes() {
-        let burn = runtime_descriptor(RuntimeId::BurnWgpu);
-        assert_eq!(burn.display_name, "Burn WGPU/Vulkan");
-        assert!(!burn.implemented);
-        assert_eq!(burn.install_target, Some("burn-wgpu"));
-
-        let onnx = runtime_descriptor(RuntimeId::OnnxRuntimeCuda);
-        assert_eq!(onnx.install_target, Some("onnxruntime"));
-        assert!(!onnx.implemented);
+    fn runtime_registry_exposes_real_vllm_runtime() {
+        let vllm = runtime_descriptor(RuntimeId::VllmCuda);
+        assert_eq!(vllm.display_name, "vLLM CUDA");
+        assert!(vllm.implemented);
+        assert_eq!(vllm.install_target, Some("vllm"));
     }
 
     #[test]
-    fn safetensors_runtime_candidates_include_pending_burn_before_candle_for_phi3() {
+    fn safetensors_runtime_candidates_include_vllm_before_candle_for_phi3() {
         if cfg!(any(windows, target_os = "linux")) {
             let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
             let candidates = auto_runtime_candidates_for_manifest(&manifest);
-            assert_eq!(candidates[0], RuntimeId::OnnxRuntimeCuda);
-            assert_eq!(candidates[1], RuntimeId::TensorRt);
-            assert_eq!(candidates[2], RuntimeId::BurnCuda);
+            assert_eq!(candidates[0], RuntimeId::VllmCuda);
             assert!(
                 candidates
                     .iter()
@@ -2914,30 +2887,24 @@ mod tests {
                     .unwrap()
                     > candidates
                         .iter()
-                        .position(|id| *id == RuntimeId::BurnCuda)
+                        .position(|id| *id == RuntimeId::VllmCuda)
                         .unwrap()
             );
 
             let concrete = auto_candidates_for_manifest(&manifest);
-            assert!(matches!(
-                concrete[0],
-                BackendChoice::Candle(CandleDeviceMode::Cuda)
-            ));
+            assert!(matches!(concrete[0], BackendChoice::Vllm));
         }
     }
 
     #[test]
-    fn safetensors_vulkan_considers_only_vulkan_capable_runtime() {
+    fn safetensors_vulkan_has_no_silent_cpu_or_candle_fallback() {
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let requested = backend_arg_to_choice(BackendArg::Vulkan);
-        assert_eq!(
-            routing_candidates_for_debug(requested, &manifest),
-            vec![RuntimeId::BurnWgpu]
-        );
+        assert!(routing_candidates_for_debug(requested, &manifest).is_empty());
 
         let store = test_store("safetensors-vulkan-runtime");
         let err = selected_backend_for_manifest(&store, requested, &manifest).unwrap_err();
-        assert!(err.to_string().contains("Burn WGPU/Vulkan"));
+        assert!(err.to_string().contains("no runtime candidates"));
         assert!(!err.to_string().contains("Candle CPU"));
     }
 
@@ -2979,8 +2946,25 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_routes_safetensors_cuda_to_candle_cuda() {
+    fn backend_selection_routes_safetensors_cuda_to_vllm_when_available() {
         let store = test_store("safetensors-cuda");
+        install_fake_managed_vllm(&store);
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let selected = selected_backend_for_manifest(
+            &store,
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Cuda,
+                candle: CandleDeviceMode::Cuda,
+            },
+            &manifest,
+        )
+        .unwrap();
+        assert!(matches!(selected, BackendChoice::Vllm));
+    }
+
+    #[test]
+    fn backend_selection_falls_back_to_candle_cuda_when_vllm_missing() {
+        let store = test_store("safetensors-cuda-fallback");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
         let result = selected_backend_for_manifest(
             &store,
@@ -2997,6 +2981,7 @@ mod tests {
             )),
             Err(err) => {
                 let message = err.to_string();
+                assert!(message.contains("vLLM"));
                 assert!(message.contains("Candle CUDA"));
                 assert!(!message.contains("Candle CPU"));
             }
@@ -3023,6 +3008,7 @@ mod tests {
         ));
 
         let safetensors = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        install_fake_managed_vllm(&store);
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -3032,12 +3018,10 @@ mod tests {
             &safetensors,
         );
         match result {
-            Ok(selected) => assert!(matches!(
-                selected,
-                BackendChoice::Candle(CandleDeviceMode::Cuda)
-            )),
+            Ok(selected) => assert!(matches!(selected, BackendChoice::Vllm)),
             Err(err) => {
                 let message = err.to_string();
+                assert!(message.contains("vLLM"));
                 assert!(message.contains("Candle CUDA"));
                 assert!(!message.contains("Candle CPU"));
             }
@@ -3054,7 +3038,7 @@ mod tests {
             &manifest,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Burn WGPU/Vulkan"));
+        assert!(err.to_string().contains("no runtime candidates"));
         assert!(!err.to_string().contains("Candle CPU"));
     }
 
@@ -3247,6 +3231,34 @@ mod tests {
     fn install_fake_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) {
         let path = managed_backend_dir(store, mode).join("llama-server");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&path);
+    }
+
+    fn install_fake_managed_vllm(store: &ModelStore) {
+        let path = if cfg!(windows) {
+            managed_vllm_dir(store)
+                .join("venv")
+                .join("Scripts")
+                .join("python.exe")
+        } else {
+            managed_vllm_dir(store)
+                .join("venv")
+                .join("bin")
+                .join("python")
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&path);
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
     }
 }

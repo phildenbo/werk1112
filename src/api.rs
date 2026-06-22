@@ -114,13 +114,16 @@ async fn chat_completions_handler(
     };
 
     let prompt = messages_to_prompt_for_model(&manifest, &request.messages);
+    let image_urls = image_urls_from_messages(&request.messages);
+    let max_tokens = request.max_completion_tokens();
     let mut stop = prompt.stop;
     stop.extend(request.stop_strings());
 
     let generate_request = GenerateRequest {
         prompt: prompt.prompt,
-        image_urls: image_urls_from_messages(&request.messages),
-        max_tokens: request.max_completion_tokens(),
+        messages: request.messages,
+        image_urls,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         stop,

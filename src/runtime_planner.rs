@@ -224,11 +224,13 @@ fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
                 vec![RuntimeId::Mlx]
             }
         }
-        ModelFormat::Onnx => onnx_auto_candidates(),
-        ModelFormat::TensorRt => vec![RuntimeId::TensorRt],
-        ModelFormat::OpenVino => vec![RuntimeId::OpenVino],
-        ModelFormat::CoreMl => vec![RuntimeId::CoreMl],
-        ModelFormat::PyTorch | ModelFormat::TensorFlow | ModelFormat::Unknown => Vec::new(),
+        ModelFormat::Onnx
+        | ModelFormat::TensorRt
+        | ModelFormat::OpenVino
+        | ModelFormat::CoreMl
+        | ModelFormat::PyTorch
+        | ModelFormat::TensorFlow
+        | ModelFormat::Unknown => Vec::new(),
     }
 }
 
@@ -255,41 +257,15 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
 fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     let architecture = normalized_architecture(manifest);
     if is_arch(&architecture, &["llama"]) {
-        append_candle_fallbacks(vec![
-            RuntimeId::ExternalVllm,
-            RuntimeId::ExternalSglang,
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-        ])
+        append_candle_fallbacks(vec![RuntimeId::VllmCuda])
     } else if is_arch(&architecture, &["phi3"]) {
-        append_candle_fallbacks(vec![
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::TensorRt,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-        ])
+        append_candle_fallbacks(vec![RuntimeId::VllmCuda])
     } else if is_arch(&architecture, &["qwen2", "qwen3"]) {
-        append_candle_fallbacks(vec![
-            RuntimeId::ExternalVllm,
-            RuntimeId::ExternalSglang,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-            RuntimeId::OnnxRuntimeCuda,
-        ])
+        append_candle_fallbacks(vec![RuntimeId::VllmCuda])
     } else if is_arch(&architecture, &["gemma", "gemma2", "gemma3"]) {
-        append_candle_fallbacks(vec![
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-            RuntimeId::OnnxRuntimeCuda,
-        ])
+        append_candle_fallbacks(vec![RuntimeId::VllmCuda])
     } else if is_arch(&architecture, &["mistral", "mixtral"]) {
-        append_candle_fallbacks(vec![
-            RuntimeId::ExternalVllm,
-            RuntimeId::ExternalSglang,
-            RuntimeId::BurnCuda,
-            RuntimeId::BurnWgpu,
-        ])
+        append_candle_fallbacks(vec![RuntimeId::VllmCuda])
     } else {
         append_candle_fallbacks(Vec::new())
     }
@@ -308,28 +284,10 @@ fn append_candle_fallbacks(mut candidates: Vec<RuntimeId>) -> Vec<RuntimeId> {
     dedupe(candidates)
 }
 
-fn onnx_auto_candidates() -> Vec<RuntimeId> {
-    let mut candidates = Vec::new();
-    if cfg!(any(windows, target_os = "linux")) {
-        candidates.push(RuntimeId::OnnxRuntimeCuda);
-    }
-    if cfg!(windows) {
-        candidates.push(RuntimeId::OnnxRuntimeDirectMl);
-    }
-    candidates.push(RuntimeId::OnnxRuntimeCpu);
-    candidates
-}
-
 fn cpu_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCpu, RuntimeId::CandleCpu],
-        ModelFormat::SafeTensors => vec![
-            RuntimeId::OnnxRuntimeCpu,
-            RuntimeId::BurnCpu,
-            RuntimeId::CandleCpu,
-        ],
-        ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCpu],
-        ModelFormat::OpenVino => vec![RuntimeId::OpenVino],
+        ModelFormat::SafeTensors => vec![RuntimeId::CandleCpu],
         _ => Vec::new(),
     }
 }
@@ -338,8 +296,6 @@ fn cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCuda],
         ModelFormat::SafeTensors => safetensors_cuda_candidates(manifest),
-        ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCuda],
-        ModelFormat::TensorRt => vec![RuntimeId::TensorRt],
         _ => Vec::new(),
     }
 }
@@ -348,28 +304,11 @@ fn safetensors_cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     let architecture = normalized_architecture(manifest);
     if is_arch(
         &architecture,
-        &["llama", "qwen2", "qwen3", "mistral", "mixtral"],
+        &[
+            "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
+        ],
     ) {
-        vec![
-            RuntimeId::ExternalVllm,
-            RuntimeId::ExternalSglang,
-            RuntimeId::BurnCuda,
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::CandleCuda,
-        ]
-    } else if is_arch(&architecture, &["phi3"]) {
-        vec![
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::TensorRt,
-            RuntimeId::BurnCuda,
-            RuntimeId::CandleCuda,
-        ]
-    } else if is_arch(&architecture, &["gemma", "gemma2", "gemma3"]) {
-        vec![
-            RuntimeId::BurnCuda,
-            RuntimeId::OnnxRuntimeCuda,
-            RuntimeId::CandleCuda,
-        ]
+        vec![RuntimeId::VllmCuda, RuntimeId::CandleCuda]
     } else {
         vec![RuntimeId::CandleCuda]
     }
@@ -378,7 +317,7 @@ fn safetensors_cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 fn vulkan_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerVulkan],
-        ModelFormat::SafeTensors => vec![RuntimeId::BurnWgpu],
+        ModelFormat::SafeTensors => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -386,7 +325,6 @@ fn vulkan_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 fn metal_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::SafeTensors | ModelFormat::Gguf => vec![RuntimeId::CandleMetal],
-        ModelFormat::CoreMl => vec![RuntimeId::CoreMl],
         _ => Vec::new(),
     }
 }
@@ -494,34 +432,16 @@ fn rejection_reason(
 
 fn model_support_rejection(manifest: &ModelManifest, runtime: BackendRuntime) -> String {
     match (runtime, &manifest.format) {
-        (BackendRuntime::OnnxRuntime, ModelFormat::SafeTensors) => {
-            "no ONNX artifact is selected for this safetensors model".to_string()
+        (BackendRuntime::Vllm, ModelFormat::SafeTensors) => {
+            "vLLM is not selected for this architecture".to_string()
         }
-        (BackendRuntime::TensorRt, ModelFormat::SafeTensors) => {
-            "no TensorRT engine is selected for this safetensors model".to_string()
-        }
-        (BackendRuntime::Burn, ModelFormat::SafeTensors) => {
-            "architecture adapter is not implemented for this model".to_string()
-        }
-        (
-            BackendRuntime::ExternalVllm | BackendRuntime::ExternalSglang,
-            ModelFormat::SafeTensors,
-        ) => "external runtime adapter is not implemented for this architecture".to_string(),
         _ => "model format or architecture is not supported".to_string(),
     }
 }
 
 fn unimplemented_runtime_rejection(manifest: &ModelManifest, runtime: BackendRuntime) -> String {
-    match (runtime, &manifest.format) {
-        (BackendRuntime::Burn, ModelFormat::SafeTensors) => {
-            "architecture adapter is not implemented for this model".to_string()
-        }
-        (
-            BackendRuntime::ExternalVllm | BackendRuntime::ExternalSglang,
-            ModelFormat::SafeTensors,
-        ) => "external runtime adapter is not implemented for this architecture".to_string(),
-        _ => "runtime integration is not implemented yet".to_string(),
-    }
+    let _ = (manifest, runtime);
+    "runtime integration is not implemented yet".to_string()
 }
 
 fn selection_reason(
@@ -532,6 +452,9 @@ fn selection_reason(
     match (manifest.format.clone(), runtime, requested_backend) {
         (ModelFormat::Gguf, BackendRuntime::LlamaServer, _) => {
             "GGUF hot path uses persistent llama.cpp server".to_string()
+        }
+        (ModelFormat::SafeTensors, BackendRuntime::Vllm, _) => {
+            "HF safetensors hot path uses vLLM".to_string()
         }
         (_, BackendRuntime::Candle, RequestedBackend::Candle) => {
             "explicit Candle route requested".to_string()
@@ -605,6 +528,7 @@ mod tests {
     fn safetensors_phi3_cuda_does_not_include_cpu_fallback() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Cuda);
+        assert_eq!(candidates[0], RuntimeId::VllmCuda);
         assert!(candidates.contains(&RuntimeId::CandleCuda));
         assert!(!candidates.contains(&RuntimeId::CandleCpu));
     }
@@ -613,8 +537,7 @@ mod tests {
     fn safetensors_qwen_auto_tries_non_candle_before_candle() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("qwen2"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::ExternalVllm);
-        assert_eq!(candidates[1], RuntimeId::ExternalSglang);
+        assert_eq!(candidates[0], RuntimeId::VllmCuda);
         assert!(
             candidates
                 .iter()
@@ -622,9 +545,32 @@ mod tests {
                 .unwrap()
                 > candidates
                     .iter()
-                    .position(|id| *id == RuntimeId::BurnCuda)
+                    .position(|id| *id == RuntimeId::VllmCuda)
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn safetensors_supported_architectures_prefer_vllm() {
+        for architecture in [
+            "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
+        ] {
+            let manifest = manifest(ModelFormat::SafeTensors, Some(architecture));
+            let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
+            assert_eq!(
+                candidates[0],
+                RuntimeId::VllmCuda,
+                "architecture {architecture}"
+            );
+        }
+    }
+
+    #[test]
+    fn safetensors_unknown_architecture_uses_candle_fallbacks_only() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("unknown"));
+        let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
+        assert!(!candidates.contains(&RuntimeId::VllmCuda));
+        assert!(candidates.contains(&RuntimeId::CandleCpu));
     }
 
     #[test]
