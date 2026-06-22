@@ -41,7 +41,8 @@ pub enum ModelFormat {
 impl ModelFormat {
     pub fn backend_hint(&self) -> &'static str {
         match self {
-            Self::Gguf | Self::SafeTensors => "candle",
+            Self::Gguf => "llama-server",
+            Self::SafeTensors => "candle",
             Self::PyTorch => "pytorch",
             Self::Onnx => "onnxruntime",
             Self::Mlx => "mlx",
@@ -56,7 +57,7 @@ impl ModelFormat {
     pub fn backend_status(&self) -> &'static str {
         match self {
             Self::Gguf => {
-                "implemented via in-process llama.cpp; Candle fallback supports selected architectures"
+                "implemented via persistent llama.cpp server; Candle is legacy/fallback for selected architectures"
             }
             Self::SafeTensors => {
                 "implemented via Candle safetensors loaders for selected architectures"

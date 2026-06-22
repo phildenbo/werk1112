@@ -594,6 +594,21 @@ impl MlxBackend {
 }
 
 impl GenerationBackend for MlxBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        if !matches!(manifest.format, ModelFormat::Mlx | ModelFormat::SafeTensors) {
+            bail!("mlx backend supports MLX or Hugging Face-style safetensors model directories");
+        }
+        Self::probe()?;
+        let model_dir = self.store.model_dir(&manifest.id).join("files");
+        if !model_dir.is_dir() {
+            bail!(
+                "model files directory does not exist: {}",
+                model_dir.display()
+            );
+        }
+        Ok(())
+    }
+
     fn generate(
         &self,
         manifest: &ModelManifest,

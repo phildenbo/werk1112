@@ -111,6 +111,10 @@ pub fn probe_device(mode: CandleDeviceMode) -> Result<String> {
 }
 
 impl GenerationBackend for CandleBackend {
+    fn prepare(&self, manifest: &ModelManifest) -> Result<()> {
+        self.cached_model(manifest).map(|_| ())
+    }
+
     fn generate(
         &self,
         manifest: &ModelManifest,
@@ -774,7 +778,7 @@ fn load_safetensors_model(
             Ok(CandleModel::SafePhi3(phi3::Model::new(&cfg, vb)?))
         }
         other => bail!(
-            "unsupported safetensors architecture '{other}' for Candle backend; supported: llama, gemma, gemma2, qwen2, mistral, phi3"
+            "Safetensors architecture '{other}' is not supported by Candle backend yet; supported: llama, gemma, gemma2, qwen2, mistral, phi3"
         ),
     }
 }
