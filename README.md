@@ -55,6 +55,7 @@ Planner policy:
 - GGUF routes to llama.cpp server CUDA, Vulkan, or CPU first. Candle GGUF is legacy fallback/debug only.
 - Safetensors Llama/Qwen/Mistral/Mixtral/Phi-3/Gemma-class text models prefer vLLM CUDA when it is installed, then Candle fallback.
 - Unknown or unsupported safetensors architectures use Candle only when Candle supports them.
+- `--backend vllm` is a strict vLLM-only safetensors route and never falls back to Candle.
 - `--backend cpu` is CPU-only, `--backend cuda` is CUDA-only, `--backend vulkan` is Vulkan-only, and `--backend candle` is an explicit Candle route.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
 - `--debug` prints the candidate runtime decisions and rejection reasons. `--verbose` stays focused on backend/timing stats.
@@ -275,6 +276,7 @@ Build features decide what Candle and llama.cpp acceleration support is compiled
 werk --backend auto chat gemma-2b-it
 werk --backend cpu chat gemma-2b-it
 werk --backend cuda chat gemma-2b-it
+werk --backend vllm chat phi-3-mini-4k-instruct
 werk --backend metal chat gemma-2b-it
 werk --backend vulkan chat TinyLLama-1B-GGUF
 werk --backend mlx chat mlx-model
@@ -282,9 +284,9 @@ werk --backend candle chat debug-model
 werk --backend cuda serve --model gemma-2b-it
 ```
 
-`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback. For safetensors it tries vLLM CUDA for supported HF text architectures, then Candle CUDA/Metal/CPU as a compatibility fallback. On Apple Silicon it prefers MLX for MLX models and may use MLX/Candle for safetensors depending on availability.
+`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback. For safetensors it tries vLLM CUDA for supported HF text architectures, then Candle CUDA/Metal/CPU as a compatibility fallback. With `--verbose`, any vLLM-to-Candle fallback is printed explicitly. On Apple Silicon it prefers MLX for MLX models and may use MLX/Candle for safetensors depending on availability.
 
-For GGUF models, `--backend cuda`, `--backend vulkan`, and `--backend cpu` use the persistent llama.cpp server backend when that server is available. For safetensors models, those same backend names mean "choose the best runtime for that accelerator," not "force Candle." Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
+For GGUF models, `--backend cuda`, `--backend vulkan`, and `--backend cpu` use the persistent llama.cpp server backend when that server is available. For safetensors models, those same backend names mean "choose the best runtime for that accelerator," not "force Candle." `--backend vllm` forces vLLM only and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
 ## End-User Releases
 
@@ -305,6 +307,7 @@ Backend selection is per process. There is no persisted setup step.
 ```bash
 werk --backend auto chat model-id
 werk --backend cuda chat model-id
+werk --backend vllm chat model-id
 werk --backend vulkan chat model-id
 werk --backend mlx chat model-id
 werk --backend metal chat model-id
@@ -312,7 +315,7 @@ werk --backend cpu chat model-id
 werk --backend candle chat model-id
 ```
 
-`auto` is format-aware: GGUF uses llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM CUDA before Candle fallback for supported HF text architectures; MLX-format models use MLX. Explicit GPU requests do not silently fall back to CPU.
+`auto` is format-aware: GGUF uses llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM CUDA before Candle fallback for supported HF text architectures; MLX-format models use MLX. Explicit `vllm` requests do not fallback, and explicit GPU requests do not silently fall back to CPU.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 

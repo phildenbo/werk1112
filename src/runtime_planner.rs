@@ -17,6 +17,7 @@ pub enum RequestedBackend {
     Metal,
     Mlx,
     Candle,
+    Vllm,
     LlamaLegacy,
     LlamaHighlevel,
 }
@@ -209,6 +210,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Metal => metal_candidates(manifest),
         RequestedBackend::Mlx => vec![RuntimeId::Mlx],
         RequestedBackend::Candle => candle_candidates(manifest),
+        RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => Vec::new(),
     }
 }
@@ -563,6 +565,13 @@ mod tests {
                 "architecture {architecture}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_vllm_request_has_no_candle_fallback_candidates() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Vllm);
+        assert_eq!(candidates, vec![RuntimeId::VllmCuda]);
     }
 
     #[test]

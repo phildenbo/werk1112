@@ -113,6 +113,10 @@ impl VllmBackend {
         missing_vllm_message(&discover_vllm(store))
     }
 
+    pub fn unavailable_reason(store: &ModelStore) -> String {
+        concise_vllm_unavailable_reason(&discover_vllm(store))
+    }
+
     fn cached_server(&self, manifest: &ModelManifest) -> Result<(Arc<VllmProcess>, bool, f64)> {
         if manifest.format != ModelFormat::SafeTensors {
             bail!("vLLM backend supports HF safetensors model directories only");
@@ -278,6 +282,7 @@ impl VllmProcess {
             .clone()
             .context("vLLM discovery had no command")?;
         let log_tail = Arc::new(Mutex::new(VecDeque::new()));
+        eprintln!("Using vLLM CUDA backend");
 
         if let VllmCommand::Remote { host, port } = command {
             let process = Self {
@@ -298,7 +303,6 @@ impl VllmProcess {
         let port = free_local_port()?;
         let url = format!("http://127.0.0.1:{port}");
         let args = vllm_server_args(&command, model_dir, &manifest.id, port);
-        eprintln!("Using vLLM CUDA backend");
         let mut child_command = Command::new(command.executable());
         child_command.args(&args);
         if env_true("WERK_VLLM_LOG") {
@@ -760,29 +764,48 @@ fn require_vllm(store: &ModelStore) -> Result<VllmDiscovery> {
 fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
     let mut attempts = Vec::new();
 
-    if let (Ok(host), Ok(port)) = (env::var("WERK_VLLM_HOST"), env::var("WERK_VLLM_PORT"))
-        && let Ok(port) = port.parse::<u16>()
-    {
-        let command = VllmCommand::Remote { host, port };
-        return VllmDiscovery {
-            command: Some(command),
-            source: "env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
-            attempts,
-        };
+    if let (Ok(host), Ok(port)) = (env::var("WERK_VLLM_HOST"), env::var("WERK_VLLM_PORT")) {
+        match port.parse::<u16>() {
+            Ok(port) => {
+                let usable = remote_supports_vllm(&host, port);
+                attempts.push(VllmDiscoveryAttempt {
+                    label: "WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                    path: None,
+                    exists: usable,
+                    usable,
+                    detail: if usable {
+                        format!("remote vLLM server reachable at http://{host}:{port}")
+                    } else {
+                        format!("remote vLLM server is not reachable at http://{host}:{port}")
+                    },
+                });
+                if usable {
+                    let command = VllmCommand::Remote { host, port };
+                    return VllmDiscovery {
+                        command: Some(command),
+                        source: "env WERK_VLLM_HOST/WERK_VLLM_PORT".to_string(),
+                        attempts,
+                    };
+                }
+            }
+            Err(err) => attempts.push(VllmDiscoveryAttempt {
+                label: "WERK_VLLM_PORT".to_string(),
+                path: None,
+                exists: true,
+                usable: false,
+                detail: format!("invalid port: {err}"),
+            }),
+        }
     }
 
     if let Some(path) = env::var_os("WERK_VLLM_PYTHON").map(PathBuf::from) {
-        let usable = python_supports_vllm(&path);
+        let (usable, detail) = python_vllm_status(&path);
         attempts.push(VllmDiscoveryAttempt {
             label: "WERK_VLLM_PYTHON".to_string(),
             path: Some(path.clone()),
             exists: path.is_file(),
             usable,
-            detail: if usable {
-                "vLLM import ok".to_string()
-            } else {
-                "Python does not import vLLM".to_string()
-            },
+            detail,
         });
         if usable {
             return VllmDiscovery {
@@ -794,17 +817,13 @@ fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
     }
 
     let managed_python = managed_vllm_python(store);
-    let managed_usable = python_supports_vllm(&managed_python);
+    let (managed_usable, managed_detail) = python_vllm_status(&managed_python);
     attempts.push(VllmDiscoveryAttempt {
         label: "managed venv".to_string(),
         path: Some(managed_python.clone()),
         exists: managed_python.is_file(),
         usable: managed_usable,
-        detail: if managed_usable {
-            "vLLM import ok".to_string()
-        } else {
-            "managed venv missing vLLM".to_string()
-        },
+        detail: managed_detail,
     });
     if managed_usable {
         return VllmDiscovery {
@@ -846,17 +865,13 @@ fn discover_vllm(store: &ModelStore) -> VllmDiscovery {
 
     for name in ["python3", "python"] {
         if let Some(path) = find_in_path(name) {
-            let usable = python_supports_vllm(&path);
+            let (usable, detail) = python_vllm_status(&path);
             attempts.push(VllmDiscoveryAttempt {
                 label: format!("PATH: {name}"),
                 path: Some(path.clone()),
                 exists: true,
                 usable,
-                detail: if usable {
-                    "vLLM import ok".to_string()
-                } else {
-                    "Python does not import vLLM".to_string()
-                },
+                detail,
             });
             if usable {
                 return VllmDiscovery {
@@ -902,18 +917,48 @@ fn missing_vllm_message(discovery: &VllmDiscovery) -> String {
     message
 }
 
-fn python_supports_vllm(path: &Path) -> bool {
-    path.is_file()
-        && Command::new(path)
-            .arg("-c")
-            .arg("import vllm")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+fn concise_vllm_unavailable_reason(discovery: &VllmDiscovery) -> String {
+    if discovery.attempts.is_empty() {
+        return "No vLLM runtime found; run: werk backend install vllm".to_string();
+    }
+    if let Some(attempt) = discovery
+        .attempts
+        .iter()
+        .find(|attempt| attempt.exists && !attempt.usable)
+        .or_else(|| discovery.attempts.iter().find(|attempt| !attempt.usable))
+    {
+        let path = attempt
+            .path
+            .as_ref()
+            .map(|path| format!(" ({})", path.display()))
+            .unwrap_or_default();
+        format!("{}{}: {}", attempt.label, path, attempt.detail)
+    } else {
+        "No vLLM runtime found; run: werk backend install vllm".to_string()
+    }
+}
+
+fn python_vllm_status(path: &Path) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "Python path does not exist".to_string());
+    }
+    match Command::new(path)
+        .arg("-c")
+        .arg("import vllm; import vllm.entrypoints.openai.api_server")
+        .output()
+    {
+        Ok(output) if output.status.success() => (true, "vLLM OpenAI server import ok".to_string()),
+        Ok(output) => (
+            false,
+            command_failure_detail("Python cannot import vLLM OpenAI server", &output),
+        ),
+        Err(err) => (false, format!("failed to run Python: {err}")),
+    }
 }
 
 fn executable_supports_vllm(path: &Path) -> bool {
     Command::new(path)
+        .arg("serve")
         .arg("--help")
         .output()
         .map(|output| output.status.success())
@@ -921,11 +966,56 @@ fn executable_supports_vllm(path: &Path) -> bool {
 }
 
 fn validate_vllm_python(path: &Path) -> Result<()> {
-    if python_supports_vllm(path) {
-        Ok(())
-    } else {
-        bail!("vLLM installation validation failed for {}", path.display())
+    let (usable, detail) = python_vllm_status(path);
+    if !usable {
+        bail!(
+            "vLLM installation validation failed for {}: {}",
+            path.display(),
+            detail
+        );
     }
+    let output = Command::new(path)
+        .arg("-m")
+        .arg("vllm.entrypoints.openai.api_server")
+        .arg("--help")
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to validate vLLM OpenAI server entrypoint with {}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "vLLM OpenAI server entrypoint validation failed for {}: {}",
+            path.display(),
+            command_failure_detail("server module did not start", &output)
+        );
+    }
+    Ok(())
+}
+
+fn remote_supports_vllm(host: &str, port: u16) -> bool {
+    let url = format!("http://{host}:{port}");
+    get(&url, "/v1/models")
+        .map(|response| response.status == 200)
+        .unwrap_or(false)
+        || get(&url, "/health")
+            .map(|response| response.status == 200)
+            .unwrap_or(false)
+}
+
+fn command_failure_detail(prefix: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        output.status.to_string()
+    };
+    format!("{prefix}: {detail}")
 }
 
 fn vllm_version(command: &VllmCommand) -> Option<String> {

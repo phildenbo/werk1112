@@ -63,7 +63,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, vulkan, metal, mlx, candle, llama-highlevel, or llama-legacy"
+        help = "Backend for this process: auto, cpu, cuda, vulkan, metal, mlx, vllm, candle, llama-highlevel, or llama-legacy"
     )]
     pub backend: BackendArg,
 
@@ -98,6 +98,7 @@ pub enum BackendArg {
     LlamaLegacy,
     Metal,
     Mlx,
+    Vllm,
     Vulkan,
 }
 
@@ -581,6 +582,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 selected_backend,
                 debug,
             );
+            print_verbose_fallback_note(
+                &store,
+                backend_choice,
+                &manifest,
+                !images.is_empty(),
+                selected_backend,
+                verbose,
+            );
             let backend_to_build =
                 backend_to_build_for_request(backend_choice, selected_backend, &manifest);
             let backend = build_generation_backend(store, backend_to_build, llama_options.clone())?;
@@ -646,6 +655,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 !images.is_empty(),
                 selected_backend,
                 debug,
+            );
+            print_verbose_fallback_note(
+                &store,
+                backend_choice,
+                &manifest,
+                !images.is_empty(),
+                selected_backend,
+                verbose,
             );
             let backend_to_build =
                 backend_to_build_for_request(backend_choice, selected_backend, &manifest);
@@ -1771,6 +1788,7 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
         },
         BackendArg::Metal => BackendChoice::Candle(CandleDeviceMode::Metal),
         BackendArg::Mlx => BackendChoice::Mlx,
+        BackendArg::Vllm => BackendChoice::Vllm,
         BackendArg::Vulkan => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Vulkan,
             candle: CandleDeviceMode::Auto,
@@ -1932,11 +1950,12 @@ fn select_backend_from_runtime_candidates(
             continue;
         };
         if !backend_available_for_store(store, backend) {
-            rejected.push(format!(
-                "{}: {}",
-                descriptor.display_name,
+            let reason = if candidates.len() == 1 {
+                unavailable_backend_message(store, backend, manifest)
+            } else {
                 availability_rejection_reason(store, backend, manifest)
-            ));
+            };
+            rejected.push(format!("{}: {}", descriptor.display_name, reason));
             continue;
         }
         return Ok(backend);
@@ -2085,6 +2104,61 @@ fn select_backend_with_planner(
     })
 }
 
+fn verbose_fallback_note(
+    store: &ModelStore,
+    requested_choice: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    selected: BackendChoice,
+) -> Option<String> {
+    if manifest.format != ModelFormat::SafeTensors
+        || !matches!(requested_choice, BackendChoice::Auto)
+        || !matches!(selected, BackendChoice::Candle(_))
+    {
+        return None;
+    }
+
+    let capabilities = request_capabilities(has_images);
+    let availability = runtime_availabilities_for_request(store, manifest);
+    let plan = plan_runtime(
+        manifest,
+        RequestedBackend::Auto,
+        capabilities,
+        &availability,
+    );
+    let vllm_rejection = plan.candidates.iter().find(|decision| {
+        decision.runtime_id == RuntimeId::VllmCuda
+            && decision.status == RuntimeDecisionStatus::Rejected
+    })?;
+    Some(format!(
+        "vLLM unavailable: {}; falling back to {}",
+        compact_reason(&vllm_rejection.reason),
+        verbose_backend_label(selected)
+    ))
+}
+
+fn print_verbose_fallback_note(
+    store: &ModelStore,
+    requested_choice: BackendChoice,
+    manifest: &ModelManifest,
+    has_images: bool,
+    selected: BackendChoice,
+    verbose: bool,
+) {
+    if !verbose {
+        return;
+    }
+    if let Some(note) =
+        verbose_fallback_note(store, requested_choice, manifest, has_images, selected)
+    {
+        eprintln!("{note}");
+    }
+}
+
+fn compact_reason(reason: &str) -> String {
+    reason.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn runtime_availabilities_for_request(
     store: &ModelStore,
     manifest: &ModelManifest,
@@ -2138,7 +2212,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         | BackendChoice::LlamaServer(LlamaCppMode::Cpu) => RequestedBackend::Cpu,
         BackendChoice::Candle(_) => RequestedBackend::Candle,
         BackendChoice::Mlx => RequestedBackend::Mlx,
-        BackendChoice::Vllm => RequestedBackend::Cuda,
+        BackendChoice::Vllm => RequestedBackend::Vllm,
         BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
         BackendChoice::LlamaHighlevel(_) => RequestedBackend::LlamaHighlevel,
     }
@@ -2196,6 +2270,8 @@ fn unavailable_backend_message(
         (BackendChoice::LlamaServer(mode), ModelFormat::Gguf) => {
             LlamaServerBackend::missing_message(store, mode)
         }
+        (BackendChoice::Vllm, ModelFormat::SafeTensors) => VllmBackend::missing_message(store),
+        (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
         _ => format!(
             "backend {} is unavailable for model '{}' with format {:?}",
             backend_label(backend),
@@ -2270,7 +2346,7 @@ fn print_routing_debug(
             RuntimeDecisionStatus::Rejected => "rejected",
         };
         eprintln!(
-            "- {}: {status}, reason: {}",
+            "candidate: {} -> {status}: {}",
             decision.display_name, decision.reason
         );
     }
@@ -2308,7 +2384,7 @@ fn availability_rejection_reason(
             "Candle Metal is unavailable".to_string()
         }
         BackendChoice::Mlx => "mlx-lm is unavailable".to_string(),
-        BackendChoice::Vllm => VllmBackend::missing_message(store),
+        BackendChoice::Vllm => VllmBackend::unavailable_reason(store),
         _ => "backend is unavailable".to_string(),
     }
 }
@@ -2339,6 +2415,7 @@ fn requested_backend_label(backend: BackendArg) -> &'static str {
         BackendArg::LlamaLegacy => "llama-legacy",
         BackendArg::Metal => "metal",
         BackendArg::Mlx => "mlx",
+        BackendArg::Vllm => "vllm",
         BackendArg::Vulkan => "vulkan",
     }
 }
@@ -2728,6 +2805,13 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "--backend", "vllm", "chat", "tiny"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Vllm);
+        match cli.command.unwrap() {
+            Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli =
             Cli::try_parse_from(["werk", "select-file", "tiny", "tinyllama.Q4_K_M.gguf"]).unwrap();
         match cli.command.unwrap() {
@@ -2822,6 +2906,10 @@ mod tests {
         assert!(matches!(
             backend_arg_to_choice(BackendArg::Candle),
             BackendChoice::Candle(CandleDeviceMode::Auto)
+        ));
+        assert!(matches!(
+            backend_arg_to_choice(BackendArg::Vllm),
+            BackendChoice::Vllm
         ));
     }
 
@@ -2960,6 +3048,46 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(selected, BackendChoice::Vllm));
+    }
+
+    #[test]
+    fn explicit_vllm_selection_never_falls_back_to_candle() {
+        let store = test_store("explicit-vllm-missing");
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let err =
+            selected_backend_for_manifest(&store, BackendChoice::Vllm, &manifest).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("vLLM CUDA"));
+        assert!(!message.contains("Candle CUDA"));
+    }
+
+    #[test]
+    fn auto_safetensors_fallback_note_mentions_vllm_reason() {
+        let store = test_store("auto-vllm-fallback-note");
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let note = verbose_fallback_note(
+            &store,
+            BackendChoice::Auto,
+            &manifest,
+            false,
+            BackendChoice::Candle(CandleDeviceMode::Cuda),
+        )
+        .unwrap();
+        assert!(note.starts_with("vLLM unavailable:"));
+        assert!(note.contains("falling back to Candle CUDA"));
+    }
+
+    #[test]
+    fn auto_safetensors_can_fallback_to_candle_with_vllm_reason() {
+        let store = test_store("auto-vllm-fallback");
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let selected =
+            selected_backend_for_manifest(&store, BackendChoice::Auto, &manifest).unwrap();
+        assert!(matches!(selected, BackendChoice::Candle(_)));
+        let note =
+            verbose_fallback_note(&store, BackendChoice::Auto, &manifest, false, selected).unwrap();
+        assert!(note.starts_with("vLLM unavailable:"));
+        assert!(note.contains("falling back to Candle"));
     }
 
     #[test]
