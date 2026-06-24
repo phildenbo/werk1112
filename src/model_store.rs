@@ -42,7 +42,7 @@ impl ModelFormat {
     pub fn backend_hint(&self) -> &'static str {
         match self {
             Self::Gguf => "llama-server",
-            Self::SafeTensors => "candle",
+            Self::SafeTensors => "onnxruntime",
             Self::PyTorch => "pytorch",
             Self::Onnx => "onnxruntime",
             Self::Mlx => "mlx",
@@ -60,7 +60,7 @@ impl ModelFormat {
                 "implemented via persistent llama.cpp server; Candle is legacy/fallback for selected architectures"
             }
             Self::SafeTensors => {
-                "implemented via Candle safetensors loaders for selected architectures"
+                "optimized artifacts through ONNX Runtime when available; Candle is compatibility fallback"
             }
             Self::PyTorch => "catalog/import only; PyTorch backend is not wired yet",
             Self::Onnx => "catalog/import only; ONNX Runtime backend is not wired yet",
@@ -88,6 +88,28 @@ pub struct ModelFile {
     pub checksum: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Onnx,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStatus {
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelArtifact {
+    pub kind: ArtifactKind,
+    pub path: String,
+    pub status: ArtifactStatus,
+    pub created_unix: u64,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManifest {
     pub id: String,
@@ -100,6 +122,8 @@ pub struct ModelManifest {
     pub backend: String,
     pub created_unix: u64,
     pub files: Vec<ModelFile>,
+    #[serde(default)]
+    pub artifacts: Vec<ModelArtifact>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +181,14 @@ impl ModelStore {
 
     pub fn model_dir(&self, id: &str) -> PathBuf {
         self.models_dir().join(sanitize_id(id))
+    }
+
+    pub fn artifacts_dir(&self, id: &str) -> PathBuf {
+        self.model_dir(id).join("artifacts")
+    }
+
+    pub fn onnx_artifact_dir(&self, id: &str) -> PathBuf {
+        self.artifacts_dir(id).join("onnx")
     }
 
     pub fn import_path(&self, source: &Path, id: &str) -> Result<ModelManifest> {
@@ -367,6 +399,101 @@ impl ModelStore {
         Ok(manifest)
     }
 
+    pub fn list_artifacts(&self, id: &str) -> Result<Vec<ModelArtifact>> {
+        Ok(self.get(id)?.artifacts)
+    }
+
+    pub fn ready_onnx_artifact(&self, manifest: &ModelManifest) -> Option<ModelArtifact> {
+        manifest
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == ArtifactKind::Onnx && artifact.status == ArtifactStatus::Ready
+            })
+            .cloned()
+            .filter(|artifact| self.model_dir(&manifest.id).join(&artifact.path).is_dir())
+    }
+
+    pub fn can_build_onnx_artifact(&self, manifest: &ModelManifest) -> bool {
+        manifest.format == ModelFormat::SafeTensors
+            && is_supported_onnx_architecture(manifest.architecture.as_deref())
+            && find_onnx_exporter().is_some()
+    }
+
+    pub fn build_onnx_artifact(&self, id: &str, rebuild: bool) -> Result<ModelArtifact> {
+        self.ensure()?;
+        let mut manifest = self.get(id)?;
+        if manifest.format != ModelFormat::SafeTensors {
+            bail!(
+                "ONNX artifacts can only be built for safetensors models; '{}' is {:?}",
+                manifest.id,
+                manifest.format
+            );
+        }
+        let architecture = manifest.architecture.as_deref().unwrap_or("unknown");
+        if !is_supported_onnx_architecture(Some(architecture)) {
+            bail!("ONNX artifact generation is not supported for architecture '{architecture}'");
+        }
+
+        let artifact_dir = self.onnx_artifact_dir(&manifest.id);
+        let artifact_rel = "artifacts/onnx".to_string();
+        if artifact_dir.is_dir() && !rebuild && onnx_files_exist(&artifact_dir)? {
+            let artifact = ModelArtifact {
+                kind: ArtifactKind::Onnx,
+                path: artifact_rel,
+                status: ArtifactStatus::Ready,
+                created_unix: unix_ts(),
+                detail: Some("existing ONNX artifact".to_string()),
+            };
+            upsert_artifact(&mut manifest, artifact.clone());
+            self.write_manifest(&manifest)?;
+            return Ok(artifact);
+        }
+        if rebuild && artifact_dir.exists() {
+            fs::remove_dir_all(&artifact_dir).with_context(|| {
+                format!("failed to remove ONNX artifact {}", artifact_dir.display())
+            })?;
+        }
+        fs::create_dir_all(&artifact_dir)?;
+
+        let exporter = find_onnx_exporter().ok_or_else(|| {
+            anyhow!("no ONNX exporter found; install optimum-cli or set WERK_ONNX_EXPORTER")
+        })?;
+        let source_dir = self.model_dir(&manifest.id).join("files");
+        let result = run_onnx_exporter(&exporter, &source_dir, &artifact_dir);
+        match result {
+            Ok(()) if onnx_files_exist(&artifact_dir)? => {
+                let artifact = ModelArtifact {
+                    kind: ArtifactKind::Onnx,
+                    path: artifact_rel,
+                    status: ArtifactStatus::Ready,
+                    created_unix: unix_ts(),
+                    detail: Some(format!("built with {}", exporter.label())),
+                };
+                write_json_pretty(&artifact_dir.join("artifact.json"), &artifact)?;
+                upsert_artifact(&mut manifest, artifact.clone());
+                self.write_manifest(&manifest)?;
+                Ok(artifact)
+            }
+            Ok(()) => {
+                let detail = "ONNX exporter completed but did not create an .onnx file".to_string();
+                let artifact = failed_onnx_artifact(artifact_rel, detail.clone());
+                write_json_pretty(&artifact_dir.join("artifact.json"), &artifact)?;
+                upsert_artifact(&mut manifest, artifact);
+                self.write_manifest(&manifest)?;
+                bail!("{detail}");
+            }
+            Err(err) => {
+                let detail = err.to_string();
+                let artifact = failed_onnx_artifact(artifact_rel, detail.clone());
+                let _ = write_json_pretty(&artifact_dir.join("artifact.json"), &artifact);
+                upsert_artifact(&mut manifest, artifact);
+                self.write_manifest(&manifest)?;
+                bail!("ONNX artifact generation failed: {detail}");
+            }
+        }
+    }
+
     pub fn absolute_model_file(&self, manifest: &ModelManifest, relative_path: &str) -> PathBuf {
         self.model_dir(&manifest.id).join(relative_path)
     }
@@ -405,6 +532,10 @@ impl ModelStore {
         manifest.backend = manifest.format.backend_hint().to_string();
         write_json_pretty(&self.model_dir(&manifest.id).join(MANIFEST_FILE), &manifest)?;
         Ok(manifest)
+    }
+
+    pub fn write_manifest(&self, manifest: &ModelManifest) -> Result<()> {
+        write_json_pretty(&self.model_dir(&manifest.id).join(MANIFEST_FILE), manifest)
     }
 
     fn build_manifest(
@@ -456,6 +587,7 @@ impl ModelStore {
             backend,
             created_unix: unix_ts(),
             files,
+            artifacts: Vec::new(),
         })
     }
 }
@@ -1137,6 +1269,168 @@ pub fn unix_ts() -> u64 {
         .as_secs()
 }
 
+#[derive(Debug, Clone)]
+enum OnnxExporter {
+    Env(PathBuf),
+    OptimumCli(PathBuf),
+    PythonModule(PathBuf),
+}
+
+impl OnnxExporter {
+    fn label(&self) -> String {
+        match self {
+            Self::Env(path) => path.display().to_string(),
+            Self::OptimumCli(path) => path.display().to_string(),
+            Self::PythonModule(path) => format!("{} -m optimum.exporters.onnx", path.display()),
+        }
+    }
+}
+
+fn is_supported_onnx_architecture(architecture: Option<&str>) -> bool {
+    let Some(architecture) = architecture else {
+        return false;
+    };
+    let normalized = architecture
+        .to_ascii_lowercase()
+        .replace('-', "")
+        .replace('_', "");
+    matches!(
+        normalized.as_str(),
+        "phi3"
+            | "qwen2"
+            | "qwen3"
+            | "gemma"
+            | "gemma2"
+            | "gemma3"
+            | "mistral"
+            | "mixtral"
+            | "llama"
+    )
+}
+
+fn failed_onnx_artifact(path: String, detail: String) -> ModelArtifact {
+    ModelArtifact {
+        kind: ArtifactKind::Onnx,
+        path,
+        status: ArtifactStatus::Failed,
+        created_unix: unix_ts(),
+        detail: Some(detail),
+    }
+}
+
+fn upsert_artifact(manifest: &mut ModelManifest, artifact: ModelArtifact) {
+    manifest
+        .artifacts
+        .retain(|existing| existing.kind != artifact.kind);
+    manifest.artifacts.push(artifact);
+}
+
+fn onnx_files_exist(dir: &Path) -> Result<bool> {
+    let mut files = Vec::new();
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    collect_files(dir, &mut files)?;
+    Ok(files.iter().any(|path| extension_eq(path, "onnx")))
+}
+
+fn find_onnx_exporter() -> Option<OnnxExporter> {
+    env::var_os("WERK_ONNX_EXPORTER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(OnnxExporter::Env)
+        .or_else(|| find_in_path("optimum-cli").map(OnnxExporter::OptimumCli))
+        .or_else(|| {
+            find_in_path("python3")
+                .or_else(|| find_in_path("python"))
+                .map(OnnxExporter::PythonModule)
+        })
+}
+
+fn run_onnx_exporter(
+    exporter: &OnnxExporter,
+    source_dir: &Path,
+    artifact_dir: &Path,
+) -> Result<()> {
+    let mut command = match exporter {
+        OnnxExporter::Env(path) => {
+            let mut command = Command::new(path);
+            command
+                .arg("--model")
+                .arg(source_dir)
+                .arg("--output")
+                .arg(artifact_dir);
+            command
+        }
+        OnnxExporter::OptimumCli(path) => {
+            let mut command = Command::new(path);
+            command
+                .args([
+                    "export",
+                    "onnx",
+                    "--task",
+                    "text-generation-with-past",
+                    "--model",
+                ])
+                .arg(source_dir)
+                .arg(artifact_dir);
+            command
+        }
+        OnnxExporter::PythonModule(path) => {
+            let mut command = Command::new(path);
+            command
+                .args([
+                    "-m",
+                    "optimum.exporters.onnx",
+                    "--task",
+                    "text-generation-with-past",
+                    "--model",
+                ])
+                .arg(source_dir)
+                .arg(artifact_dir);
+            command
+        }
+    };
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run ONNX exporter {}", exporter.label()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        output.status.to_string()
+    };
+    bail!("{} failed: {}", exporter.label(), detail)
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(name);
+    if path.components().count() > 1 && path.is_file() {
+        return Some(path);
+    }
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let candidate = dir.join(format!("{name}.exe"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,7 +1648,7 @@ mod tests {
 
         let manifest = store.set_model_file("mixed", "model.safetensors").unwrap();
         assert_eq!(manifest.format, ModelFormat::SafeTensors);
-        assert_eq!(manifest.backend, "candle");
+        assert_eq!(manifest.backend, "onnxruntime");
         assert_eq!(manifest.architecture.as_deref(), Some("llama"));
         assert_eq!(
             manifest.model_path.as_deref(),

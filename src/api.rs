@@ -350,6 +350,7 @@ mod tests {
             backend: "mock".to_string(),
             created_unix: 1,
             files: Vec::new(),
+            artifacts: Vec::new(),
         };
         fs::create_dir_all(store.model_dir("mock")).unwrap();
         fs::write(
@@ -435,6 +436,7 @@ mod tests {
             backend: "mock".to_string(),
             created_unix: 1,
             files: Vec::new(),
+            artifacts: Vec::new(),
         };
         fs::create_dir_all(store.model_dir("mock")).unwrap();
         fs::write(

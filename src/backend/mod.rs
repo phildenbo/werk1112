@@ -1,19 +1,28 @@
+mod burn;
 mod candle;
 mod external;
 mod llama_fast;
 mod llama_server;
+mod onnxruntime;
 mod vllm;
 
 use anyhow::Result;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+pub use burn::{
+    BurnBackend, BurnDiscovery, BurnMode, managed_runner_path as managed_burn_runner_path,
+};
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
 pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
 pub use llama_server::{
     BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, backend_doctor_checks,
     install_managed_llama_server, llama_server_help_ok, managed_backend_dir,
+};
+pub use onnxruntime::{
+    OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend, OnnxRuntimeMode,
+    install_managed_onnx_runtime, managed_runner_path,
 };
 pub use vllm::{
     VllmBackend, VllmDiscovery, install_managed_vllm, managed_vllm_dir, vllm_doctor_checks,
@@ -26,11 +35,13 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendRuntime {
+    Burn,
     Candle,
     LlamaServer,
     LlamaLegacy,
     LlamaHighlevel,
     Vllm,
+    OnnxRuntime,
     Mlx,
 }
 
@@ -51,6 +62,7 @@ pub enum BackendAccelerator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeId {
+    Burn,
     LlamaServerCuda,
     LlamaServerVulkan,
     LlamaServerCpu,
@@ -59,6 +71,8 @@ pub enum RuntimeId {
     CandleCpu,
     Mlx,
     VllmCuda,
+    OnnxRuntimeCuda,
+    OnnxRuntimeCpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,18 +113,27 @@ const MLX_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
 
 const GGUF_FORMATS: &[ModelFormat] = &[ModelFormat::Gguf];
 const SAFETENSORS_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors];
+const ONNX_RUNTIME_FORMATS: &[ModelFormat] = &[ModelFormat::SafeTensors, ModelFormat::Onnx];
 const CANDLE_FORMATS: &[ModelFormat] = &[ModelFormat::Gguf, ModelFormat::SafeTensors];
 const MLX_FORMATS: &[ModelFormat] = &[ModelFormat::Mlx, ModelFormat::SafeTensors];
 
 const ANY_ARCH: &[&str] = &[];
-const CANDLE_ARCHES: &[&str] = &[
-    "llama", "gemma", "gemma2", "gemma3", "qwen2", "mistral", "phi", "phi2", "phi3",
-];
 const VLLM_ARCHES: &[&str] = &[
     "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
 ];
-
 pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
+    RuntimeDescriptor {
+        id: RuntimeId::Burn,
+        runtime: BackendRuntime::Burn,
+        display_name: "Burn",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cuda, BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 980,
+        implemented: true,
+        install_target: None,
+    },
     RuntimeDescriptor {
         id: RuntimeId::LlamaServerCuda,
         runtime: BackendRuntime::LlamaServer,
@@ -152,10 +175,22 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle CUDA",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: CANDLE_ARCHES,
+        supported_architectures: ANY_ARCH,
         accelerators: &[BackendAccelerator::Cuda],
         capabilities: TEXT_STREAMING,
         priority: 700,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeCuda,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime CUDA",
+        supported_formats: ONNX_RUNTIME_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cuda],
+        capabilities: TEXT_STREAMING,
+        priority: 960,
         implemented: true,
         install_target: None,
     },
@@ -164,7 +199,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle Metal",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: CANDLE_ARCHES,
+        supported_architectures: ANY_ARCH,
         accelerators: &[BackendAccelerator::Metal],
         capabilities: TEXT_STREAMING,
         priority: 650,
@@ -176,10 +211,22 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         runtime: BackendRuntime::Candle,
         display_name: "Candle CPU",
         supported_formats: CANDLE_FORMATS,
-        supported_architectures: CANDLE_ARCHES,
+        supported_architectures: ANY_ARCH,
         accelerators: &[BackendAccelerator::Cpu],
         capabilities: TEXT_STREAMING,
         priority: 100,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeCpu,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime CPU",
+        supported_formats: ONNX_RUNTIME_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Cpu],
+        capabilities: TEXT_STREAMING,
+        priority: 760,
         implemented: true,
         install_target: None,
     },
@@ -248,10 +295,14 @@ pub fn runtime_supports_model(
 pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) -> bool {
     match runtime {
         BackendRuntime::Candle => matches!(format, ModelFormat::Gguf | ModelFormat::SafeTensors),
+        BackendRuntime::Burn => matches!(format, ModelFormat::SafeTensors),
         BackendRuntime::LlamaServer
         | BackendRuntime::LlamaLegacy
         | BackendRuntime::LlamaHighlevel => matches!(format, ModelFormat::Gguf),
         BackendRuntime::Vllm => matches!(format, ModelFormat::SafeTensors),
+        BackendRuntime::OnnxRuntime => {
+            matches!(format, ModelFormat::SafeTensors | ModelFormat::Onnx)
+        }
         BackendRuntime::Mlx => matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors),
     }
 }
@@ -272,6 +323,10 @@ pub fn backend_supports_accelerator(
                 | BackendAccelerator::Cuda
                 | BackendAccelerator::Metal
         ),
+        BackendRuntime::Burn => matches!(
+            accelerator,
+            BackendAccelerator::Auto | BackendAccelerator::Cpu | BackendAccelerator::Cuda
+        ),
         BackendRuntime::LlamaServer
         | BackendRuntime::LlamaLegacy
         | BackendRuntime::LlamaHighlevel => matches!(
@@ -279,6 +334,12 @@ pub fn backend_supports_accelerator(
             BackendAccelerator::Cpu | BackendAccelerator::Cuda | BackendAccelerator::Vulkan
         ),
         BackendRuntime::Vllm => matches!(accelerator, BackendAccelerator::Cuda),
+        BackendRuntime::OnnxRuntime => {
+            matches!(
+                accelerator,
+                BackendAccelerator::Cuda | BackendAccelerator::Cpu
+            )
+        }
         BackendRuntime::Mlx => matches!(accelerator, BackendAccelerator::Mlx),
     }
 }
@@ -291,11 +352,15 @@ pub fn explain_backend_rejection(
     if !backend_supports_format(runtime, format) {
         return Some(match runtime {
             BackendRuntime::Candle => "Candle supports GGUF and safetensors only",
+            BackendRuntime::Burn => "Burn supports safetensors only",
             BackendRuntime::LlamaServer => "llama.cpp server supports GGUF only",
             BackendRuntime::LlamaLegacy | BackendRuntime::LlamaHighlevel => {
                 "llama.cpp legacy backends support GGUF only"
             }
             BackendRuntime::Vllm => "vLLM supports selected HF safetensors models only",
+            BackendRuntime::OnnxRuntime => {
+                "ONNX Runtime supports ONNX models and selected HF safetensors models with managed ONNX artifacts"
+            }
             BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
         });
     }

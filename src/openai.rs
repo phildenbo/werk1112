@@ -325,6 +325,7 @@ mod tests {
             backend: "candle".to_string(),
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
+            artifacts: Vec::new(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,

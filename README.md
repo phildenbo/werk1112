@@ -23,16 +23,16 @@ This is an early V1 skeleton:
 - Local GGUF and safetensors model imports are copied into a managed model store.
 - Hugging Face pulls use `git clone` for now, so install `git` and `git-lfs` for real model repos.
 
-Current generation support is selected through the Werk1112 Runtime Planner. Werk is an inference router, not a Candle wrapper: GGUF uses a persistent llama.cpp `llama-server` process as the hot path, so decode, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. HF safetensors directories for Llama, Qwen, Mistral/Mixtral, Phi-3, and Gemma-class text models route to a persistent vLLM OpenAI-compatible server when available, with Candle kept as a compatibility fallback for supported text-only models. MLX model directories can run through an external `mlx-lm` backend.
+Current generation support is selected through the Werk1112 Runtime Planner. Werk is an inference router, not a Candle wrapper: GGUF uses a persistent llama.cpp `llama-server` process as the hot path, so decode, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. HF safetensors directories prefer Burn when a usable Burn runner is available, with Candle kept as a compatibility fallback for text-only models. MLX model directories can run through an external `mlx-lm` backend.
 
 ## Format Support
 
 | Format | Typical Use | Import/List/Inspect | Backend Status |
 | --- | --- | --- | --- |
-| Safetensors | Hugging Face training/fine-tuning standard | Yes | vLLM CUDA for supported HF text architectures; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected |
+| Safetensors | Hugging Face training/fine-tuning standard | Yes | Burn CUDA/CPU when a runner is available; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected |
 | GGUF | llama.cpp, Ollama, LM Studio, CPU inference | Yes | CUDA/Vulkan/CPU through persistent llama.cpp server; Candle is legacy/fallback only |
 | PyTorch (`.pt`, `.pth`, `pytorch_model.bin`) | Training, research, checkpoints | Yes | Catalog/import only; no generation backend yet |
-| ONNX (`.onnx`) | Framework-independent inference | Yes | Catalog/import only; no generation backend yet |
+| ONNX (`.onnx`) | Framework-independent inference | Yes | ONNX Runtime CUDA/CPU when a runner is available |
 | MLX (`.npz`, MLX-style dirs) | Apple Silicon / MLX-LM | Yes | Implemented through external `mlx-lm` backend when configured |
 | TensorRT Engine (`.engine`, `.plan`) | NVIDIA-optimized inference | Yes | Catalog/import only; no generation backend yet |
 | OpenVINO IR (`.xml` + `.bin`) | Intel CPUs, GPUs, NPUs | Yes | Catalog/import only; no generation backend yet |
@@ -46,15 +46,16 @@ Werk routes by requested backend, model format, model architecture, input capabi
 | Runtime | Formats | Accelerators | VLM | Status |
 | --- | --- | --- | --- | --- |
 | llama.cpp server | GGUF | CUDA, Vulkan, CPU | Pending mmproj/image wiring | Primary GGUF hot path |
+| Burn | Safetensors | CUDA, CPU | No | Primary safetensors path when a runner is available |
+| ONNX Runtime | Managed ONNX artifacts/direct ONNX when selected | CUDA, CPU | No | Explicit opt-in route |
 | Candle | GGUF legacy, safetensors | CUDA, Metal, CPU | No | Implemented for selected architectures |
-| vLLM | Selected HF safetensors | CUDA | Backend-dependent | Primary safetensors hot path when installed |
+| vLLM | Selected HF safetensors | CUDA | Backend-dependent | Explicit opt-in route |
 | MLX | MLX dirs, selected HF safetensors | Apple Silicon / MLX | Backend-dependent | Implemented through `mlx-lm` when configured |
 
 Planner policy:
 
 - GGUF routes to llama.cpp server CUDA, Vulkan, or CPU first. Candle GGUF is legacy fallback/debug only.
-- Safetensors Llama/Qwen/Mistral/Mixtral/Phi-3/Gemma-class text models prefer vLLM CUDA when it is installed, then Candle fallback.
-- Unknown or unsupported safetensors architectures use Candle only when Candle supports them.
+- Safetensors routing is format-based: Burn first, then Candle fallback. Burn and Candle decide internally whether they can load a model.
 - `--backend vllm` is a strict vLLM-only safetensors route and never falls back to Candle.
 - `--backend cpu` is CPU-only, `--backend cuda` is CUDA-only, `--backend vulkan` is Vulkan-only, and `--backend candle` is an explicit Candle route.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
@@ -62,7 +63,7 @@ Planner policy:
 
 ## Build
 
-Default local installs build the recommended runtime stack so users do not need to know which internal runtime powers each model format. For the current Windows/Linux workflow that means CUDA support for llama.cpp and Candle. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
+Default local installs build the recommended runtime stack so users do not need to know which internal runtime powers each model format. For the current Windows/Linux workflow that means CUDA support for llama.cpp and Candle, plus packaged companion runners such as Burn when the release artifact includes them. Release builds use one target-specific Cargo alias per deployed end-user artifact. Each artifact includes the supported backends for that platform, and users choose the active backend at runtime with `--backend`.
 
 ```bash
 cargo install --path . --locked --force
@@ -252,7 +253,7 @@ target/x86_64-unknown-linux-gnu/release/werk
 target/aarch64-apple-darwin/release/werk
 ```
 
-Runtime backend setup should be a black box for end users. GGUF execution uses a persistent llama.cpp server backend so the decode loop, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. HF safetensors execution uses a persistent vLLM OpenAI-compatible server when available, so token generation stays inside vLLM instead of Candle. Source builds may need managed or PATH-provided companion runtimes; use `werk backend list`, `werk backend doctor`, `werk backend install llama-cuda`, and `werk backend install vllm` for local development. `WERK_LLAMA_CTX`, `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH`, and `WERK_LLAMA_MAIN_GPU` are advanced GGUF tuning overrides. `WERK_VLLM_PYTHON`, `WERK_VLLM_HOST`, `WERK_VLLM_PORT`, and `WERK_VLLM_ARGS` are advanced vLLM overrides. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
+Runtime backend setup should be a black box for end users. GGUF execution uses a persistent llama.cpp server backend so the decode loop, sampling, KV cache, logits, and GPU execution stay inside llama.cpp. HF safetensors execution prefers Burn when a usable Burn runner is packaged, installed, or configured, so Candle is a compatibility fallback instead of the primary target. In `--backend auto`, Werk skips unavailable companion runtimes quietly and uses the best working fallback; `--verbose` prints only the selected backend and one concise fallback note, while `--debug` prints full discovery paths and rejection details. Source builds may need managed or PATH-provided companion runtimes; use `werk backend list`, `werk backend doctor --debug`, `werk backend install llama-cuda`, and `werk artifacts build <model>` for local development. `WERK_LLAMA_CTX`, `WERK_LLAMA_BATCH`, `WERK_LLAMA_UBATCH`, and `WERK_LLAMA_MAIN_GPU` are advanced GGUF tuning overrides. `WERK_BURN_RUNNER_CUDA`, `WERK_BURN_RUNNER_CPU`, and `WERK_BURN_RUNNER` are advanced Burn runner overrides. `WERK_ONNX_RUNTIME_CUDA`, `WERK_ONNX_RUNTIME_CPU`, `WERK_ONNX_RUNTIME`, `WERK_ONNX_RUNTIME_BUNDLE_CUDA`, `WERK_ONNX_RUNTIME_BUNDLE_CPU`, and `WERK_ONNX_EXPORTER` are advanced ONNX artifact/runtime overrides. `WERK_VLLM_PYTHON`, `WERK_VLLM_HOST`, `WERK_VLLM_PORT`, and `WERK_VLLM_ARGS` remain available for explicit vLLM routes. The MLX backend uses `python3 -m mlx_lm.generate` or `WERK_MLX_PYTHON`. VLM request/image support is compiled into every build; actual multimodal generation depends on the chosen model and backend.
 
 Additional low-level acceleration features are available for custom builds:
 
@@ -276,17 +277,19 @@ Build features decide what Candle and llama.cpp acceleration support is compiled
 werk --backend auto chat gemma-2b-it
 werk --backend cpu chat gemma-2b-it
 werk --backend cuda chat gemma-2b-it
-werk --backend vllm chat phi-3-mini-4k-instruct
 werk --backend metal chat gemma-2b-it
 werk --backend vulkan chat TinyLLama-1B-GGUF
 werk --backend mlx chat mlx-model
 werk --backend candle chat debug-model
+werk --backend burn chat phi-3-mini-4k-instruct
+werk --backend onnx chat phi-3-mini-4k-instruct
+werk --backend vllm chat phi-3-mini-4k-instruct
 werk --backend cuda serve --model gemma-2b-it
 ```
 
-`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback. For safetensors it tries vLLM CUDA for supported HF text architectures, then Candle CUDA/Metal/CPU as a compatibility fallback. With `--verbose`, any vLLM-to-Candle fallback is printed explicitly. On Apple Silicon it prefers MLX for MLX models and may use MLX/Candle for safetensors depending on availability.
+`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback. For safetensors it tries Burn first when a Burn runner is usable, then Candle CUDA/Metal/CPU as a compatibility fallback. With `--verbose`, Burn-to-Candle fallback is reported as one concise note; use `--debug` for paths, attempted runtimes, and rejection reasons. On Apple Silicon it prefers MLX for MLX models and may use Burn CPU, MLX, or Candle for safetensors depending on availability.
 
-For GGUF models, `--backend cuda`, `--backend vulkan`, and `--backend cpu` use the persistent llama.cpp server backend when that server is available. For safetensors models, those same backend names mean "choose the best runtime for that accelerator," not "force Candle." `--backend vllm` forces vLLM only and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
+For GGUF models, `--backend cuda`, `--backend vulkan`, and `--backend cpu` use the persistent llama.cpp server backend when that server is available. For safetensors models, those same backend names mean "choose the best runtime for that accelerator," not "force Candle": CUDA tries Burn CUDA then Candle CUDA, and CPU tries Burn CPU then Candle CPU. `--backend burn` is strict Burn only and never falls back to Candle. `--backend onnx` is strict ONNX Runtime only: it never falls back to Candle and fails with actionable diagnostics if no runner is installed. `--backend vllm` remains an explicit vLLM-only route and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
 ## End-User Releases
 
@@ -302,20 +305,22 @@ Each target artifact should include the supported backends for that build, and u
 | Linux x64 | `cargo build-linux` | CPU, CUDA via llama.cpp server | llama.cpp server CUDA |
 | macOS Apple Silicon | `cargo build-macos-apple-silicon` | CPU, MLX-LM, VLM request support | MLX |
 
-Backend selection is per process. There is no persisted setup step.
+Backend selection is per process. Managed runtime provisioning and generated artifacts are cached under `WERK_HOME` when needed.
 
 ```bash
 werk --backend auto chat model-id
 werk --backend cuda chat model-id
-werk --backend vllm chat model-id
 werk --backend vulkan chat model-id
 werk --backend mlx chat model-id
 werk --backend metal chat model-id
 werk --backend cpu chat model-id
 werk --backend candle chat model-id
+werk --backend burn chat model-id
+werk --backend onnx chat model-id
+werk --backend vllm chat model-id
 ```
 
-`auto` is format-aware: GGUF uses llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses vLLM CUDA before Candle fallback for supported HF text architectures; MLX-format models use MLX. Explicit `vllm` requests do not fallback, and explicit GPU requests do not silently fall back to CPU.
+`auto` is format-aware: GGUF uses llama.cpp server CUDA, Vulkan, CPU, then Candle legacy GPU/CPU fallback; safetensors uses Burn before Candle fallback when a Burn runner is packaged or installed; MLX-format models use MLX. Explicit `burn`, `onnx`, and `vllm` requests do not fallback, and explicit GPU requests do not silently fall back to CPU.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 
@@ -344,8 +349,10 @@ Each imported or pulled model is stored under `models/<model-id>/` inside that s
 ```text
 ~/.local/share/werk1112/models/TinyLLama-1B-GGUF/
 ├── manifest.json
-└── files/
-    └── ...
+├── files/
+│   └── ...
+└── artifacts/
+    └── onnx/
 ```
 
 On native Windows, the same model is saved here by default:
@@ -354,7 +361,7 @@ On native Windows, the same model is saved here by default:
 %LOCALAPPDATA%\werk1112\models\TinyLLama-1B-GGUF\
 ```
 
-`manifest.json` contains source, format, architecture, tokenizer/config paths, model file path, checksums, and backend hints. `files/` contains the copied local model files or downloaded Hugging Face files.
+`manifest.json` contains source, format, architecture, tokenizer/config paths, model file path, checksums, backend hints, and optimized artifact metadata. `files/` contains the copied local model files or downloaded Hugging Face files. `artifacts/` contains generated runtime artifacts such as ONNX exports.
 
 For GGUF repositories that contain many quantizations, new imports prefer a balanced `Q4_K_M` file when it is present instead of taking the first filename alphabetically. The selected file is stored in `manifest.json` as `model_path`, and both `chat` and `serve` use that selected file.
 
@@ -432,6 +439,16 @@ werk pull TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
 ```
 
 Pull shows live status for each phase. The first phase clones Git metadata with `GIT_LFS_SKIP_SMUDGE=1`; the second phase runs `git lfs pull` and shows `downloading` with either Git LFS percent/speed or a running local bytes/s estimate while Git LFS is quiet. After the download completes, the CLI shows an import step while files are copied into the managed model store.
+
+Build, list, or rebuild optimized runtime artifacts for a safetensors model:
+
+```bash
+werk artifacts build phi-3-mini-4k-instruct
+werk artifacts list phi-3-mini-4k-instruct
+werk artifacts rebuild phi-3-mini-4k-instruct
+```
+
+When an explicit ONNX Runtime route is selected and no ready ONNX artifact exists, Werk attempts the same managed artifact build automatically. Auto SafeTensors routing uses Burn before Candle and does not require ONNX artifacts. Set `WERK_ONNX_EXPORTER` to a custom exporter binary, or install `optimum-cli` / `optimum.exporters.onnx` for the default exporter path.
 
 Remove an installed model from Werk's managed store. This deletes the managed copy under `WERK_HOME`; it does not delete the original local import source or any upstream Hugging Face repository:
 
@@ -569,8 +586,8 @@ Text deltas are intentionally chunked. They are not one event per token.
 
 ## Next Work
 
-- Extend safetensors execution coverage beyond the current vLLM and Candle architecture set.
+- Extend safetensors Burn coverage and ship managed Burn runner artifacts for release builds.
 - Add richer chat template support from tokenizer/model metadata.
 - Keep improving GGUF performance through persistent llama.cpp server defaults and runtime tuning.
-- Add real generation backends for ONNX Runtime, TensorRT, OpenVINO, TensorFlow, CoreML, and direct PyTorch checkpoint execution/conversion when they can execute end-to-end.
+- Add real generation backends for TensorRT, OpenVINO, TensorFlow, CoreML, and direct PyTorch checkpoint execution/conversion when they can execute end-to-end.
 - Add embeddings and tool-call response support after the chat/models baseline is stable.
