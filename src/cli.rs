@@ -3553,13 +3553,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_safetensors_prefers_burn_then_candle_on_linux_and_windows() {
+    fn auto_safetensors_prefers_burn_then_vllm_then_candle_on_linux_and_windows() {
         if cfg!(any(windows, target_os = "linux")) {
             let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
             let order = auto_candidates_for_manifest(&manifest);
             assert!(matches!(order[0], BackendChoice::Burn(BurnMode::Cuda)));
+            assert!(matches!(order[1], BackendChoice::Vllm));
             assert!(matches!(
-                order[1],
+                order[2],
                 BackendChoice::Candle(CandleDeviceMode::Cuda)
             ));
         }
@@ -3678,7 +3679,7 @@ mod tests {
     #[test]
     fn backend_selection_does_not_fake_burn_safetensors_support() {
         let store = test_store("safetensors-cuda");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -3759,7 +3760,7 @@ mod tests {
     #[test]
     fn auto_safetensors_can_fallback_to_candle_without_verbose_burn_note() {
         let store = test_store("auto-burn-fallback");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let selected =
             selected_backend_for_manifest(&store, BackendChoice::Auto, &manifest).unwrap();
         assert!(matches!(selected, BackendChoice::Candle(_)));
@@ -3770,7 +3771,7 @@ mod tests {
     #[test]
     fn backend_selection_falls_back_to_candle_cuda_when_burn_missing() {
         let store = test_store("safetensors-cuda-fallback");
-        let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {
@@ -3812,7 +3813,7 @@ mod tests {
             BackendChoice::LlamaServer(LlamaCppMode::Cuda)
         ));
 
-        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let result = selected_backend_for_manifest(
             &store,
             BackendChoice::GgufPreferred {

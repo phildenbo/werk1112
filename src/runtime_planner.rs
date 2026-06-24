@@ -220,7 +220,7 @@ pub fn runtime_candidate_ids(
 fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => gguf_auto_candidates(),
-        ModelFormat::SafeTensors => safetensors_auto_candidates(),
+        ModelFormat::SafeTensors => safetensors_auto_candidates(manifest),
         ModelFormat::Onnx => onnx_auto_candidates(),
         ModelFormat::Mlx => {
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -266,7 +266,7 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
     }
 }
 
-fn safetensors_auto_candidates() -> Vec<RuntimeId> {
+fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         vec![
             RuntimeId::BurnCpu,
@@ -281,14 +281,28 @@ fn safetensors_auto_candidates() -> Vec<RuntimeId> {
             RuntimeId::CandleCpu,
         ]
     } else if cfg!(any(windows, target_os = "linux")) {
-        vec![
-            RuntimeId::BurnCuda,
+        let mut candidates = vec![RuntimeId::BurnCuda];
+        candidates.extend(vllm_auto_candidates(manifest));
+        candidates.extend([
             RuntimeId::CandleCuda,
             RuntimeId::BurnCpu,
             RuntimeId::CandleCpu,
-        ]
+        ]);
+        candidates
     } else {
         vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu]
+    }
+}
+
+fn vllm_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
+    if runtime_supports_model(
+        runtime_descriptor(RuntimeId::VllmCuda),
+        &manifest.format,
+        manifest.architecture.as_deref(),
+    ) {
+        vec![RuntimeId::VllmCuda]
+    } else {
+        Vec::new()
     }
 }
 
@@ -304,7 +318,12 @@ fn cpu_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 fn cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCuda],
-        ModelFormat::SafeTensors => vec![RuntimeId::BurnCuda, RuntimeId::CandleCuda],
+        ModelFormat::SafeTensors => {
+            let mut candidates = vec![RuntimeId::BurnCuda];
+            candidates.extend(vllm_auto_candidates(manifest));
+            candidates.push(RuntimeId::CandleCuda);
+            candidates
+        }
         ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCuda],
         _ => Vec::new(),
     }
@@ -463,8 +482,11 @@ fn selection_reason(
         (ModelFormat::SafeTensors, BackendRuntime::Burn, _) => {
             "HF safetensors hot path uses Burn".to_string()
         }
-        (ModelFormat::SafeTensors, BackendRuntime::Vllm, _) => {
+        (ModelFormat::SafeTensors, BackendRuntime::Vllm, RequestedBackend::Vllm) => {
             "explicit vLLM route requested".to_string()
+        }
+        (ModelFormat::SafeTensors, BackendRuntime::Vllm, _) => {
+            "HF safetensors CUDA hot path uses vLLM for supported architectures".to_string()
         }
         (_, BackendRuntime::Candle, RequestedBackend::Candle) => {
             "explicit Candle route requested".to_string()
@@ -507,13 +529,40 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_cuda_uses_burn_then_candle_without_cpu_fallback() {
+    fn safetensors_cuda_uses_burn_then_vllm_then_candle_without_cpu_fallback() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Cuda);
         assert_eq!(candidates[0], RuntimeId::BurnCuda);
+        assert!(
+            candidates
+                .iter()
+                .position(|id| *id == RuntimeId::VllmCuda)
+                .unwrap()
+                < candidates
+                    .iter()
+                    .position(|id| *id == RuntimeId::CandleCuda)
+                    .unwrap()
+        );
         assert!(candidates.contains(&RuntimeId::CandleCuda));
         assert!(!candidates.contains(&RuntimeId::CandleCpu));
         assert!(!candidates.contains(&RuntimeId::BurnCpu));
+    }
+
+    #[test]
+    fn safetensors_auto_tries_vllm_before_candle_for_supported_architectures() {
+        let qwen = manifest(ModelFormat::SafeTensors, Some("qwen2"));
+        let candidates = runtime_candidate_ids(&qwen, RequestedBackend::Auto);
+        assert_eq!(candidates[0], RuntimeId::BurnCuda);
+        assert!(
+            candidates
+                .iter()
+                .position(|id| *id == RuntimeId::VllmCuda)
+                .unwrap()
+                < candidates
+                    .iter()
+                    .position(|id| *id == RuntimeId::CandleCuda)
+                    .unwrap()
+        );
     }
 
     #[test]

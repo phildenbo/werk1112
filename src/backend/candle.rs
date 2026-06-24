@@ -8,7 +8,7 @@ use candle_transformers::{
     generation::LogitsProcessor,
     models::{
         gemma, gemma2, llama, mistral, phi3, quantized_gemma3, quantized_llama, quantized_phi,
-        quantized_phi3, quantized_qwen2, qwen2,
+        quantized_phi3, quantized_qwen2, quantized_qwen3, qwen2, qwen3,
     },
 };
 use serde::de::DeserializeOwned;
@@ -581,12 +581,14 @@ fn gguf_f64_array(content: &gguf_file::Content, key: &str) -> Result<Vec<f64>> {
 enum CandleModel {
     Llama(quantized_llama::ModelWeights),
     Qwen2(quantized_qwen2::ModelWeights),
+    Qwen3(quantized_qwen3::ModelWeights),
     Phi(quantized_phi::ModelWeights),
     Phi3(quantized_phi3::ModelWeights),
     Gemma3(quantized_gemma3::ModelWeights),
     SafeGemma(gemma::Model),
     SafeGemma2(gemma2::Model),
     SafeQwen2(qwen2::ModelForCausalLM),
+    SafeQwen3(qwen3::ModelForCausalLM),
     SafeMistral(mistral::Model),
     SafePhi3(phi3::Model),
     SafeLlama(SafeLlamaModel),
@@ -627,9 +629,11 @@ impl CandleModel {
     fn clear_kv_cache(&mut self) -> Result<()> {
         match self {
             Self::Llama(_) | Self::Qwen2(_) | Self::Phi(_) | Self::Phi3(_) | Self::Gemma3(_) => {}
+            Self::Qwen3(model) => model.clear_kv_cache(),
             Self::SafeGemma(model) => model.clear_kv_cache(),
             Self::SafeGemma2(model) => model.clear_kv_cache(),
             Self::SafeQwen2(model) => model.clear_kv_cache(),
+            Self::SafeQwen3(model) => model.clear_kv_cache(),
             Self::SafeMistral(model) => model.clear_kv_cache(),
             Self::SafePhi3(model) => model.clear_kv_cache(),
             Self::SafeLlama(model) => model.clear_kv_cache()?,
@@ -641,12 +645,14 @@ impl CandleModel {
         match self {
             Self::Llama(model) => Ok(model.forward(input, index_pos)?),
             Self::Qwen2(model) => Ok(model.forward(input, index_pos)?),
+            Self::Qwen3(model) => Ok(model.forward(input, index_pos)?),
             Self::Phi(model) => Ok(model.forward(input, index_pos)?),
             Self::Phi3(model) => Ok(model.forward(input, index_pos)?),
             Self::Gemma3(model) => Ok(model.forward(input, index_pos)?),
             Self::SafeGemma(model) => Ok(model.forward(input, index_pos)?),
             Self::SafeGemma2(model) => Ok(model.forward(input, index_pos)?),
             Self::SafeQwen2(model) => Ok(model.forward(input, index_pos)?),
+            Self::SafeQwen3(model) => Ok(model.forward(input, index_pos)?),
             Self::SafeMistral(model) => Ok(model.forward(input, index_pos)?),
             Self::SafePhi3(model) => Ok(model.forward(input, index_pos)?),
             Self::SafeLlama(model) => model.forward(input, index_pos),
@@ -717,6 +723,9 @@ fn load_gguf_model(
         "qwen2" => Ok(CandleModel::Qwen2(
             quantized_qwen2::ModelWeights::from_gguf(content, &mut file, device)?,
         )),
+        "qwen3" => Ok(CandleModel::Qwen3(
+            quantized_qwen3::ModelWeights::from_gguf(content, &mut file, device)?,
+        )),
         "phi" | "phi2" => Ok(CandleModel::Phi(quantized_phi::ModelWeights::from_gguf(
             content, &mut file, device,
         )?)),
@@ -727,7 +736,7 @@ fn load_gguf_model(
             quantized_gemma3::ModelWeights::from_gguf(content, &mut file, device)?,
         )),
         other => bail!(
-            "unsupported GGUF architecture '{other}' for Candle backend; supported: llama, qwen2, phi/phi2, phi3, gemma3"
+            "unsupported GGUF architecture '{other}' for Candle backend; supported: llama, qwen2, qwen3, phi/phi2, phi3, gemma3"
         ),
     }
 }
@@ -754,7 +763,8 @@ fn load_safetensors_model(
         );
     }
 
-    let dtype = DType::F32;
+    let dtype = safetensors_load_dtype(&config_path, device)?;
+    eprintln!("Loading safetensors weights as {dtype:?}");
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, dtype, device)? };
 
     match architecture {
@@ -781,6 +791,12 @@ fn load_safetensors_model(
                 &cfg, vb,
             )?))
         }
+        "qwen3" => {
+            let cfg: qwen3::Config = read_config(&config_path)?;
+            Ok(CandleModel::SafeQwen3(qwen3::ModelForCausalLM::new(
+                &cfg, vb,
+            )?))
+        }
         "mistral" => {
             let cfg: mistral::Config = read_config(&config_path)?;
             Ok(CandleModel::SafeMistral(mistral::Model::new(&cfg, vb)?))
@@ -790,7 +806,7 @@ fn load_safetensors_model(
             Ok(CandleModel::SafePhi3(phi3::Model::new(&cfg, vb)?))
         }
         other => bail!(
-            "Safetensors architecture '{other}' is not supported by Candle backend yet; supported: llama, gemma, gemma2, qwen2, mistral, phi3"
+            "Safetensors architecture '{other}' is not supported by Candle backend yet; supported: llama, gemma, gemma2, qwen2, qwen3, mistral, phi3"
         ),
     }
 }
@@ -804,6 +820,32 @@ fn safetensor_paths(store: &ModelStore, manifest: &ModelManifest) -> Result<Vec<
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
+}
+
+#[derive(serde::Deserialize)]
+struct DTypeConfig {
+    torch_dtype: Option<String>,
+    dtype: Option<String>,
+}
+
+fn safetensors_load_dtype(config_path: &PathBuf, device: &Device) -> Result<DType> {
+    let config: DTypeConfig = read_config(config_path)?;
+    let dtype = config
+        .torch_dtype
+        .as_deref()
+        .or(config.dtype.as_deref())
+        .map(|dtype| dtype.to_ascii_lowercase());
+
+    Ok(match dtype.as_deref() {
+        Some("bfloat16" | "bf16") if device.supports_bf16() => DType::BF16,
+        Some("bfloat16" | "bf16") => DType::F32,
+        Some("float16" | "fp16" | "f16" | "half") if device.is_cuda() || device.is_metal() => {
+            DType::F16
+        }
+        Some("float16" | "fp16" | "f16" | "half") => DType::F32,
+        Some("float32" | "fp32" | "f32") => DType::F32,
+        _ => DType::F32,
+    })
 }
 
 fn read_config<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
