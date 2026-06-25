@@ -18,6 +18,7 @@ use crate::model_store::{ArtifactKind, ArtifactStatus, ModelFormat, ModelManifes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnnxRuntimeMode {
     Cuda,
+    Rocm,
     Cpu,
 }
 
@@ -25,6 +26,7 @@ impl OnnxRuntimeMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cuda => "onnxruntime-cuda",
+            Self::Rocm => "onnxruntime-rocm",
             Self::Cpu => "onnxruntime-cpu",
         }
     }
@@ -32,6 +34,7 @@ impl OnnxRuntimeMode {
     pub fn display(self) -> &'static str {
         match self {
             Self::Cuda => "ONNX Runtime CUDA",
+            Self::Rocm => "ONNX Runtime ROCm",
             Self::Cpu => "ONNX Runtime CPU",
         }
     }
@@ -39,6 +42,7 @@ impl OnnxRuntimeMode {
     fn bundle_env(self) -> &'static str {
         match self {
             Self::Cuda => "WERK_ONNX_RUNTIME_BUNDLE_CUDA",
+            Self::Rocm => "WERK_ONNX_RUNTIME_BUNDLE_ROCM",
             Self::Cpu => "WERK_ONNX_RUNTIME_BUNDLE_CPU",
         }
     }
@@ -253,6 +257,7 @@ impl OnnxRuntimeBackend {
             .arg("--backend")
             .arg(match self.mode {
                 OnnxRuntimeMode::Cuda => "cuda",
+                OnnxRuntimeMode::Rocm => "rocm",
                 OnnxRuntimeMode::Cpu => "cpu",
             })
             .arg("--json")
@@ -353,6 +358,7 @@ fn discover_onnx_runtime(store: &ModelStore, mode: OnnxRuntimeMode) -> OnnxRunti
     let mut attempts = Vec::new();
     let env_name = match mode {
         OnnxRuntimeMode::Cuda => "WERK_ONNX_RUNTIME_CUDA",
+        OnnxRuntimeMode::Rocm => "WERK_ONNX_RUNTIME_ROCM",
         OnnxRuntimeMode::Cpu => "WERK_ONNX_RUNTIME_CPU",
     };
     for (label, path) in [
@@ -413,6 +419,7 @@ fn discover_onnx_runtime(store: &ModelStore, mode: OnnxRuntimeMode) -> OnnxRunti
 pub fn managed_runner_path(store: &ModelStore, mode: OnnxRuntimeMode) -> PathBuf {
     let name = match mode {
         OnnxRuntimeMode::Cuda => "onnxruntime-cuda",
+        OnnxRuntimeMode::Rocm => "onnxruntime-rocm",
         OnnxRuntimeMode::Cpu => "onnxruntime-cpu",
     };
     store.home().join("backends").join(name).join(runner_name())
@@ -462,6 +469,7 @@ fn bundled_runner_candidates(mode: OnnxRuntimeMode) -> Vec<PathBuf> {
 
     let backend_dir = match mode {
         OnnxRuntimeMode::Cuda => "onnxruntime-cuda",
+        OnnxRuntimeMode::Rocm => "onnxruntime-rocm",
         OnnxRuntimeMode::Cpu => "onnxruntime-cpu",
     };
 

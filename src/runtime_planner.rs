@@ -13,6 +13,7 @@ pub enum RequestedBackend {
     Auto,
     Cpu,
     Cuda,
+    Rocm,
     Vulkan,
     Metal,
     Mlx,
@@ -149,18 +150,20 @@ pub fn plan_runtime(
     let mut selected = None;
     let mut rejections = Vec::new();
 
-    for candidate in runtime_candidates(manifest, requested_backend) {
-        let descriptor = runtime_descriptor(candidate.runtime_id);
+    for runtime_id in
+        runtime_candidate_ids_for_plan(manifest, requested_backend, available_runtimes)
+    {
+        let descriptor = runtime_descriptor(runtime_id);
         let decision = candidate_decision(
             manifest,
             requested_backend,
             request_capabilities,
-            candidate.runtime_id,
-            availability.get(&candidate.runtime_id),
+            runtime_id,
+            availability.get(&runtime_id),
         );
         if decision.status == RuntimeDecisionStatus::Accepted {
             selected = Some(SelectedRuntime {
-                runtime_id: candidate.runtime_id,
+                runtime_id,
                 display_name: descriptor.display_name,
                 accelerator: descriptor
                     .accelerators
@@ -207,6 +210,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Auto => auto_candidates(manifest),
         RequestedBackend::Cpu => cpu_candidates(manifest),
         RequestedBackend::Cuda => cuda_candidates(manifest),
+        RequestedBackend::Rocm => rocm_candidates(manifest),
         RequestedBackend::Vulkan => vulkan_candidates(manifest),
         RequestedBackend::Metal => metal_candidates(manifest),
         RequestedBackend::Mlx => vec![RuntimeId::Mlx],
@@ -215,6 +219,28 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => Vec::new(),
     }
+}
+
+fn runtime_candidate_ids_for_plan(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    available_runtimes: &[RuntimeAvailability],
+) -> Vec<RuntimeId> {
+    let mut candidates = runtime_candidate_ids(manifest, requested_backend);
+    if requested_backend == RequestedBackend::Auto
+        && manifest.format == ModelFormat::Gguf
+        && available_runtimes
+            .iter()
+            .any(|availability| availability.runtime_id == RuntimeId::LlamaServerRocm)
+        && !candidates.contains(&RuntimeId::LlamaServerRocm)
+    {
+        let insert_at = candidates
+            .iter()
+            .position(|id| *id == RuntimeId::LlamaServerVulkan)
+            .unwrap_or(candidates.len());
+        candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
+    }
+    candidates
 }
 
 fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
@@ -250,6 +276,9 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
     if cfg!(any(windows, target_os = "linux")) {
         vec![
             RuntimeId::LlamaServerCuda,
+            // ROCm is added by the CLI selection layer only when a ROCm/HIP
+            // llama-server is detected or explicitly signaled. Keeping it out
+            // of the default pure planner avoids noisy NVIDIA-only auto output.
             RuntimeId::LlamaServerVulkan,
             RuntimeId::LlamaServerCpu,
             RuntimeId::CandleCuda,
@@ -268,29 +297,16 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
 
 fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        vec![
-            RuntimeId::BurnCpu,
-            RuntimeId::Mlx,
-            RuntimeId::CandleMetal,
-            RuntimeId::CandleCpu,
-        ]
+        vec![RuntimeId::Mlx, RuntimeId::CandleMetal, RuntimeId::CandleCpu]
     } else if cfg!(target_os = "macos") {
-        vec![
-            RuntimeId::BurnCpu,
-            RuntimeId::CandleMetal,
-            RuntimeId::CandleCpu,
-        ]
+        vec![RuntimeId::CandleMetal, RuntimeId::CandleCpu]
     } else if cfg!(any(windows, target_os = "linux")) {
-        let mut candidates = vec![RuntimeId::BurnCuda];
+        let mut candidates = Vec::new();
         candidates.extend(vllm_auto_candidates(manifest));
-        candidates.extend([
-            RuntimeId::CandleCuda,
-            RuntimeId::BurnCpu,
-            RuntimeId::CandleCpu,
-        ]);
+        candidates.extend([RuntimeId::CandleCuda, RuntimeId::CandleCpu]);
         candidates
     } else {
-        vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu]
+        vec![RuntimeId::CandleCpu]
     }
 }
 
@@ -308,8 +324,8 @@ fn vllm_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 
 fn cpu_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
-        ModelFormat::Gguf => vec![RuntimeId::LlamaServerCpu, RuntimeId::CandleCpu],
-        ModelFormat::SafeTensors => vec![RuntimeId::BurnCpu, RuntimeId::CandleCpu],
+        ModelFormat::Gguf => vec![RuntimeId::LlamaServerCpu],
+        ModelFormat::SafeTensors => vec![RuntimeId::CandleCpu],
         ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeCpu],
         _ => Vec::new(),
     }
@@ -319,7 +335,7 @@ fn cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
         ModelFormat::Gguf => vec![RuntimeId::LlamaServerCuda],
         ModelFormat::SafeTensors => {
-            let mut candidates = vec![RuntimeId::BurnCuda];
+            let mut candidates = Vec::new();
             candidates.extend(vllm_auto_candidates(manifest));
             candidates.push(RuntimeId::CandleCuda);
             candidates
@@ -329,11 +345,22 @@ fn cuda_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     }
 }
 
+fn rocm_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
+    match manifest.format {
+        ModelFormat::Gguf => vec![RuntimeId::LlamaServerRocm],
+        ModelFormat::SafeTensors => vec![RuntimeId::VllmRocm],
+        ModelFormat::Onnx => vec![RuntimeId::OnnxRuntimeRocm],
+        _ => Vec::new(),
+    }
+}
+
 fn burn_candidates() -> Vec<RuntimeId> {
-    if cfg!(any(windows, target_os = "linux")) {
+    if cfg!(feature = "burn-cuda") && cfg!(any(windows, target_os = "linux")) {
         vec![RuntimeId::BurnCuda]
-    } else {
+    } else if cfg!(feature = "burn-cpu") {
         vec![RuntimeId::BurnCpu]
+    } else {
+        Vec::new()
     }
 }
 
@@ -498,6 +525,7 @@ fn selection_reason(
         (_, BackendRuntime::Mlx, _) => "MLX runtime selected for compatible model".to_string(),
         (_, _, RequestedBackend::Cpu) => "best CPU runtime for this model".to_string(),
         (_, _, RequestedBackend::Cuda) => "best CUDA runtime for this model".to_string(),
+        (_, _, RequestedBackend::Rocm) => "best ROCm runtime for this model".to_string(),
         (_, _, RequestedBackend::Vulkan) => "best Vulkan runtime for this model".to_string(),
         _ => "best available runtime for this model".to_string(),
     }
@@ -529,10 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_cuda_uses_burn_then_vllm_then_candle_without_cpu_fallback() {
+    fn safetensors_cuda_uses_vllm_then_candle_without_cpu_fallback() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("phi3"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Cuda);
-        assert_eq!(candidates[0], RuntimeId::BurnCuda);
+        assert_eq!(candidates[0], RuntimeId::VllmCuda);
         assert!(
             candidates
                 .iter()
@@ -545,6 +573,7 @@ mod tests {
         );
         assert!(candidates.contains(&RuntimeId::CandleCuda));
         assert!(!candidates.contains(&RuntimeId::CandleCpu));
+        assert!(!candidates.contains(&RuntimeId::BurnCuda));
         assert!(!candidates.contains(&RuntimeId::BurnCpu));
     }
 
@@ -552,38 +581,36 @@ mod tests {
     fn safetensors_auto_tries_vllm_before_candle_for_supported_architectures() {
         let qwen = manifest(ModelFormat::SafeTensors, Some("qwen2"));
         let candidates = runtime_candidate_ids(&qwen, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::BurnCuda);
-        assert!(
-            candidates
-                .iter()
-                .position(|id| *id == RuntimeId::VllmCuda)
-                .unwrap()
-                < candidates
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(candidates[0], RuntimeId::VllmCuda);
+            assert!(
+                candidates
                     .iter()
-                    .position(|id| *id == RuntimeId::CandleCuda)
+                    .position(|id| *id == RuntimeId::VllmCuda)
                     .unwrap()
-        );
+                    < candidates
+                        .iter()
+                        .position(|id| *id == RuntimeId::CandleCuda)
+                        .unwrap()
+            );
+            assert!(candidates.contains(&RuntimeId::CandleCpu));
+        }
+        assert!(!candidates.contains(&RuntimeId::BurnCuda));
+        assert!(!candidates.contains(&RuntimeId::BurnCpu));
     }
 
     #[test]
-    fn safetensors_auto_tries_burn_before_candle_for_any_architecture() {
-        let qwen = manifest(ModelFormat::SafeTensors, Some("qwen2"));
-        let candidates = runtime_candidate_ids(&qwen, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::BurnCuda);
-        assert!(
-            candidates
-                .iter()
-                .position(|id| *id == RuntimeId::CandleCuda)
-                .unwrap()
-                > candidates
-                    .iter()
-                    .position(|id| *id == RuntimeId::BurnCuda)
-                    .unwrap()
-        );
+    fn safetensors_auto_omits_burn_and_keeps_cpu_only_as_auto_fallback() {
         let unknown = manifest(ModelFormat::SafeTensors, Some("unknown"));
         let candidates = runtime_candidate_ids(&unknown, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::BurnCuda);
-        assert!(candidates.contains(&RuntimeId::CandleCuda));
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(
+                candidates,
+                vec![RuntimeId::CandleCuda, RuntimeId::CandleCpu]
+            );
+        }
+        assert!(!candidates.contains(&RuntimeId::BurnCuda));
+        assert!(!candidates.contains(&RuntimeId::BurnCpu));
     }
 
     #[test]
@@ -597,11 +624,81 @@ mod tests {
     fn explicit_burn_request_has_no_candle_fallback_candidates() {
         let manifest = manifest(ModelFormat::SafeTensors, Some("unknown"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Burn);
-        if cfg!(any(windows, target_os = "linux")) {
+        if cfg!(feature = "burn-cuda") && cfg!(any(windows, target_os = "linux")) {
             assert_eq!(candidates, vec![RuntimeId::BurnCuda]);
-        } else {
+        } else if cfg!(feature = "burn-cpu") {
             assert_eq!(candidates, vec![RuntimeId::BurnCpu]);
+        } else {
+            assert!(candidates.is_empty());
         }
+    }
+
+    #[test]
+    fn explicit_rocm_routes_to_rocm_candidates_only_for_compatible_formats() {
+        let safetensors = manifest(ModelFormat::SafeTensors, Some("qwen3"));
+        assert_eq!(
+            runtime_candidate_ids(&safetensors, RequestedBackend::Rocm),
+            vec![RuntimeId::VllmRocm]
+        );
+        let unknown_safetensors = manifest(ModelFormat::SafeTensors, Some("unknown"));
+        assert_eq!(
+            runtime_candidate_ids(&unknown_safetensors, RequestedBackend::Rocm),
+            vec![RuntimeId::VllmRocm]
+        );
+
+        let gguf = manifest(ModelFormat::Gguf, Some("llama"));
+        assert_eq!(
+            runtime_candidate_ids(&gguf, RequestedBackend::Rocm),
+            vec![RuntimeId::LlamaServerRocm]
+        );
+
+        let onnx = manifest(ModelFormat::Onnx, None);
+        assert_eq!(
+            runtime_candidate_ids(&onnx, RequestedBackend::Rocm),
+            vec![RuntimeId::OnnxRuntimeRocm]
+        );
+    }
+
+    #[test]
+    fn gguf_auto_adds_rocm_only_when_availability_mentions_it() {
+        let manifest = manifest(ModelFormat::Gguf, Some("llama"));
+        let plain = plan_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[],
+        );
+        assert!(
+            !plain
+                .candidates
+                .iter()
+                .any(|decision| decision.runtime_id == RuntimeId::LlamaServerRocm)
+        );
+
+        let gated = plan_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[RuntimeAvailability {
+                runtime_id: RuntimeId::LlamaServerRocm,
+                available: false,
+                reason: Some("ROCm probe unavailable".to_string()),
+            }],
+        );
+        let ids = gated
+            .candidates
+            .iter()
+            .map(|decision| decision.runtime_id)
+            .collect::<Vec<_>>();
+        let rocm = ids
+            .iter()
+            .position(|id| *id == RuntimeId::LlamaServerRocm)
+            .unwrap();
+        let vulkan = ids
+            .iter()
+            .position(|id| *id == RuntimeId::LlamaServerVulkan)
+            .unwrap();
+        assert!(rocm < vulkan);
     }
 
     #[test]

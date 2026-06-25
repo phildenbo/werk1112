@@ -13,6 +13,8 @@ use std::{
 };
 use tokio_stream::StreamExt;
 
+#[cfg(feature = "burn-experimental")]
+use crate::backend::burn_doctor_checks;
 use crate::{
     api::{ApiState, serve},
     backend::{
@@ -23,11 +25,11 @@ use crate::{
         MlxBackend, OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend,
         OnnxRuntimeMode, RuntimeId, StreamGranularity, VllmBackend, backend_doctor_checks,
         backend_supports_accelerator, backend_supports_format,
-        backend_supports_images as runtime_supports_images, burn_doctor_checks,
-        install_managed_llama_server, install_managed_onnx_runtime, install_managed_vllm,
-        llama_server_help_ok, managed_backend_dir, managed_runner_path as managed_onnx_runner_path,
-        managed_vllm_dir, probe_device, runtime_descriptor, runtime_registry,
-        runtime_supports_model, vllm_doctor_checks,
+        backend_supports_images as runtime_supports_images, install_managed_llama_server,
+        install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
+        managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
+        probe_device, runtime_descriptor, runtime_registry, runtime_supports_model,
+        vllm_doctor_checks,
     },
     banner::print_banner,
     model_store::{
@@ -69,7 +71,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, vulkan, metal, mlx, burn, onnx, vllm, candle, llama-highlevel, or llama-legacy"
+        help = "Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, onnx, vllm, candle, llama-highlevel, or llama-legacy"
     )]
     pub backend: BackendArg,
 
@@ -114,6 +116,7 @@ pub enum StreamGranularityArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendArg {
     Auto,
+    #[cfg_attr(not(feature = "burn-experimental"), value(skip))]
     Burn,
     Candle,
     Cpu,
@@ -123,6 +126,7 @@ pub enum BackendArg {
     Metal,
     Mlx,
     Onnx,
+    Rocm,
     Vllm,
     Vulkan,
 }
@@ -269,9 +273,11 @@ pub enum BenchCompareArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendInstallArg {
     LlamaCuda,
+    LlamaRocm,
     LlamaVulkan,
     LlamaCpu,
     OnnxCuda,
+    OnnxRocm,
     OnnxCpu,
     #[value(name = "vllm")]
     Vllm,
@@ -281,15 +287,17 @@ impl BackendInstallArg {
     fn mode(self) -> Option<LlamaCppMode> {
         match self {
             Self::LlamaCuda => Some(LlamaCppMode::Cuda),
+            Self::LlamaRocm => Some(LlamaCppMode::Rocm),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
-            Self::OnnxCuda | Self::OnnxCpu | Self::Vllm => None,
+            Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm => None,
         }
     }
 
     fn onnx_mode(self) -> Option<OnnxRuntimeMode> {
         match self {
             Self::OnnxCuda => Some(OnnxRuntimeMode::Cuda),
+            Self::OnnxRocm => Some(OnnxRuntimeMode::Rocm),
             Self::OnnxCpu => Some(OnnxRuntimeMode::Cpu),
             _ => None,
         }
@@ -1438,16 +1446,24 @@ fn print_backend_list(store: &ModelStore) {
         "{:<8} {:<16} {:<7} {:<7} PATH",
         "BACKEND", "SOURCE", "EXISTS", "HELP"
     );
-    for mode in [LlamaCppMode::Cuda, LlamaCppMode::Vulkan, LlamaCppMode::Cpu] {
+    for mode in [
+        LlamaCppMode::Cuda,
+        LlamaCppMode::Rocm,
+        LlamaCppMode::Vulkan,
+        LlamaCppMode::Cpu,
+    ] {
         let discovery = LlamaServerBackend::discover(store, mode);
         print_backend_discovery(&discovery);
     }
 
-    println!();
-    println!("Burn runtime");
-    println!("{:<8} {:<16} {:<7} DETAIL", "BACKEND", "SOURCE", "READY");
-    for mode in [BurnMode::Cuda, BurnMode::Cpu] {
-        print_burn_discovery(store, mode);
+    #[cfg(feature = "burn-experimental")]
+    {
+        println!();
+        println!("Burn runtime");
+        println!("{:<8} {:<16} {:<7} DETAIL", "BACKEND", "SOURCE", "READY");
+        for mode in [BurnMode::Cuda, BurnMode::Cpu] {
+            print_burn_discovery(store, mode);
+        }
     }
 
     println!();
@@ -1456,7 +1472,11 @@ fn print_backend_list(store: &ModelStore) {
         "{:<8} {:<16} {:<7} {:<7} PATH",
         "BACKEND", "SOURCE", "EXISTS", "HELP"
     );
-    for mode in [OnnxRuntimeMode::Cuda, OnnxRuntimeMode::Cpu] {
+    for mode in [
+        OnnxRuntimeMode::Cuda,
+        OnnxRuntimeMode::Rocm,
+        OnnxRuntimeMode::Cpu,
+    ] {
         print_onnxruntime_discovery(store, mode);
     }
 
@@ -1494,7 +1514,9 @@ fn print_backend_list(store: &ModelStore) {
         "{:<24} {:<12} {:<12} {:<8} INSTALL",
         "RUNTIME", "STATE", "ACCEL", "VLM"
     );
-    for runtime in runtime_registry() {
+    for runtime in runtime_registry().iter().filter(|runtime| {
+        cfg!(feature = "burn-experimental") || runtime.runtime != BackendRuntime::Burn
+    }) {
         println!(
             "{:<24} {:<12} {:<12} {:<8} {}",
             runtime.display_name,
@@ -1515,6 +1537,7 @@ fn print_backend_list(store: &ModelStore) {
     }
 }
 
+#[cfg(feature = "burn-experimental")]
 fn print_burn_discovery(store: &ModelStore, mode: BurnMode) {
     let _ = store;
     let status = BurnBackend::runtime_status(mode);
@@ -1583,6 +1606,7 @@ fn print_onnxruntime_discovery(store: &ModelStore, mode: OnnxRuntimeMode) {
         "{:<8} {:<16} {:<7} {:<7} {}",
         match mode {
             OnnxRuntimeMode::Cuda => "CUDA",
+            OnnxRuntimeMode::Rocm => "ROCm",
             OnnxRuntimeMode::Cpu => "CPU",
         },
         discovery.source,
@@ -1606,6 +1630,10 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
         "CUDA cache: {}",
         managed_backend_dir(store, LlamaCppMode::Cuda).display()
     );
+    println!(
+        "ROCm cache: {}",
+        managed_backend_dir(store, LlamaCppMode::Rocm).display()
+    );
     println!();
     for check in backend_doctor_checks(store) {
         println!(
@@ -1623,6 +1651,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
             check.detail
         );
     }
+    #[cfg(feature = "burn-experimental")]
     for check in burn_doctor_checks() {
         println!(
             "{:<24} {:<7} {}",
@@ -1633,6 +1662,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
     }
     println!();
     println!("{:<24} {:<12} DETAIL", "RUNTIME", "STATUS");
+    #[cfg(feature = "burn-experimental")]
     for mode in [BurnMode::Cuda, BurnMode::Cpu] {
         let status = BurnBackend::runtime_status(mode);
         println!(
@@ -1652,7 +1682,11 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
             );
         }
     }
-    for mode in [OnnxRuntimeMode::Cuda, OnnxRuntimeMode::Cpu] {
+    for mode in [
+        OnnxRuntimeMode::Cuda,
+        OnnxRuntimeMode::Rocm,
+        OnnxRuntimeMode::Cpu,
+    ] {
         let discovery = OnnxRuntimeBackend::discover(store, mode);
         let availability = OnnxRuntimeBackend::availability(store, mode);
         let status = match availability {
@@ -1869,6 +1903,7 @@ enum BackendChoice {
     Mlx,
     OnnxRuntime(OnnxRuntimeMode),
     Vllm,
+    VllmRocm,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2123,6 +2158,10 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
         BackendArg::Metal => BackendChoice::Candle(CandleDeviceMode::Metal),
         BackendArg::Mlx => BackendChoice::Mlx,
         BackendArg::Onnx => BackendChoice::OnnxRuntime(preferred_onnx_mode()),
+        BackendArg::Rocm => BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Rocm,
+            candle: CandleDeviceMode::Auto,
+        },
         BackendArg::Vllm => BackendChoice::Vllm,
         BackendArg::Vulkan => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Vulkan,
@@ -2152,7 +2191,7 @@ fn preferred_onnx_mode() -> OnnxRuntimeMode {
 }
 
 fn preferred_burn_mode() -> BurnMode {
-    if cfg!(any(windows, target_os = "linux")) {
+    if cfg!(feature = "burn-cuda") && cfg!(any(windows, target_os = "linux")) {
         BurnMode::Cuda
     } else {
         BurnMode::Cpu
@@ -2218,7 +2257,7 @@ fn build_concrete_backend(
         BackendChoice::Burn(mode) => Ok(Arc::new(BurnBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
-        BackendChoice::Vllm => Ok(Arc::new(VllmBackend::new(store))),
+        BackendChoice::Vllm | BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new(store))),
     }
 }
 
@@ -2241,6 +2280,7 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::BurnCuda => Some(BackendChoice::Burn(BurnMode::Cuda)),
         RuntimeId::BurnCpu => Some(BackendChoice::Burn(BurnMode::Cpu)),
         RuntimeId::LlamaServerCuda => Some(BackendChoice::LlamaServer(LlamaCppMode::Cuda)),
+        RuntimeId::LlamaServerRocm => Some(BackendChoice::LlamaServer(LlamaCppMode::Rocm)),
         RuntimeId::LlamaServerVulkan => Some(BackendChoice::LlamaServer(LlamaCppMode::Vulkan)),
         RuntimeId::LlamaServerCpu => Some(BackendChoice::LlamaServer(LlamaCppMode::Cpu)),
         RuntimeId::CandleCuda => Some(BackendChoice::Candle(CandleDeviceMode::Cuda)),
@@ -2248,8 +2288,10 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::CandleCpu => Some(BackendChoice::Candle(CandleDeviceMode::Cpu)),
         RuntimeId::Mlx => Some(BackendChoice::Mlx),
         RuntimeId::OnnxRuntimeCuda => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda)),
+        RuntimeId::OnnxRuntimeRocm => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)),
         RuntimeId::OnnxRuntimeCpu => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu)),
         RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
+        RuntimeId::VllmRocm => Some(BackendChoice::VllmRocm),
     }
 }
 
@@ -2269,6 +2311,7 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         BackendChoice::Burn(BurnMode::Cuda) => Some(RuntimeId::BurnCuda),
         BackendChoice::Burn(BurnMode::Cpu) => Some(RuntimeId::BurnCpu),
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => Some(RuntimeId::LlamaServerCuda),
+        BackendChoice::LlamaServer(LlamaCppMode::Rocm) => Some(RuntimeId::LlamaServerRocm),
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => Some(RuntimeId::LlamaServerVulkan),
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => Some(RuntimeId::LlamaServerCpu),
         BackendChoice::Candle(CandleDeviceMode::Cuda) => Some(RuntimeId::CandleCuda),
@@ -2277,8 +2320,10 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         | BackendChoice::Candle(CandleDeviceMode::Auto) => Some(RuntimeId::CandleCpu),
         BackendChoice::Mlx => Some(RuntimeId::Mlx),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => Some(RuntimeId::OnnxRuntimeCuda),
+        BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => Some(RuntimeId::OnnxRuntimeRocm),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => Some(RuntimeId::OnnxRuntimeCpu),
         BackendChoice::Vllm => Some(RuntimeId::VllmCuda),
+        BackendChoice::VllmRocm => Some(RuntimeId::VllmRocm),
         BackendChoice::Auto
         | BackendChoice::GgufPreferred { .. }
         | BackendChoice::LlamaFast(_)
@@ -2380,7 +2425,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
         BackendChoice::LlamaHighlevel(_) => BackendRuntime::LlamaHighlevel,
         BackendChoice::Mlx => BackendRuntime::Mlx,
         BackendChoice::OnnxRuntime(_) => BackendRuntime::OnnxRuntime,
-        BackendChoice::Vllm => BackendRuntime::Vllm,
+        BackendChoice::Vllm | BackendChoice::VllmRocm => BackendRuntime::Vllm,
     }
 }
 
@@ -2398,6 +2443,11 @@ fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
         | BackendChoice::LlamaServer(LlamaCppMode::Cuda)
         | BackendChoice::LlamaFast(LlamaCppMode::Cuda)
         | BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda) => BackendAccelerator::Cuda,
+        BackendChoice::LlamaServer(LlamaCppMode::Rocm)
+        | BackendChoice::LlamaFast(LlamaCppMode::Rocm)
+        | BackendChoice::LlamaHighlevel(LlamaCppMode::Rocm)
+        | BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)
+        | BackendChoice::VllmRocm => BackendAccelerator::Rocm,
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan)
         | BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
         | BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => BackendAccelerator::Vulkan,
@@ -2459,6 +2509,9 @@ fn backend_unavailability_reason(
         BackendChoice::Vllm => VllmBackend::probe(store)
             .err()
             .map(|_| VllmBackend::unavailable_reason(store)),
+        BackendChoice::VllmRocm => VllmBackend::probe_rocm(store)
+            .err()
+            .map(|_| VllmBackend::rocm_unavailable_reason(store)),
         BackendChoice::LlamaServer(mode) => LlamaServerBackend::probe(store, mode)
             .err()
             .map(|_| LlamaServerBackend::missing_message(store, mode)),
@@ -2510,7 +2563,8 @@ fn selected_backend_for_request(
         | BackendChoice::Burn(_)
         | BackendChoice::Mlx
         | BackendChoice::OnnxRuntime(_)
-        | BackendChoice::Vllm => {
+        | BackendChoice::Vllm
+        | BackendChoice::VllmRocm => {
             let Some(runtime_id) = backend_to_runtime_id(backend) else {
                 bail!(
                     "backend {} is not represented in the runtime planner",
@@ -2599,12 +2653,17 @@ fn runtime_availabilities_for_request(
     requested: RequestedBackend,
     selection_options: SelectionOptions,
 ) -> Vec<RuntimeAvailability> {
-    runtime_candidate_ids(manifest, requested)
+    runtime_candidate_ids_for_selection(store, manifest, requested)
         .into_iter()
         .map(|runtime_id| {
             if let Some(backend) = runtime_id_to_backend_for_request(runtime_id, requested) {
-                let reason =
-                    backend_unavailability_reason(store, backend, manifest, selection_options);
+                let reason = runtime_unavailability_reason(
+                    store,
+                    runtime_id,
+                    backend,
+                    manifest,
+                    selection_options,
+                );
                 RuntimeAvailability {
                     runtime_id,
                     available: reason.is_none(),
@@ -2629,6 +2688,46 @@ fn runtime_availabilities_for_request(
         .collect()
 }
 
+fn runtime_candidate_ids_for_selection(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    requested: RequestedBackend,
+) -> Vec<RuntimeId> {
+    let mut candidates = runtime_candidate_ids(manifest, requested);
+    if requested == RequestedBackend::Auto
+        && manifest.format == ModelFormat::Gguf
+        && llama_rocm_auto_probeable(store)
+        && !candidates.contains(&RuntimeId::LlamaServerRocm)
+    {
+        let insert_at = candidates
+            .iter()
+            .position(|id| *id == RuntimeId::LlamaServerVulkan)
+            .unwrap_or(candidates.len());
+        candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
+    }
+    candidates
+}
+
+fn llama_rocm_auto_probeable(store: &ModelStore) -> bool {
+    env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
+        || managed_backend_dir(store, LlamaCppMode::Rocm).exists()
+}
+
+fn runtime_unavailability_reason(
+    store: &ModelStore,
+    runtime_id: RuntimeId,
+    backend: BackendChoice,
+    manifest: &ModelManifest,
+    selection_options: SelectionOptions,
+) -> Option<String> {
+    match runtime_id {
+        RuntimeId::VllmRocm => VllmBackend::probe_rocm(store)
+            .err()
+            .map(|_| VllmBackend::rocm_unavailable_reason(store)),
+        _ => backend_unavailability_reason(store, backend, manifest, selection_options),
+    }
+}
+
 fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
     match backend {
         BackendChoice::Auto => RequestedBackend::Auto,
@@ -2638,6 +2737,12 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         }
         | BackendChoice::LlamaServer(LlamaCppMode::Cuda) => RequestedBackend::Cuda,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => RequestedBackend::Cuda,
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Rocm,
+            ..
+        }
+        | BackendChoice::LlamaServer(LlamaCppMode::Rocm) => RequestedBackend::Rocm,
+        BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => RequestedBackend::Rocm,
         BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Vulkan,
             ..
@@ -2653,6 +2758,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         BackendChoice::Candle(_) => RequestedBackend::Candle,
         BackendChoice::Mlx => RequestedBackend::Mlx,
         BackendChoice::Vllm => RequestedBackend::Vllm,
+        BackendChoice::VllmRocm => RequestedBackend::Rocm,
         BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
         BackendChoice::LlamaHighlevel(_) => RequestedBackend::LlamaHighlevel,
     }
@@ -2717,6 +2823,9 @@ fn unavailable_backend_message(
             OnnxRuntimeBackend::missing_message(store, mode)
         }
         (BackendChoice::Vllm, ModelFormat::SafeTensors) => VllmBackend::missing_message(store),
+        (BackendChoice::VllmRocm, ModelFormat::SafeTensors) => {
+            VllmBackend::rocm_unavailable_reason(store)
+        }
         (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
         _ => format!(
             "backend {} is unavailable for model '{}' with format {:?}",
@@ -2793,14 +2902,22 @@ fn print_routing_debug(
     );
     eprintln!("candidate runtimes:");
     for decision in &plan.candidates {
+        let descriptor = runtime_descriptor(decision.runtime_id);
         let status = match decision.status {
             RuntimeDecisionStatus::Accepted => "accepted",
             RuntimeDecisionStatus::Rejected => "rejected",
         };
+        let role = runtime_role(manifest, requested_backend, decision.runtime_id);
         eprintln!(
-            "candidate: {} -> {status}: {}",
+            "candidate: {} ({role}) -> {status}: {}",
             decision.display_name, decision.reason
         );
+        if decision.status == RuntimeDecisionStatus::Rejected
+            && let Some(target) = descriptor.install_target
+        {
+            eprintln!("  install hint: werk backend install {target}");
+        }
+        #[cfg(feature = "burn-experimental")]
         if matches!(
             decision.runtime_id,
             RuntimeId::BurnCuda | RuntimeId::BurnCpu
@@ -2815,23 +2932,66 @@ fn print_routing_debug(
         }
         if matches!(
             decision.runtime_id,
-            RuntimeId::OnnxRuntimeCuda | RuntimeId::OnnxRuntimeCpu
+            RuntimeId::OnnxRuntimeCuda | RuntimeId::OnnxRuntimeRocm | RuntimeId::OnnxRuntimeCpu
         ) && decision.status == RuntimeDecisionStatus::Rejected
         {
             let mode = match decision.runtime_id {
                 RuntimeId::OnnxRuntimeCuda => OnnxRuntimeMode::Cuda,
+                RuntimeId::OnnxRuntimeRocm => OnnxRuntimeMode::Rocm,
                 RuntimeId::OnnxRuntimeCpu => OnnxRuntimeMode::Cpu,
                 _ => unreachable!(),
             };
             print_onnxruntime_debug_details(store, mode);
         }
     }
-    eprintln!("selected runtime: {}", verbose_backend_label(selected));
-    if let Some(selected) = plan.selected {
-        eprintln!("reason: {}", selected.reason);
+    if let Some(planned) = plan.selected {
+        eprintln!("selected runtime: {}", planned.display_name);
+        eprintln!(
+            "selected role: {}",
+            runtime_role(manifest, requested_backend, planned.runtime_id)
+        );
+        eprintln!("reason: {}", planned.reason);
+        if candle_safetensors_cuda_fallback_warning(manifest, requested_backend, planned.runtime_id)
+        {
+            eprintln!(
+                "warning: Candle is a compatibility fallback for safetensors CUDA. Install vLLM for better serving performance."
+            );
+        }
+    } else {
+        eprintln!("selected runtime: {}", verbose_backend_label(selected));
     }
 }
 
+fn runtime_role(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    runtime_id: RuntimeId,
+) -> &'static str {
+    let descriptor = runtime_descriptor(runtime_id);
+    if descriptor.runtime == BackendRuntime::Candle
+        && manifest.format == ModelFormat::SafeTensors
+        && requested_backend != RequestedBackend::Candle
+    {
+        "compatibility fallback"
+    } else {
+        "primary runtime"
+    }
+}
+
+fn candle_safetensors_cuda_fallback_warning(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    runtime_id: RuntimeId,
+) -> bool {
+    manifest.format == ModelFormat::SafeTensors
+        && matches!(
+            requested_backend,
+            RequestedBackend::Auto | RequestedBackend::Cuda
+        )
+        && runtime_id == RuntimeId::CandleCuda
+}
+
+#[cfg(feature = "burn-experimental")]
 fn print_burn_debug_details(store: &ModelStore, manifest: &ModelManifest, mode: BurnMode) {
     let report = BurnBackend::probe_report(store, manifest, mode);
     eprintln!(
@@ -2926,6 +3086,7 @@ fn requested_backend_label(backend: BackendArg) -> &'static str {
         BackendArg::Metal => "metal",
         BackendArg::Mlx => "mlx",
         BackendArg::Onnx => "onnx",
+        BackendArg::Rocm => "rocm",
         BackendArg::Vllm => "vllm",
         BackendArg::Vulkan => "vulkan",
     }
@@ -2991,6 +3152,10 @@ fn backend_label(backend: BackendChoice) -> &'static str {
             ..
         } => "cuda",
         BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Rocm,
+            ..
+        } => "rocm",
+        BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cpu,
             ..
         } => "cpu",
@@ -3006,12 +3171,16 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "onnxruntime-cuda",
+        BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "onnxruntime-rocm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "onnxruntime-cpu",
         BackendChoice::Vllm => "vllm-cuda",
+        BackendChoice::VllmRocm => "vllm-rocm",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama-server-cuda",
+        BackendChoice::LlamaServer(LlamaCppMode::Rocm) => "llama-server-rocm",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama-server-vulkan",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama-server-cpu",
         BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama-legacy-cuda",
+        BackendChoice::LlamaFast(LlamaCppMode::Rocm) => "llama-legacy-rocm",
         BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama-legacy-vulkan",
         BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama-legacy-cpu",
         BackendChoice::LlamaHighlevel(mode) => mode.label(),
@@ -3025,6 +3194,10 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
             llama: LlamaCppMode::Cuda,
             ..
         } => "llama.cpp server CUDA",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Rocm,
+            ..
+        } => "llama.cpp server ROCm/HIP",
         BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cpu,
             ..
@@ -3041,15 +3214,20 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Metal) => "Candle Metal",
         BackendChoice::Mlx => "MLX",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "ONNX Runtime CUDA",
+        BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "ONNX Runtime ROCm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "ONNX Runtime CPU",
         BackendChoice::Vllm => "vLLM CUDA",
+        BackendChoice::VllmRocm => "vLLM ROCm",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama.cpp server CUDA",
+        BackendChoice::LlamaServer(LlamaCppMode::Rocm) => "llama.cpp server ROCm/HIP",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama.cpp server Vulkan",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama.cpp server CPU",
         BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama.cpp legacy FFI CUDA",
+        BackendChoice::LlamaFast(LlamaCppMode::Rocm) => "llama.cpp legacy FFI ROCm",
         BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama.cpp legacy FFI Vulkan",
         BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama.cpp legacy FFI CPU",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda) => "llama.cpp high-level CUDA",
+        BackendChoice::LlamaHighlevel(LlamaCppMode::Rocm) => "llama.cpp high-level ROCm",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => "llama.cpp high-level Vulkan",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Cpu) => "llama.cpp high-level CPU",
     }
@@ -3058,6 +3236,7 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
 fn display_llama_mode(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "CUDA",
+        LlamaCppMode::Rocm => "ROCm/HIP",
         LlamaCppMode::Vulkan => "Vulkan",
         LlamaCppMode::Cpu => "CPU",
     }
@@ -3369,11 +3548,27 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "llama-rocm"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::LlamaRocm),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "backend", "install", "vllm"]).unwrap();
         match cli.command.unwrap() {
             Commands::Backend {
                 command: BackendCommands::Install { target },
             } => assert_eq!(target, BackendInstallArg::Vllm),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "backend", "install", "onnx-rocm"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Backend {
+                command: BackendCommands::Install { target },
+            } => assert_eq!(target, BackendInstallArg::OnnxRocm),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -3412,6 +3607,20 @@ mod tests {
         match cli.command.unwrap() {
             Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
             command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "--backend", "rocm", "chat", "tiny"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Rocm);
+        match cli.command.unwrap() {
+            Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let burn = Cli::try_parse_from(["werk", "--backend", "burn", "chat", "tiny"]);
+        if cfg!(feature = "burn-experimental") {
+            assert!(burn.is_ok());
+        } else {
+            assert!(burn.is_err());
         }
 
         let cli = Cli::try_parse_from([
@@ -3522,6 +3731,14 @@ mod tests {
             }
         ));
         assert!(matches!(
+            backend_arg_to_choice(BackendArg::Rocm),
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Rocm,
+                candle: CandleDeviceMode::Auto
+            }
+        ));
+        #[cfg(feature = "burn-experimental")]
+        assert!(matches!(
             backend_arg_to_choice(BackendArg::Burn),
             BackendChoice::Burn(_)
         ));
@@ -3568,29 +3785,200 @@ mod tests {
     }
 
     #[test]
-    fn auto_safetensors_prefers_burn_then_vllm_then_candle_on_linux_and_windows() {
+    fn gguf_auto_includes_rocm_only_when_probeable() {
         if cfg!(any(windows, target_os = "linux")) {
-            let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-            let order = auto_candidates_for_manifest(&manifest);
-            assert!(matches!(order[0], BackendChoice::Burn(BurnMode::Cuda)));
-            assert!(matches!(order[1], BackendChoice::Vllm));
-            assert!(matches!(
-                order[2],
-                BackendChoice::Candle(CandleDeviceMode::Cuda)
-            ));
+            let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+            let store = test_store("gguf-auto-rocm-gating");
+            let plain =
+                runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Auto);
+            assert!(!plain.contains(&RuntimeId::LlamaServerRocm));
+
+            install_fake_managed_llama_server(&store, LlamaCppMode::Rocm);
+            let gated =
+                runtime_candidate_ids_for_selection(&store, &manifest, RequestedBackend::Auto);
+            let rocm = gated
+                .iter()
+                .position(|id| *id == RuntimeId::LlamaServerRocm)
+                .unwrap();
+            let vulkan = gated
+                .iter()
+                .position(|id| *id == RuntimeId::LlamaServerVulkan)
+                .unwrap();
+            assert!(rocm < vulkan);
         }
     }
 
     #[test]
-    fn runtime_registry_exposes_real_burn_runtime() {
+    fn explicit_rocm_candidates_are_strict_for_compatible_formats() {
+        let requested = backend_arg_to_choice(BackendArg::Rocm);
+
+        let gguf = test_manifest(ModelFormat::Gguf, Some("llama"));
+        assert_eq!(
+            routing_candidates_for_debug(requested, &gguf),
+            vec![RuntimeId::LlamaServerRocm]
+        );
+
+        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("qwen3"));
+        assert_eq!(
+            routing_candidates_for_debug(requested, &safetensors),
+            vec![RuntimeId::VllmRocm]
+        );
+        let unknown_safetensors = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
+        assert_eq!(
+            routing_candidates_for_debug(requested, &unknown_safetensors),
+            vec![RuntimeId::VllmRocm]
+        );
+
+        let onnx = test_manifest(ModelFormat::Onnx, None);
+        assert_eq!(
+            routing_candidates_for_debug(requested, &onnx),
+            vec![RuntimeId::OnnxRuntimeRocm]
+        );
+    }
+
+    #[test]
+    fn explicit_rocm_selection_does_not_fall_back_to_cpu() {
+        let store = test_store("explicit-rocm");
+        let requested = backend_arg_to_choice(BackendArg::Rocm);
+
+        let gguf = test_manifest(ModelFormat::Gguf, Some("llama"));
+        match selected_backend_for_manifest(&store, requested, &gguf) {
+            Ok(selected) => assert!(matches!(
+                selected,
+                BackendChoice::LlamaServer(LlamaCppMode::Rocm)
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("llama.cpp server ROCm/HIP"));
+                assert!(!message.contains("llama.cpp server CPU"));
+                assert!(!message.contains("Candle CPU"));
+            }
+        }
+
+        let safetensors = test_manifest(ModelFormat::SafeTensors, Some("qwen3"));
+        match selected_backend_for_manifest(&store, requested, &safetensors) {
+            Ok(selected) => assert!(matches!(selected, BackendChoice::VllmRocm)),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("vLLM ROCm"));
+                assert!(message.contains("ROCm") || message.contains("HIP"));
+                assert!(!message.contains("Candle CPU"));
+            }
+        }
+
+        let onnx = test_manifest(ModelFormat::Onnx, None);
+        match selected_backend_for_manifest(&store, requested, &onnx) {
+            Ok(selected) => assert!(matches!(
+                selected,
+                BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)
+            )),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("ONNX Runtime ROCm"));
+                assert!(!message.contains("ONNX Runtime CPU"));
+            }
+        }
+    }
+
+    #[test]
+    fn onnx_vulkan_and_mlx_gpu_requests_reject_without_cpu_fallback() {
+        let store = test_store("unsupported-explicit-accelerators");
+
+        let onnx = test_manifest(ModelFormat::Onnx, None);
+        let vulkan = backend_arg_to_choice(BackendArg::Vulkan);
+        assert!(routing_candidates_for_debug(vulkan, &onnx).is_empty());
+        let err = selected_backend_for_manifest(&store, vulkan, &onnx).unwrap_err();
+        assert!(err.to_string().contains("no runtime candidates"));
+        assert!(!err.to_string().contains("ONNX Runtime CPU"));
+
+        let mlx = test_manifest(ModelFormat::Mlx, Some("llama"));
+        for backend in [BackendArg::Cuda, BackendArg::Rocm, BackendArg::Vulkan] {
+            let requested = backend_arg_to_choice(backend);
+            assert!(routing_candidates_for_debug(requested, &mlx).is_empty());
+            let err = selected_backend_for_manifest(&store, requested, &mlx).unwrap_err();
+            assert!(err.to_string().contains("no runtime candidates"));
+            assert!(!err.to_string().contains("Candle CPU"));
+        }
+    }
+
+    #[test]
+    fn gguf_explicit_mlx_vllm_and_onnx_reject() {
+        let store = test_store("gguf-strict-runtime-rejections");
+        let gguf = test_manifest(ModelFormat::Gguf, Some("llama"));
+
+        for requested in [
+            BackendChoice::Mlx,
+            BackendChoice::Vllm,
+            BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda),
+        ] {
+            let err = selected_backend_for_manifest(&store, requested, &gguf).unwrap_err();
+            let message = err.to_string();
+            assert!(!message.contains("llama.cpp server CPU"));
+            assert!(!message.contains("Candle CPU"));
+        }
+    }
+
+    #[test]
+    fn explicit_gguf_rocm_can_select_managed_rocm_server() {
+        let store = test_store("gguf-rocm");
+        install_fake_managed_llama_server(&store, LlamaCppMode::Rocm);
+        let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        let selected = selected_backend_for_manifest(
+            &store,
+            backend_arg_to_choice(BackendArg::Rocm),
+            &manifest,
+        )
+        .unwrap();
+        assert!(matches!(
+            selected,
+            BackendChoice::LlamaServer(LlamaCppMode::Rocm)
+        ));
+    }
+
+    #[test]
+    fn auto_safetensors_prefers_vllm_then_candle_on_linux_and_windows() {
+        if cfg!(any(windows, target_os = "linux")) {
+            let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
+            let order = auto_candidates_for_manifest(&manifest);
+            assert!(matches!(order[0], BackendChoice::Vllm));
+            assert!(matches!(
+                order[1],
+                BackendChoice::Candle(CandleDeviceMode::Cuda)
+            ));
+            assert!(matches!(
+                order[2],
+                BackendChoice::Candle(CandleDeviceMode::Cpu)
+            ));
+            assert!(
+                !order
+                    .iter()
+                    .any(|choice| matches!(choice, BackendChoice::Burn(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_registry_omits_burn_from_normal_policy_unless_experimental() {
         let burn_cuda = runtime_descriptor(RuntimeId::BurnCuda);
         assert_eq!(burn_cuda.display_name, "Burn CUDA");
-        assert!(burn_cuda.implemented);
+        assert_eq!(burn_cuda.implemented, cfg!(feature = "burn-cuda"));
         assert_eq!(burn_cuda.install_target, None);
         let burn_cpu = runtime_descriptor(RuntimeId::BurnCpu);
         assert_eq!(burn_cpu.display_name, "Burn CPU");
-        assert!(burn_cpu.implemented);
+        assert_eq!(burn_cpu.implemented, cfg!(feature = "burn-cpu"));
         assert_eq!(burn_cpu.install_target, None);
+
+        let normal_runtime_ids = runtime_registry()
+            .iter()
+            .filter(|runtime| {
+                cfg!(feature = "burn-experimental") || runtime.runtime != BackendRuntime::Burn
+            })
+            .map(|runtime| runtime.id)
+            .collect::<Vec<_>>();
+        if !cfg!(feature = "burn-experimental") {
+            assert!(!normal_runtime_ids.contains(&RuntimeId::BurnCuda));
+            assert!(!normal_runtime_ids.contains(&RuntimeId::BurnCpu));
+        }
     }
 
     #[test]
@@ -3621,24 +4009,26 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_runtime_candidates_include_burn_before_candle_for_any_architecture() {
+    fn safetensors_runtime_candidates_omit_burn_and_keep_cpu_as_auto_fallback() {
         if cfg!(any(windows, target_os = "linux")) {
             let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
             let candidates = auto_runtime_candidates_for_manifest(&manifest);
-            assert_eq!(candidates[0], RuntimeId::BurnCuda);
-            assert!(
-                candidates
-                    .iter()
-                    .position(|id| *id == RuntimeId::CandleCuda)
-                    .unwrap()
-                    > candidates
-                        .iter()
-                        .position(|id| *id == RuntimeId::BurnCuda)
-                        .unwrap()
+            assert_eq!(
+                candidates,
+                vec![RuntimeId::CandleCuda, RuntimeId::CandleCpu]
             );
+            assert!(!candidates.contains(&RuntimeId::BurnCuda));
+            assert!(!candidates.contains(&RuntimeId::BurnCpu));
 
             let concrete = auto_candidates_for_manifest(&manifest);
-            assert!(matches!(concrete[0], BackendChoice::Burn(BurnMode::Cuda)));
+            assert!(matches!(
+                concrete[0],
+                BackendChoice::Candle(CandleDeviceMode::Cuda)
+            ));
+            assert!(matches!(
+                concrete[1],
+                BackendChoice::Candle(CandleDeviceMode::Cpu)
+            ));
         }
     }
 
@@ -3692,7 +4082,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_does_not_fake_burn_safetensors_support() {
+    fn backend_selection_routes_safetensors_cuda_without_burn_or_cpu_fallback() {
         let store = test_store("safetensors-cuda");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let result = selected_backend_for_manifest(
@@ -3710,8 +4100,8 @@ mod tests {
             )),
             Err(err) => {
                 let message = err.to_string();
-                assert!(message.contains("Burn CUDA"));
                 assert!(message.contains("Candle CUDA"));
+                assert!(!message.contains("Burn CUDA"));
                 assert!(!message.contains("Burn CPU"));
                 assert!(!message.contains("Candle CPU"));
             }
@@ -3784,7 +4174,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_falls_back_to_candle_cuda_when_burn_missing() {
+    fn backend_selection_falls_back_to_candle_cuda_when_vllm_missing() {
         let store = test_store("safetensors-cuda-fallback");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
         let result = selected_backend_for_manifest(
@@ -3802,8 +4192,8 @@ mod tests {
             )),
             Err(err) => {
                 let message = err.to_string();
-                assert!(message.contains("Burn"));
                 assert!(message.contains("Candle CUDA"));
+                assert!(!message.contains("Burn"));
                 assert!(!message.contains("Candle CPU"));
             }
         }
@@ -3844,8 +4234,8 @@ mod tests {
             )),
             Err(err) => {
                 let message = err.to_string();
-                assert!(message.contains("Burn"));
                 assert!(message.contains("Candle CUDA"));
+                assert!(!message.contains("Burn"));
                 assert!(!message.contains("Candle CPU"));
             }
         }

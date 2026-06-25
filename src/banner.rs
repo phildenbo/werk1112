@@ -8,7 +8,7 @@ pub const BANNER: &str = concat!(
     "\x1b[38;2;0;220;255m     \\ V  V /\x1b[38;2;59;130;246m/ /___ \x1b[38;2;99;102;241m/ _, _/\x1b[38;2;139;92;246m/ /| | \x1b[38;2;255;79;195m / /  / /  / /  / __/ \x1b[0m\n",
     "\x1b[38;2;0;220;255m      \\_/\\_/\x1b[38;2;59;130;246m/_____/\x1b[38;2;99;102;241m/_/ |_|\x1b[38;2;139;92;246m/_/ |_| \x1b[38;2;255;79;195m/_/  /_/  /_/  /____/\x1b[0m\n",
     "\n",
-    "\x1b[38;2;0;220;255m                 Any \x1b[38;2;59;130;246mModel\x1b[38;2;99;102;241m. \x1b[38;2;139;92;246mAny\x1b[38;2;255;79;195mwhere.\x1b[0m\n",
+    "\x1b[38;2;0;220;255m                 Native \x1b[38;2;59;130;246mAI \x1b[38;2;99;102;241m\x1b[38;2;139;92;246mruntime \x1b[38;2;255;79;195mmanagement.\x1b[0m\n",
     "\n",
 );
 
@@ -26,7 +26,7 @@ mod tests {
     fn banner_contains_required_identity() {
         let plain = strip_ansi(BANNER);
 
-        assert!(plain.contains("Any Model. Anywhere."));
+        assert!(plain.contains("Native AI. runtime management."));
         assert!(plain.contains("__        __"));
         assert!(plain.contains("\\ \\      / /"));
         assert!(plain.contains("/ //_/"));

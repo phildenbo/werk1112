@@ -48,6 +48,7 @@ pub enum BackendAccelerator {
     Auto,
     Cpu,
     Cuda,
+    Rocm,
     Vulkan,
     Wgpu,
     Metal,
@@ -63,6 +64,7 @@ pub enum RuntimeId {
     BurnCuda,
     BurnCpu,
     LlamaServerCuda,
+    LlamaServerRocm,
     LlamaServerVulkan,
     LlamaServerCpu,
     CandleCuda,
@@ -70,7 +72,9 @@ pub enum RuntimeId {
     CandleCpu,
     Mlx,
     VllmCuda,
+    VllmRocm,
     OnnxRuntimeCuda,
+    OnnxRuntimeRocm,
     OnnxRuntimeCpu,
 }
 
@@ -130,7 +134,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         accelerators: &[BackendAccelerator::Cuda],
         capabilities: TEXT_STREAMING,
         priority: 980,
-        implemented: true,
+        implemented: cfg!(feature = "burn-cuda"),
         install_target: None,
     },
     RuntimeDescriptor {
@@ -142,7 +146,7 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         accelerators: &[BackendAccelerator::Cpu],
         capabilities: TEXT_STREAMING,
         priority: 780,
-        implemented: true,
+        implemented: cfg!(feature = "burn-cpu"),
         install_target: None,
     },
     RuntimeDescriptor {
@@ -156,6 +160,18 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         priority: 1000,
         implemented: true,
         install_target: Some("llama-cuda"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::LlamaServerRocm,
+        runtime: BackendRuntime::LlamaServer,
+        display_name: "llama.cpp server ROCm/HIP",
+        supported_formats: GGUF_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Rocm],
+        capabilities: TEXT_STREAMING,
+        priority: 950,
+        implemented: true,
+        install_target: Some("llama-rocm"),
     },
     RuntimeDescriptor {
         id: RuntimeId::LlamaServerVulkan,
@@ -206,6 +222,18 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: None,
     },
     RuntimeDescriptor {
+        id: RuntimeId::OnnxRuntimeRocm,
+        runtime: BackendRuntime::OnnxRuntime,
+        display_name: "ONNX Runtime ROCm",
+        supported_formats: ONNX_RUNTIME_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Rocm],
+        capabilities: TEXT_STREAMING,
+        priority: 955,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
         id: RuntimeId::CandleMetal,
         runtime: BackendRuntime::Candle,
         display_name: "Candle Metal",
@@ -250,6 +278,18 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         accelerators: &[BackendAccelerator::Cuda],
         capabilities: TEXT_STREAMING,
         priority: 950,
+        implemented: true,
+        install_target: Some("vllm"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::VllmRocm,
+        runtime: BackendRuntime::Vllm,
+        display_name: "vLLM ROCm",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: VLLM_ARCHES,
+        accelerators: &[BackendAccelerator::Rocm],
+        capabilities: TEXT_STREAMING,
+        priority: 945,
         implemented: true,
         install_target: Some("vllm"),
     },
@@ -342,13 +382,19 @@ pub fn backend_supports_accelerator(
         | BackendRuntime::LlamaLegacy
         | BackendRuntime::LlamaHighlevel => matches!(
             accelerator,
-            BackendAccelerator::Cpu | BackendAccelerator::Cuda | BackendAccelerator::Vulkan
+            BackendAccelerator::Cpu
+                | BackendAccelerator::Cuda
+                | BackendAccelerator::Rocm
+                | BackendAccelerator::Vulkan
         ),
-        BackendRuntime::Vllm => matches!(accelerator, BackendAccelerator::Cuda),
+        BackendRuntime::Vllm => matches!(
+            accelerator,
+            BackendAccelerator::Cuda | BackendAccelerator::Rocm
+        ),
         BackendRuntime::OnnxRuntime => {
             matches!(
                 accelerator,
-                BackendAccelerator::Cuda | BackendAccelerator::Cpu
+                BackendAccelerator::Cuda | BackendAccelerator::Rocm | BackendAccelerator::Cpu
             )
         }
         BackendRuntime::Mlx => matches!(accelerator, BackendAccelerator::Mlx),

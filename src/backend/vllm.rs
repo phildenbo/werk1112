@@ -105,6 +105,16 @@ impl VllmBackend {
         }
     }
 
+    pub fn probe_rocm(store: &ModelStore) -> Result<String> {
+        let discovery = require_vllm(store)?;
+        let command = discovery
+            .command
+            .as_ref()
+            .context("vLLM discovery had no command")?;
+        let detail = vllm_rocm_capability(command)?;
+        Ok(format!("vLLM ROCm ({detail})"))
+    }
+
     pub fn discover(store: &ModelStore) -> VllmDiscovery {
         discover_vllm(store)
     }
@@ -115,6 +125,17 @@ impl VllmBackend {
 
     pub fn unavailable_reason(store: &ModelStore) -> String {
         concise_vllm_unavailable_reason(&discover_vllm(store))
+    }
+
+    pub fn rocm_unavailable_reason(store: &ModelStore) -> String {
+        let discovery = discover_vllm(store);
+        let Some(command) = discovery.command.as_ref() else {
+            return concise_vllm_unavailable_reason(&discovery);
+        };
+        vllm_rocm_capability(command)
+            .err()
+            .map(|err| compact_error(&err.to_string()))
+            .unwrap_or_else(|| "vLLM ROCm runtime is unavailable".to_string())
     }
 
     fn cached_server(&self, manifest: &ModelManifest) -> Result<(Arc<VllmProcess>, bool, f64)> {
@@ -956,6 +977,79 @@ fn python_vllm_status(path: &Path) -> (bool, String) {
     }
 }
 
+fn python_rocm_status(path: &Path) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "Python path does not exist".to_string());
+    }
+    match Command::new(path)
+        .arg("-c")
+        .arg(
+            "import torch; hip = getattr(torch.version, 'hip', None); \
+             assert hip, 'torch.version.hip is not set'; print(hip)",
+        )
+        .output()
+    {
+        Ok(output) if output.status.success() => (
+            true,
+            format!(
+                "PyTorch ROCm/HIP runtime detected ({})",
+                String::from_utf8_lossy(&output.stdout).trim()
+            ),
+        ),
+        Ok(output) => (
+            false,
+            command_failure_detail("Python does not expose a ROCm/HIP PyTorch stack", &output),
+        ),
+        Err(err) => (false, format!("failed to run Python: {err}")),
+    }
+}
+
+fn vllm_rocm_capability(command: &VllmCommand) -> Result<String> {
+    match command {
+        VllmCommand::Python(path) => {
+            let (usable, detail) = python_rocm_status(path);
+            if usable {
+                Ok(detail)
+            } else {
+                bail!(
+                    "vLLM is installed, but the Python environment is not ROCm-capable: {detail}. Install vLLM with a ROCm/HIP PyTorch build or use --backend cuda/auto."
+                )
+            }
+        }
+        VllmCommand::Remote { host, port } => {
+            if remote_rocm_explicitly_confirmed() {
+                Ok(format!(
+                    "remote vLLM endpoint at http://{host}:{port} marked ROCm-capable by environment"
+                ))
+            } else {
+                bail!(
+                    "remote vLLM endpoint is reachable at http://{host}:{port}, but ROCm capability cannot be inferred. Set WERK_VLLM_ACCELERATOR=rocm or WERK_VLLM_ROCM=1 for an explicitly ROCm-backed remote server."
+                )
+            }
+        }
+        VllmCommand::Executable(path) => {
+            bail!(
+                "vLLM executable {} is installed, but ROCm capability cannot be verified from the executable. Set WERK_VLLM_PYTHON to a Python environment where torch.version.hip is set, or use a remote endpoint with WERK_VLLM_ACCELERATOR=rocm.",
+                path.display()
+            )
+        }
+    }
+}
+
+fn remote_rocm_explicitly_confirmed() -> bool {
+    env::var("WERK_VLLM_ACCELERATOR")
+        .map(|value| value.eq_ignore_ascii_case("rocm") || value.eq_ignore_ascii_case("hip"))
+        .unwrap_or(false)
+        || env::var("WERK_VLLM_ROCM")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "rocm" | "hip"
+                )
+            })
+            .unwrap_or(false)
+}
+
 fn executable_supports_vllm(path: &Path) -> bool {
     Command::new(path)
         .arg("serve")
@@ -1016,6 +1110,10 @@ fn command_failure_detail(prefix: &str, output: &std::process::Output) -> String
         output.status.to_string()
     };
     format!("{prefix}: {detail}")
+}
+
+fn compact_error(reason: &str) -> String {
+    reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn vllm_version(command: &VllmCommand) -> Option<String> {
@@ -1363,6 +1461,10 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::openai::{ChatMessage, MessageContent};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn chat_completion_body_uses_openai_messages() {
@@ -1401,5 +1503,57 @@ mod tests {
         update_completion_from_event(&mut completion, &value);
         assert_eq!(completion.prompt_tokens, 4);
         assert_eq!(completion.completion_tokens, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vllm_rocm_capability_accepts_python_with_hip_stack() {
+        let python = fake_python("rocm-ok", "printf '6.3.0\\n'\nexit 0\n");
+        let detail = vllm_rocm_capability(&VllmCommand::Python(python)).unwrap();
+        assert!(detail.contains("PyTorch ROCm/HIP runtime detected"));
+        assert!(detail.contains("6.3.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vllm_rocm_capability_rejects_python_without_hip_stack() {
+        let python = fake_python(
+            "rocm-missing",
+            "printf 'torch.version.hip is not set\\n' >&2\nexit 1\n",
+        );
+        let err = vllm_rocm_capability(&VllmCommand::Python(python)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not ROCm-capable"));
+        assert!(message.contains("ROCm/HIP PyTorch"));
+    }
+
+    #[test]
+    fn vllm_rocm_capability_rejects_plain_executable_discovery() {
+        let err = vllm_rocm_capability(&VllmCommand::Executable(PathBuf::from("/usr/bin/vllm")))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ROCm capability cannot be verified"));
+        assert!(message.contains("WERK_VLLM_PYTHON"));
+    }
+
+    #[cfg(unix)]
+    fn fake_python(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "werk1112-vllm-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("python");
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 }

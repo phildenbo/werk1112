@@ -32,6 +32,7 @@ const DEFAULT_N_UBATCH: u32 = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlamaCppMode {
     Cuda,
+    Rocm,
     Vulkan,
     Cpu,
 }
@@ -74,6 +75,7 @@ impl LlamaCppMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cuda => "llama-cpp-cuda",
+            Self::Rocm => "llama-cpp-rocm",
             Self::Vulkan => "llama-cpp-vulkan",
             Self::Cpu => "llama-cpp-cpu",
         }
@@ -83,6 +85,7 @@ impl LlamaCppMode {
     fn display_name(self) -> &'static str {
         match self {
             Self::Cuda => "CUDA",
+            Self::Rocm => "ROCm/HIP",
             Self::Vulkan => "Vulkan",
             Self::Cpu => "CPU",
         }
@@ -92,7 +95,7 @@ impl LlamaCppMode {
     fn gpu_layers(self) -> u32 {
         match self {
             Self::Cpu => 0,
-            Self::Cuda | Self::Vulkan => 999,
+            Self::Cuda | Self::Rocm | Self::Vulkan => 999,
         }
     }
 
@@ -106,6 +109,7 @@ impl LlamaCppMode {
         match self {
             Self::Cpu => cfg!(feature = "llama-cpp"),
             Self::Cuda => cfg!(feature = "llama-legacy-cuda"),
+            Self::Rocm => false,
             Self::Vulkan => cfg!(feature = "llama-legacy-vulkan"),
         }
     }
@@ -117,6 +121,9 @@ impl LlamaCppMode {
             }
             Self::Vulkan => {
                 "llama.cpp Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
+            }
+            Self::Rocm => {
+                "legacy llama.cpp ROCm/HIP backend is not implemented; use the persistent llama.cpp server ROCm route via --backend rocm".to_string()
             }
             Self::Cpu => {
                 "llama.cpp CPU backend is not compiled into this binary; build/install with --features llama-cpp".to_string()

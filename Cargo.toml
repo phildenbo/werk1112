@@ -32,12 +32,13 @@ llama_cpp_sys = { version = "0.3.2", default-features = false, optional = true }
 
 [features]
 default = ["recommended"]
-recommended = ["cuda", "burn-cpu"]
+recommended = ["cuda"]
 llama-cpp = ["dep:llama_cpp"]
 llama-fast = ["dep:llama_cpp_sys"]
 llama-legacy-cuda = ["llama-fast", "llama-cpp", "llama_cpp_sys/cuda", "llama_cpp/cuda"]
 llama-legacy-vulkan = ["llama-fast", "llama-cpp", "llama_cpp_sys/vulkan", "llama_cpp/vulkan"]
-burn-runtime = ["dep:burn", "dep:burn-store", "burn/store"]
+burn-experimental = []
+burn-runtime = ["burn-experimental", "dep:burn", "dep:burn-store", "burn/store"]
 burn-cpu = ["burn-runtime", "burn/flex"]
 burn-cuda = ["burn-runtime", "burn/cuda", "burn/fusion", "dep:cudarc", "cudarc/cuda-12080"]
 cuda = [

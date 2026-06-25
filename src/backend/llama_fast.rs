@@ -1041,6 +1041,7 @@ mod imp {
         match mode {
             LlamaCppMode::Cpu => cfg!(feature = "llama-fast"),
             LlamaCppMode::Cuda => cfg!(feature = "llama-legacy-cuda"),
+            LlamaCppMode::Rocm => false,
             LlamaCppMode::Vulkan => cfg!(feature = "llama-legacy-vulkan"),
         }
     }
@@ -1048,6 +1049,7 @@ mod imp {
     fn display_name(mode: LlamaCppMode) -> &'static str {
         match mode {
             LlamaCppMode::Cuda => "CUDA",
+            LlamaCppMode::Rocm => "ROCm/HIP",
             LlamaCppMode::Vulkan => "Vulkan",
             LlamaCppMode::Cpu => "CPU",
         }
@@ -1056,6 +1058,7 @@ mod imp {
     fn label(mode: LlamaCppMode) -> &'static str {
         match mode {
             LlamaCppMode::Cuda => "llama-legacy-cuda",
+            LlamaCppMode::Rocm => "llama-legacy-rocm",
             LlamaCppMode::Vulkan => "llama-legacy-vulkan",
             LlamaCppMode::Cpu => "llama-legacy-cpu",
         }
@@ -1064,7 +1067,7 @@ mod imp {
     fn gpu_layers(mode: LlamaCppMode) -> i32 {
         match mode {
             LlamaCppMode::Cpu => 0,
-            LlamaCppMode::Cuda | LlamaCppMode::Vulkan => 999,
+            LlamaCppMode::Cuda | LlamaCppMode::Rocm | LlamaCppMode::Vulkan => 999,
         }
     }
 
@@ -1072,6 +1075,9 @@ mod imp {
         match mode {
             LlamaCppMode::Cuda => {
                 "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features llama-legacy-cuda".to_string()
+            }
+            LlamaCppMode::Rocm => {
+                "llama.cpp legacy FFI ROCm backend is not implemented; use the persistent llama.cpp server ROCm route with --backend rocm".to_string()
             }
             LlamaCppMode::Vulkan => {
                 "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
@@ -1257,6 +1263,7 @@ mod imp {
             LlamaFastRuntimeReport {
                 backend: match mode {
                     LlamaCppMode::Cuda => "llama-legacy-cuda",
+                    LlamaCppMode::Rocm => "llama-legacy-rocm",
                     LlamaCppMode::Vulkan => "llama-legacy-vulkan",
                     LlamaCppMode::Cpu => "llama-legacy-cpu",
                 },
@@ -1329,6 +1336,9 @@ mod imp {
         match mode {
             LlamaCppMode::Cuda => {
                 "llama.cpp legacy FFI CUDA backend is not compiled into this binary; build/install with --features llama-legacy-cuda".to_string()
+            }
+            LlamaCppMode::Rocm => {
+                "llama.cpp legacy FFI ROCm backend is not implemented; use the persistent llama.cpp server ROCm route with --backend rocm".to_string()
             }
             LlamaCppMode::Vulkan => {
                 "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()

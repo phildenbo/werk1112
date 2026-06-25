@@ -929,6 +929,9 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
                 configure.arg(format!("-DCMAKE_CXX_COMPILER={}", host_compiler.display()));
             }
         }
+        LlamaCppMode::Rocm => {
+            configure.arg("-DGGML_HIP=ON");
+        }
         LlamaCppMode::Vulkan => {
             configure.arg("-DGGML_VULKAN=ON");
         }
@@ -1396,6 +1399,7 @@ fn cache_write_check(store: &ModelStore) -> BackendDoctorCheck {
 fn mode_env_name(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "WERK_LLAMA_SERVER_CUDA",
+        LlamaCppMode::Rocm => "WERK_LLAMA_SERVER_ROCM",
         LlamaCppMode::Vulkan => "WERK_LLAMA_SERVER_VULKAN",
         LlamaCppMode::Cpu => "WERK_LLAMA_SERVER_CPU",
     }
@@ -1404,6 +1408,7 @@ fn mode_env_name(mode: LlamaCppMode) -> &'static str {
 fn install_target_name(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "llama-cuda",
+        LlamaCppMode::Rocm => "llama-rocm",
         LlamaCppMode::Vulkan => "llama-vulkan",
         LlamaCppMode::Cpu => "llama-cpu",
     }
@@ -1543,13 +1548,14 @@ fn estimate_tokens(text: &str) -> usize {
 fn gpu_layers(mode: LlamaCppMode) -> i32 {
     match mode {
         LlamaCppMode::Cpu => 0,
-        LlamaCppMode::Cuda | LlamaCppMode::Vulkan => 999,
+        LlamaCppMode::Cuda | LlamaCppMode::Rocm | LlamaCppMode::Vulkan => 999,
     }
 }
 
 fn display_name(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "CUDA",
+        LlamaCppMode::Rocm => "ROCm/HIP",
         LlamaCppMode::Vulkan => "Vulkan",
         LlamaCppMode::Cpu => "CPU",
     }
@@ -1558,6 +1564,7 @@ fn display_name(mode: LlamaCppMode) -> &'static str {
 fn label(mode: LlamaCppMode) -> &'static str {
     match mode {
         LlamaCppMode::Cuda => "llama-server-cuda",
+        LlamaCppMode::Rocm => "llama-server-rocm",
         LlamaCppMode::Vulkan => "llama-server-vulkan",
         LlamaCppMode::Cpu => "llama-server-cpu",
     }
