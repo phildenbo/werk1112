@@ -135,7 +135,10 @@ pub enum PullProgress {
         line: String,
     },
     CloneFinished,
-    LfsStarted,
+    LfsStarted {
+        file: Option<String>,
+        total_bytes: Option<u64>,
+    },
     LfsProgress {
         line: String,
     },
@@ -292,11 +295,20 @@ impl ModelStore {
         )?;
         progress(PullProgress::CloneFinished);
 
-        let include_file = file.map(|file| resolve_pull_file(&tmp, file)).transpose()?;
+        let explicit_file = file.map(|file| resolve_pull_file(&tmp, file)).transpose()?;
+        let auto_file = if explicit_file.is_none() {
+            default_lfs_include_file(&tmp)?
+        } else {
+            None
+        };
+        let include_file = explicit_file.or(auto_file);
 
         if tmp.join(".gitattributes").is_file() {
             let total_bytes = lfs_pointer_total(&tmp, include_file.as_deref())?;
-            progress(PullProgress::LfsStarted);
+            progress(PullProgress::LfsStarted {
+                file: include_file.clone(),
+                total_bytes,
+            });
             let mut lfs_command = Command::new("git");
             lfs_command.arg("-C").arg(&tmp).args(["lfs", "pull"]);
             if let Some(include_file) = include_file.as_deref() {
@@ -669,8 +681,9 @@ where
     });
 
     let mut stderr_tail = VecDeque::<String>::new();
+    let baseline_bytes = watch_path.and_then(|path| dir_size(path).ok()).unwrap_or(0);
     let mut last_stats_at = Instant::now();
-    let mut last_bytes = watch_path.and_then(|path| dir_size(path).ok()).unwrap_or(0);
+    let mut last_bytes = 0u64;
 
     loop {
         while let Ok(line) = line_rx.try_recv() {
@@ -706,8 +719,9 @@ where
 
         if let Some(path) = watch_path
             && last_stats_at.elapsed() >= Duration::from_millis(750)
-            && let Ok(bytes) = dir_size(path)
+            && let Ok(current_bytes) = dir_size(path)
         {
+            let bytes = current_bytes.saturating_sub(baseline_bytes);
             let elapsed = last_stats_at.elapsed().as_secs_f64().max(0.001);
             let bytes_per_second = bytes.saturating_sub(last_bytes) as f64 / elapsed;
             progress(GitCommandProgress::Stats {
@@ -751,9 +765,22 @@ fn dir_size(path: &Path) -> Result<u64> {
     let mut bytes = 0u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
         bytes = bytes.saturating_add(dir_size(&entry.path())?);
     }
     Ok(bytes)
+}
+
+fn default_lfs_include_file(root: &Path) -> Result<Option<String>> {
+    let mut files = Vec::new();
+    collect_files(root, &mut files)?;
+    let format = detect_format(&files);
+    Ok(match format {
+        ModelFormat::Gguf => first_gguf_model_path(root, &files),
+        _ => None,
+    })
 }
 
 fn resolve_pull_file(root: &Path, file: &str) -> Result<String> {
@@ -1609,6 +1636,37 @@ mod tests {
     }
 
     #[test]
+    fn default_lfs_include_file_prefers_balanced_gguf() {
+        let tmp = test_dir("gguf-pull-default-file");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_lfs_pointer(&source.join("tiny.Q2_K.gguf"), 2);
+        write_lfs_pointer(&source.join("tiny.Q4_K_M.gguf"), 4);
+        write_lfs_pointer(&source.join("tiny.Q5_K_M.gguf"), 5);
+        fs::write(source.join("README.md"), b"readme").unwrap();
+
+        assert_eq!(
+            default_lfs_include_file(&source).unwrap().as_deref(),
+            Some("tiny.Q4_K_M.gguf")
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn dir_size_skips_git_metadata_for_transfer_progress() {
+        let tmp = test_dir("transfer-dir-size");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join(".git/lfs/objects")).unwrap();
+        fs::write(source.join("model.gguf"), vec![0_u8; 32]).unwrap();
+        fs::write(source.join(".git/lfs/objects/object"), vec![0_u8; 1024]).unwrap();
+
+        assert_eq!(dir_size(&source).unwrap(), 32);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn set_model_file_updates_manifest_selection() {
         let tmp = test_dir("set-model-file");
         let source = tmp.join("source");
@@ -1663,6 +1721,18 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    fn write_lfs_pointer(path: &Path, size: u64) {
+        fs::write(
+            path,
+            format!(
+                "version https://git-lfs.github.com/spec/v1\n\
+                 oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n\
+                 size {size}\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn assert_import_format(

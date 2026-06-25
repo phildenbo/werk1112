@@ -3159,9 +3159,16 @@ fn update_pull_progress(progress: &ProgressBar, event: PullProgress) {
             progress.set_position(100);
             progress.set_message("metadata clone complete");
         }
-        PullProgress::LfsStarted => {
+        PullProgress::LfsStarted { file, total_bytes } => {
             progress.set_position(0);
-            progress.set_message("downloading");
+            let target = file
+                .as_deref()
+                .map(|file| format!(" {file}"))
+                .unwrap_or_default();
+            let size = total_bytes
+                .map(|bytes| format!(" ({})", format_bytes(bytes)))
+                .unwrap_or_default();
+            progress.set_message(format!("downloading{target}{size}"));
         }
         PullProgress::LfsProgress { line } => {
             if let Some(percent) = parse_git_percent(&line) {
@@ -3177,12 +3184,20 @@ fn update_pull_progress(progress: &ProgressBar, event: PullProgress) {
             if let Some(total_bytes) = total_bytes.filter(|total| *total > 0) {
                 let percent = bytes.saturating_mul(100) / total_bytes;
                 progress.set_position(percent.min(99));
-                progress.set_message(format!(
-                    "downloading {} / {} @ {}/s",
-                    format_bytes(bytes.min(total_bytes)),
-                    format_bytes(total_bytes),
-                    format_bytes_per_second(bytes_per_second)
-                ));
+                if bytes >= total_bytes {
+                    progress.set_message(format!(
+                        "finalizing LFS checkout after {} @ {}/s",
+                        format_bytes(total_bytes),
+                        format_bytes_per_second(bytes_per_second)
+                    ));
+                } else {
+                    progress.set_message(format!(
+                        "downloading {} / {} @ {}/s",
+                        format_bytes(bytes),
+                        format_bytes(total_bytes),
+                        format_bytes_per_second(bytes_per_second)
+                    ));
+                }
             } else {
                 progress.set_message(format!(
                     "downloading {} @ {}/s",
