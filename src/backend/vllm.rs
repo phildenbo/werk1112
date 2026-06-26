@@ -143,14 +143,7 @@ impl VllmBackend {
             bail!("vLLM backend supports HF safetensors model directories only");
         }
 
-        let model_dir = self.store.model_dir(&manifest.id);
-        if !model_dir.is_dir() {
-            bail!(
-                "model directory for '{}' does not exist: {}",
-                manifest.id,
-                model_dir.display()
-            );
-        }
+        let model_dir = resolve_vllm_model_dir(&self.store, manifest)?;
 
         let key = format!(
             "{}:{}:{}",
@@ -579,6 +572,54 @@ fn vllm_server_args(
         args.extend(split_args(&extra));
     }
     args
+}
+
+fn resolve_vllm_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Result<PathBuf> {
+    let root = store.model_dir(&manifest.id);
+    if !root.is_dir() {
+        bail!(
+            "model directory for '{}' does not exist: {}",
+            manifest.id,
+            root.display()
+        );
+    }
+
+    if let Some(config_path) = manifest.config_path.as_deref() {
+        let config = store.absolute_model_file(manifest, config_path);
+        let dir = config.parent().with_context(|| {
+            format!(
+                "manifest config_path '{}' has no parent directory",
+                config_path
+            )
+        })?;
+        if dir.join("config.json").is_file() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+
+    let files_dir = root.join("files");
+    if files_dir.join("config.json").is_file() {
+        return Ok(files_dir);
+    }
+
+    if root.join("config.json").is_file() {
+        return Ok(root);
+    }
+
+    bail!(
+        "vLLM requires a Hugging Face model directory containing config.json for '{}'; tried manifest config_path {}, files directory {}, and model root {}",
+        manifest.id,
+        manifest
+            .config_path
+            .as_deref()
+            .map(|path| store
+                .absolute_model_file(manifest, path)
+                .display()
+                .to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        files_dir.display(),
+        root.display()
+    )
 }
 
 fn chat_completion_body(model_name: &str, request: &GenerateRequest) -> Value {
@@ -1460,6 +1501,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_store::ModelSource;
     use crate::openai::{ChatMessage, MessageContent};
     use std::{
         fs,
@@ -1503,6 +1545,82 @@ mod tests {
         update_completion_from_event(&mut completion, &value);
         assert_eq!(completion.prompt_tokens, 4);
         assert_eq!(completion.completion_tokens, 2);
+    }
+
+    #[test]
+    fn vllm_model_dir_prefers_manifest_config_parent() {
+        let store = test_store("vllm-config-parent");
+        let manifest = test_manifest(
+            "Qwen/Qwen3-4B",
+            Some("files/snapshots/main/config.json"),
+            Some("files/model.safetensors"),
+        );
+        let root = store.model_dir(&manifest.id);
+        fs::create_dir_all(root.join("files/snapshots/main")).unwrap();
+        fs::create_dir_all(root.join("files")).unwrap();
+        fs::write(root.join("files/snapshots/main/config.json"), b"{}").unwrap();
+        fs::write(root.join("files/config.json"), b"{}").unwrap();
+
+        let resolved = resolve_vllm_model_dir(&store, &manifest).unwrap();
+        assert_eq!(resolved, root.join("files/snapshots/main"));
+    }
+
+    #[test]
+    fn vllm_model_dir_falls_back_to_files_dir_with_config() {
+        let store = test_store("vllm-files-dir");
+        let manifest = test_manifest("Qwen/Qwen3-4B", None, Some("files/model.safetensors"));
+        let root = store.model_dir(&manifest.id);
+        fs::create_dir_all(root.join("files")).unwrap();
+        fs::write(root.join("files/config.json"), b"{}").unwrap();
+
+        let resolved = resolve_vllm_model_dir(&store, &manifest).unwrap();
+        assert_eq!(resolved, root.join("files"));
+    }
+
+    #[test]
+    fn vllm_model_dir_uses_root_only_when_root_contains_config() {
+        let store = test_store("vllm-root-dir");
+        let manifest = test_manifest("Qwen/Qwen3-4B", None, None);
+        let root = store.model_dir(&manifest.id);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), b"{}").unwrap();
+
+        let resolved = resolve_vllm_model_dir(&store, &manifest).unwrap();
+        assert_eq!(resolved, root);
+    }
+
+    #[test]
+    fn vllm_model_dir_rejects_store_root_without_config() {
+        let store = test_store("vllm-no-config");
+        let manifest = test_manifest("Qwen/Qwen3-4B", None, Some("files/model.safetensors"));
+        let root = store.model_dir(&manifest.id);
+        fs::create_dir_all(root.join("files")).unwrap();
+
+        let err = resolve_vllm_model_dir(&store, &manifest).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("config.json"));
+        assert!(message.contains("Qwen/Qwen3-4B"));
+    }
+
+    #[test]
+    fn vllm_args_keep_logical_served_model_name() {
+        let model_dir = PathBuf::from("/tmp/werk-model/files");
+        let args = vllm_server_args(
+            &VllmCommand::Python(PathBuf::from("/usr/bin/python3")),
+            &model_dir,
+            "Qwen/Qwen3-4B",
+            12345,
+        );
+        let model_arg = args
+            .windows(2)
+            .find(|pair| pair[0] == "--model")
+            .map(|pair| pair[1].as_str());
+        let served_name = args
+            .windows(2)
+            .find(|pair| pair[0] == "--served-model-name")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(model_arg, Some("/tmp/werk-model/files"));
+        assert_eq!(served_name, Some("Qwen/Qwen3-4B"));
     }
 
     #[cfg(unix)]
@@ -1555,5 +1673,39 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    fn test_store(name: &str) -> ModelStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "werk1112-vllm-store-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        ModelStore::resolve(Some(root)).unwrap()
+    }
+
+    fn test_manifest(
+        id: &str,
+        config_path: Option<&str>,
+        model_path: Option<&str>,
+    ) -> ModelManifest {
+        ModelManifest {
+            id: id.to_string(),
+            source: ModelSource::LocalPath {
+                path: "test".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("qwen3".to_string()),
+            tokenizer_path: Some("files/tokenizer.json".to_string()),
+            config_path: config_path.map(str::to_string),
+            model_path: model_path.map(str::to_string),
+            backend: "test".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+        }
     }
 }

@@ -628,7 +628,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             )?;
             if let Some(model) = model.as_deref() {
                 let manifest = store.get(model)?;
-                backend.prepare(&manifest)?;
+                with_terminal_spinner(
+                    terminal_spinner_enabled(false),
+                    format!("Loading default model '{model}'..."),
+                    || backend.prepare(&manifest),
+                )?;
                 println!("Default model available: {model}");
             }
             serve(
@@ -703,7 +707,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 verbose,
                 debug,
             };
-            let response = backend.generate(&manifest, request)?;
+            let response = with_terminal_spinner(
+                terminal_spinner_enabled(debug),
+                format!("Running model '{}'...", manifest.id),
+                || backend.generate(&manifest, request),
+            )?;
             println!("{}", response.text.trim());
             if verbose {
                 let mut stderr = io::stderr().lock();
@@ -776,6 +784,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 stream_granularity.into(),
                 verbose,
                 debug,
+                terminal_spinner_enabled(debug),
             )
             .await
         }
@@ -993,6 +1002,30 @@ fn should_print_startup_banner_for(
     }
 }
 
+fn terminal_spinner_enabled(debug: bool) -> bool {
+    io::stderr().is_terminal() && !debug
+}
+
+fn with_terminal_spinner<T>(
+    enabled: bool,
+    message: impl Into<String>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let spinner = enabled.then(|| {
+        let progress = ProgressBar::new_spinner();
+        progress.enable_steady_tick(Duration::from_millis(120));
+        progress.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
+        progress.set_message(message.into());
+        progress
+    });
+
+    let result = operation();
+    if let Some(progress) = spinner {
+        progress.finish_and_clear();
+    }
+    result
+}
+
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
@@ -1005,8 +1038,10 @@ async fn chat_loop(
     stream_granularity: StreamGranularity,
     verbose: bool,
     debug: bool,
+    show_loading_spinner: bool,
 ) -> Result<()> {
-    let chat_session = prepare_backend_for_chat(backend.as_ref(), &manifest, seed)?;
+    let chat_session =
+        prepare_backend_for_chat(backend.as_ref(), &manifest, seed, show_loading_spinner)?;
 
     println!(
         "Chatting with {}. Type /exit or /quit to stop.",
@@ -1124,9 +1159,16 @@ fn prepare_backend_for_chat(
     backend: &dyn GenerationBackend,
     manifest: &ModelManifest,
     seed: Option<u64>,
+    show_loading_spinner: bool,
 ) -> Result<Option<Box<dyn ChatGenerationSession>>> {
-    backend.prepare(manifest)?;
-    backend.start_chat_session(manifest, seed)
+    with_terminal_spinner(
+        show_loading_spinner,
+        format!("Loading model '{}'...", manifest.id),
+        || {
+            backend.prepare(manifest)?;
+            backend.start_chat_session(manifest, seed)
+        },
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -4337,7 +4379,7 @@ mod tests {
             calls: calls.clone(),
         };
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("phi3"));
-        let _ = prepare_backend_for_chat(&backend, &manifest, None).unwrap();
+        let _ = prepare_backend_for_chat(&backend, &manifest, None, false).unwrap();
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &["prepare", "start_chat_session"]
