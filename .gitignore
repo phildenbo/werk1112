@@ -1,2 +1,6 @@
 /target
 /models
+
+.agents
+.codex
+.venv

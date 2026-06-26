@@ -22,6 +22,7 @@ use crate::model_store::{ModelFormat, ModelManifest, ModelStore};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WSL_VLLM_MESSAGE: &str = "vLLM is a Linux-native runtime. Your environment appears to be WSL, where vLLM can fail because required GPU memory features such as UVA/CUDA IPC are unavailable. Werk will fall back to Candle CUDA. For best vLLM support use native Linux or a remote vLLM server.";
 
 #[derive(Clone)]
 pub struct VllmBackend {
@@ -62,6 +63,14 @@ pub struct VllmDiscoveryAttempt {
 }
 
 #[derive(Debug, Clone)]
+pub struct VllmHealthStatus {
+    pub installed_label: &'static str,
+    pub health_label: &'static str,
+    pub healthy: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum VllmCommand {
     Python(PathBuf),
     Executable(PathBuf),
@@ -88,12 +97,15 @@ impl VllmBackend {
     }
 
     pub fn probe(store: &ModelStore) -> Result<String> {
-        let discovery = require_vllm(store)?;
-        match discovery
-            .command
-            .as_ref()
-            .context("vLLM discovery had no command")?
-        {
+        let discovery = discover_vllm(store);
+        if let Some(reason) = local_vllm_platform_rejection_for_discovery(&discovery) {
+            bail!("{reason}");
+        }
+        let Some(command) = discovery.command.as_ref() else {
+            bail!("{}", missing_vllm_message(&discovery));
+        };
+        ensure_vllm_platform_eligible(command)?;
+        match command {
             VllmCommand::Remote { host, port } => {
                 Ok(format!("vLLM OpenAI server at http://{host}:{port}"))
             }
@@ -111,6 +123,7 @@ impl VllmBackend {
             .command
             .as_ref()
             .context("vLLM discovery had no command")?;
+        ensure_vllm_platform_eligible(command)?;
         let detail = vllm_rocm_capability(command)?;
         Ok(format!("vLLM ROCm ({detail})"))
     }
@@ -119,19 +132,43 @@ impl VllmBackend {
         discover_vllm(store)
     }
 
+    pub fn health(store: &ModelStore) -> VllmHealthStatus {
+        let discovery = discover_vllm(store);
+        vllm_health(&discovery)
+    }
+
     pub fn missing_message(store: &ModelStore) -> String {
-        missing_vllm_message(&discover_vllm(store))
+        let discovery = discover_vllm(store);
+        if let Some(reason) = local_vllm_platform_rejection_for_discovery(&discovery) {
+            return reason.to_string();
+        }
+        missing_vllm_message(&discovery)
     }
 
     pub fn unavailable_reason(store: &ModelStore) -> String {
-        concise_vllm_unavailable_reason(&discover_vllm(store))
+        let discovery = discover_vllm(store);
+        if let Some(reason) = local_vllm_platform_rejection_for_discovery(&discovery) {
+            return reason.to_string();
+        }
+        if let Some(command) = discovery.command.as_ref()
+            && let Err(err) = ensure_vllm_platform_eligible(command)
+        {
+            return compact_error(&err.to_string());
+        }
+        concise_vllm_unavailable_reason(&discovery)
     }
 
     pub fn rocm_unavailable_reason(store: &ModelStore) -> String {
         let discovery = discover_vllm(store);
+        if let Some(reason) = local_vllm_platform_rejection_for_discovery(&discovery) {
+            return reason.to_string();
+        }
         let Some(command) = discovery.command.as_ref() else {
             return concise_vllm_unavailable_reason(&discovery);
         };
+        if let Err(err) = ensure_vllm_platform_eligible(command) {
+            return compact_error(&err.to_string());
+        }
         vllm_rocm_capability(command)
             .err()
             .map(|err| compact_error(&err.to_string()))
@@ -399,10 +436,14 @@ impl VllmProcess {
         let started = Instant::now();
         loop {
             if let Some(status) = self.try_wait_status()? {
-                bail!(
+                let reason = format!(
                     "vLLM server exited before becoming healthy ({status}){}",
                     self.formatted_log_tail()
                 );
+                if let Some(message) = wsl_vllm_health_failure_message(&reason) {
+                    bail!("{message}");
+                }
+                bail!("{reason}");
             }
             if get(&self.url, "/health")
                 .map(|response| response.status == 200)
@@ -414,11 +455,15 @@ impl VllmProcess {
                 return Ok(());
             }
             if started.elapsed() > HEALTH_TIMEOUT {
-                bail!(
+                let reason = format!(
                     "timed out waiting for vLLM server at {}{}",
                     self.url,
                     self.formatted_log_tail()
                 );
+                if let Some(message) = wsl_vllm_health_failure_message(&reason) {
+                    bail!("{message}");
+                }
+                bail!("{reason}");
             }
             thread::sleep(HEALTH_POLL_INTERVAL);
         }
@@ -712,6 +757,14 @@ fn finalize_completion_stats(
 }
 
 pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
+    let platform = current_vllm_platform();
+    if let Some(reason) = managed_vllm_install_rejection(platform) {
+        bail!("{reason}");
+    }
+    if platform == VllmPlatform::Wsl {
+        eprintln!("{WSL_VLLM_MESSAGE}");
+    }
+
     let root = managed_vllm_dir(store);
     let venv = root.join("venv");
     fs::create_dir_all(&root)
@@ -752,6 +805,7 @@ pub fn install_managed_vllm(store: &ModelStore) -> Result<PathBuf> {
 
 pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
     let discovery = discover_vllm(store);
+    let health = vllm_health(&discovery);
     let mut checks = Vec::new();
     checks.push(BackendDoctorCheck {
         name: "vLLM discovery".to_string(),
@@ -779,6 +833,11 @@ pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
             .and_then(vllm_version)
             .unwrap_or_else(|| "not installed".to_string()),
     });
+    checks.push(BackendDoctorCheck {
+        name: "vLLM health".to_string(),
+        ok: health.healthy,
+        detail: format!("{}: {}", health.health_label, health.detail),
+    });
     checks.push(command_check(
         "nvidia-smi",
         &[],
@@ -794,6 +853,185 @@ pub fn vllm_doctor_checks(store: &ModelStore) -> Vec<BackendDoctorCheck> {
             .unwrap_or_else(|| "unknown".to_string()),
     });
     checks
+}
+
+fn vllm_health(discovery: &VllmDiscovery) -> VllmHealthStatus {
+    vllm_health_for_platform(discovery, current_vllm_platform())
+}
+
+fn vllm_health_for_platform(discovery: &VllmDiscovery, platform: VllmPlatform) -> VllmHealthStatus {
+    match discovery.command.as_ref() {
+        Some(VllmCommand::Remote { host, port }) => VllmHealthStatus {
+            installed_label: "remote",
+            health_label: "healthy",
+            healthy: true,
+            detail: format!(
+                "remote OpenAI-compatible vLLM endpoint reachable at http://{host}:{port}"
+            ),
+        },
+        Some(command) => match local_vllm_platform_rejection(platform) {
+            Some(reason) => VllmHealthStatus {
+                installed_label: "yes",
+                health_label: if platform == VllmPlatform::Wsl {
+                    "best-effort on WSL"
+                } else {
+                    "unsupported"
+                },
+                healthy: false,
+                detail: reason.to_string(),
+            },
+            None => VllmHealthStatus {
+                installed_label: "yes",
+                health_label: "eligible",
+                healthy: true,
+                detail: vllm_version(command).unwrap_or_else(|| "version unknown".to_string()),
+            },
+        },
+        None => {
+            match local_vllm_platform_rejection_for_discovery_with_platform(discovery, platform) {
+                Some(reason) => VllmHealthStatus {
+                    installed_label: "no",
+                    health_label: if platform == VllmPlatform::Wsl {
+                        "best-effort on WSL"
+                    } else {
+                        "unsupported"
+                    },
+                    healthy: false,
+                    detail: reason.to_string(),
+                },
+                None => VllmHealthStatus {
+                    installed_label: "no",
+                    health_label: "missing",
+                    healthy: false,
+                    detail: concise_vllm_unavailable_reason(discovery),
+                },
+            }
+        }
+    }
+}
+
+fn ensure_vllm_platform_eligible(command: &VllmCommand) -> Result<()> {
+    if matches!(command, VllmCommand::Remote { .. }) {
+        return Ok(());
+    }
+    if let Some(reason) = local_vllm_platform_rejection(current_vllm_platform()) {
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VllmPlatform {
+    NativeLinux,
+    Wsl,
+    NativeWindows,
+    Macos,
+    Unsupported,
+}
+
+fn current_vllm_platform() -> VllmPlatform {
+    if cfg!(target_os = "linux") {
+        if is_wsl_environment() {
+            VllmPlatform::Wsl
+        } else {
+            VllmPlatform::NativeLinux
+        }
+    } else if cfg!(target_os = "windows") {
+        VllmPlatform::NativeWindows
+    } else if cfg!(target_os = "macos") {
+        VllmPlatform::Macos
+    } else {
+        VllmPlatform::Unsupported
+    }
+}
+
+fn local_vllm_platform_rejection(platform: VllmPlatform) -> Option<&'static str> {
+    match platform {
+        VllmPlatform::NativeLinux => None,
+        VllmPlatform::Wsl => Some(WSL_VLLM_MESSAGE),
+        VllmPlatform::NativeWindows => Some(
+            "vLLM is a Linux-native runtime. Native Windows local vLLM is not eligible. Use native Linux or a remote vLLM server.",
+        ),
+        VllmPlatform::Macos => Some(
+            "vLLM is a Linux-native runtime. Local managed vLLM is not eligible on macOS. Use native Linux or a remote vLLM server.",
+        ),
+        VllmPlatform::Unsupported => Some(
+            "vLLM is a Linux-native runtime. Local vLLM is not eligible on this platform. Use native Linux or a remote vLLM server.",
+        ),
+    }
+}
+
+fn managed_vllm_install_rejection(platform: VllmPlatform) -> Option<&'static str> {
+    match platform {
+        VllmPlatform::NativeLinux | VllmPlatform::Wsl => None,
+        VllmPlatform::NativeWindows | VllmPlatform::Macos | VllmPlatform::Unsupported => {
+            local_vllm_platform_rejection(platform)
+        }
+    }
+}
+
+fn local_vllm_platform_rejection_for_discovery(discovery: &VllmDiscovery) -> Option<&'static str> {
+    local_vllm_platform_rejection_for_discovery_with_platform(discovery, current_vllm_platform())
+}
+
+fn local_vllm_platform_rejection_for_discovery_with_platform(
+    discovery: &VllmDiscovery,
+    platform: VllmPlatform,
+) -> Option<&'static str> {
+    if matches!(discovery.command, Some(VllmCommand::Remote { .. }))
+        || discovery_has_remote_attempt(discovery)
+    {
+        return None;
+    }
+    local_vllm_platform_rejection(platform)
+}
+
+fn discovery_has_remote_attempt(discovery: &VllmDiscovery) -> bool {
+    discovery
+        .attempts
+        .iter()
+        .any(|attempt| attempt.label == "WERK_VLLM_HOST/WERK_VLLM_PORT")
+}
+
+fn is_wsl_environment() -> bool {
+    env::var_os("WSL_DISTRO_NAME").is_some()
+        || env::var_os("WSL_INTEROP").is_some()
+        || fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|text| linux_release_looks_like_wsl(&text))
+            .unwrap_or(false)
+        || fs::read_to_string("/proc/version")
+            .map(|text| linux_release_looks_like_wsl(&text))
+            .unwrap_or(false)
+}
+
+fn linux_release_looks_like_wsl(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("microsoft") || lower.contains("wsl")
+}
+
+fn wsl_vllm_health_failure_message(reason: &str) -> Option<String> {
+    if current_vllm_platform() != VllmPlatform::Wsl || !is_wsl_sensitive_vllm_failure(reason) {
+        return None;
+    }
+    Some(format!(
+        "{WSL_VLLM_MESSAGE}\n\nvLLM health probe failed: {}",
+        compact_error(reason)
+    ))
+}
+
+fn is_wsl_sensitive_vllm_failure(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("uva")
+        || lower.contains("pin_memory")
+        || lower.contains("pin memory")
+        || lower.contains("engine-core")
+        || lower.contains("engine_core")
+        || lower.contains("engine core")
+        || lower.contains("cuda ipc")
+        || lower.contains("cuda_ipc")
+        || lower.contains("cudaipc")
+        || (lower.contains("multiprocessing")
+            && (lower.contains("start") || lower.contains("spawn") || lower.contains("failed")))
 }
 
 pub fn managed_vllm_dir(store: &ModelStore) -> PathBuf {
@@ -1621,6 +1859,88 @@ mod tests {
             .map(|pair| pair[1].as_str());
         assert_eq!(model_arg, Some("/tmp/werk-model/files"));
         assert_eq!(served_name, Some("Qwen/Qwen3-4B"));
+    }
+
+    #[test]
+    fn linux_release_detection_identifies_wsl() {
+        assert!(linux_release_looks_like_wsl(
+            "5.15.167.4-microsoft-standard-WSL2"
+        ));
+        assert!(linux_release_looks_like_wsl("Linux version 6.6.0 WSL2"));
+        assert!(!linux_release_looks_like_wsl("6.8.0-63-generic"));
+    }
+
+    #[test]
+    fn local_vllm_policy_rejects_wsl_with_fallback_message() {
+        let reason = local_vllm_platform_rejection(VllmPlatform::Wsl).unwrap();
+        assert!(reason.contains("vLLM is a Linux-native runtime"));
+        assert!(reason.contains("Werk will fall back to Candle CUDA"));
+        assert!(reason.contains("remote vLLM server"));
+        assert!(local_vllm_platform_rejection(VllmPlatform::NativeLinux).is_none());
+    }
+
+    #[test]
+    fn managed_vllm_install_policy_allows_linux_and_wsl_only() {
+        assert!(managed_vllm_install_rejection(VllmPlatform::NativeLinux).is_none());
+        assert!(managed_vllm_install_rejection(VllmPlatform::Wsl).is_none());
+
+        let windows = managed_vllm_install_rejection(VllmPlatform::NativeWindows).unwrap();
+        assert!(windows.contains("Native Windows local vLLM is not eligible"));
+
+        let macos = managed_vllm_install_rejection(VllmPlatform::Macos).unwrap();
+        assert!(macos.contains("not eligible on macOS"));
+    }
+
+    #[test]
+    fn vllm_health_marks_wsl_local_as_best_effort_but_remote_healthy() {
+        let local = VllmDiscovery {
+            command: Some(VllmCommand::Python(PathBuf::from("/tmp/python"))),
+            source: "test".to_string(),
+            attempts: Vec::new(),
+        };
+        let health = vllm_health_for_platform(&local, VllmPlatform::Wsl);
+        assert_eq!(health.installed_label, "yes");
+        assert_eq!(health.health_label, "best-effort on WSL");
+        assert!(!health.healthy);
+
+        let remote = VllmDiscovery {
+            command: Some(VllmCommand::Remote {
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+            }),
+            source: "test".to_string(),
+            attempts: Vec::new(),
+        };
+        let health = vllm_health_for_platform(&remote, VllmPlatform::Wsl);
+        assert_eq!(health.installed_label, "remote");
+        assert_eq!(health.health_label, "healthy");
+        assert!(health.healthy);
+    }
+
+    #[test]
+    fn vllm_health_marks_wsl_missing_local_as_best_effort() {
+        let discovery = VllmDiscovery {
+            command: None,
+            source: "missing".to_string(),
+            attempts: Vec::new(),
+        };
+        let health = vllm_health_for_platform(&discovery, VllmPlatform::Wsl);
+        assert_eq!(health.installed_label, "no");
+        assert_eq!(health.health_label, "best-effort on WSL");
+        assert!(!health.healthy);
+        assert!(health.detail.contains("Werk will fall back to Candle CUDA"));
+    }
+
+    #[test]
+    fn wsl_sensitive_vllm_failure_markers_are_detected() {
+        assert!(is_wsl_sensitive_vllm_failure("UVA is not available"));
+        assert!(is_wsl_sensitive_vllm_failure("pin_memory failed"));
+        assert!(is_wsl_sensitive_vllm_failure("CUDA IPC handle failed"));
+        assert!(is_wsl_sensitive_vllm_failure("engine-core failed to start"));
+        assert!(is_wsl_sensitive_vllm_failure(
+            "multiprocessing spawn failed during startup"
+        ));
+        assert!(!is_wsl_sensitive_vllm_failure("model file not found"));
     }
 
     #[cfg(unix)]

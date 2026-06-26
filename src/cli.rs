@@ -1525,6 +1525,7 @@ fn print_backend_list(store: &ModelStore) {
     println!();
     println!("vLLM discovery");
     let discovery = VllmBackend::discover(store);
+    let health = VllmBackend::health(store);
     let vllm_path = discovery
         .attempts
         .iter()
@@ -1540,15 +1541,12 @@ fn print_backend_list(store: &ModelStore) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| managed_vllm_dir(store).join("venv").display().to_string());
     println!(
-        "{:<8} {:<16} {:<7} {}",
-        "BACKEND", "SOURCE", "EXISTS", "PATH"
+        "{:<8} {:<16} {:<10} {:<18} {}",
+        "BACKEND", "SOURCE", "INSTALLED", "HEALTH", "PATH"
     );
     println!(
-        "{:<8} {:<16} {:<7} {}",
-        "vLLM",
-        discovery.source,
-        yes_no(discovery.command.is_some()),
-        vllm_path
+        "{:<8} {:<16} {:<10} {:<18} {}",
+        "vLLM", discovery.source, health.installed_label, health.health_label, vllm_path
     );
 
     println!();
@@ -1681,7 +1679,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
         println!(
             "{:<24} {:<7} {}",
             check.name,
-            if check.ok { "ok" } else { "missing" },
+            doctor_check_status(&check),
             check.detail
         );
     }
@@ -1689,7 +1687,7 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
         println!(
             "{:<24} {:<7} {}",
             check.name,
-            if check.ok { "ok" } else { "missing" },
+            doctor_check_status(&check),
             check.detail
         );
     }
@@ -3288,6 +3286,16 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn doctor_check_status(check: &crate::backend::BackendDoctorCheck) -> &'static str {
+    if check.detail.contains("best-effort on WSL") {
+        "warn"
+    } else if check.ok {
+        "ok"
+    } else {
+        "missing"
+    }
+}
+
 fn artifact_debug_label(store: &ModelStore, manifest: &ModelManifest) -> String {
     if manifest.format != ModelFormat::SafeTensors {
         return "none".to_string();
@@ -4170,7 +4178,7 @@ mod tests {
             selected_backend_for_manifest(&store, BackendChoice::Vllm, &manifest).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("vLLM CUDA"));
-        assert!(!message.contains("Candle CUDA"));
+        assert!(!message.contains("Candle CUDA:"));
     }
 
     #[test]
