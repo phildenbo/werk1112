@@ -1,7 +1,7 @@
 # Werk1112
 
 <p align="center">
-  <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Native AI runtime management." />
+  <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Inference Router." />
 </p>
 
 Werk1112 is a local-first AI runtime written in Rust.
