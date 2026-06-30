@@ -304,13 +304,30 @@ impl ModelStore {
         let include_file = explicit_file.or(auto_file);
 
         if tmp.join(".gitattributes").is_file() {
+            let mut lfs_install_command = Command::new("git");
+            lfs_install_command
+                .arg("-C")
+                .arg(&tmp)
+                .args(["lfs", "install", "--local"]);
+            run_git_with_progress(
+                &mut lfs_install_command,
+                "git lfs install --local failed; install git-lfs and run `git lfs install`",
+                None,
+                None,
+                |_| {},
+            )?;
+
             let total_bytes = lfs_pointer_total(&tmp, include_file.as_deref())?;
             progress(PullProgress::LfsStarted {
                 file: include_file.clone(),
                 total_bytes,
             });
             let mut lfs_command = Command::new("git");
-            lfs_command.arg("-C").arg(&tmp).args(["lfs", "pull"]);
+            lfs_command
+                .env("GIT_LFS_FORCE_PROGRESS", "1")
+                .arg("-C")
+                .arg(&tmp)
+                .args(["lfs", "pull"]);
             if let Some(include_file) = include_file.as_deref() {
                 lfs_command
                     .arg("--include")
@@ -336,24 +353,50 @@ impl ModelStore {
                     }),
                 },
             )?;
+
+            let mut lfs_checkout_command = Command::new("git");
+            lfs_checkout_command
+                .arg("-C")
+                .arg(&tmp)
+                .args(["lfs", "checkout"]);
+            run_git_with_progress(
+                &mut lfs_checkout_command,
+                "git lfs checkout failed after pull",
+                None,
+                None,
+                |_| {},
+            )?;
             progress(PullProgress::LfsFinished);
         }
 
         if let Some(include_file) = include_file.as_deref() {
             ensure_lfs_file_downloaded(&tmp, include_file)?;
-            remove_lfs_pointer_files(&tmp)?;
         }
+        let import_tmp = tmp.with_file_name(format!(
+            "{}-import",
+            tmp.file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("pull-import")
+        ));
+        let import_source = if let Some(include_file) = include_file.as_deref() {
+            prepare_included_file_import_tree(&tmp, include_file, &import_tmp)?;
+            import_tmp.as_path()
+        } else {
+            tmp.as_path()
+        };
+        ensure_no_lfs_pointers_remaining(import_source)?;
 
         progress(PullProgress::Importing);
 
         let manifest = self.import_path_with_source(
-            &tmp,
+            import_source,
             id,
             ModelSource::HuggingFace {
                 repo: repo.to_string(),
             },
         );
         let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&import_tmp);
         let manifest = manifest?;
         progress(PullProgress::Finished {
             files: manifest.files.len(),
@@ -663,61 +706,116 @@ where
     F: FnMut(GitCommandProgress),
 {
     let mut child = command
-        .stdout(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to execute git; install git and git-lfs for Hugging Face pulls")?;
 
     let (line_tx, line_rx) = mpsc::channel();
-    let reader = child.stderr.take().map(|stderr| {
+    let stdout_reader = child.stdout.take().map(|stdout| {
+        let line_tx = line_tx.clone();
         thread::spawn(move || -> Result<VecDeque<String>, String> {
-            let mut stderr_tail = VecDeque::new();
-            read_git_progress(stderr, &mut stderr_tail, &mut |line| {
+            let mut output_tail = VecDeque::new();
+            read_git_progress(stdout, &mut output_tail, &mut |line| {
                 let _ = line_tx.send(line);
             })
             .map_err(|err| err.to_string())?;
-            Ok(stderr_tail)
+            Ok(output_tail)
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::spawn(move || -> Result<VecDeque<String>, String> {
+            let mut output_tail = VecDeque::new();
+            read_git_progress(stderr, &mut output_tail, &mut |line| {
+                let _ = line_tx.send(line);
+            })
+            .map_err(|err| err.to_string())?;
+            Ok(output_tail)
         })
     });
 
-    let mut stderr_tail = VecDeque::<String>::new();
+    let mut output_tail = VecDeque::<String>::new();
     let baseline_bytes = watch_path.and_then(|path| dir_size(path).ok()).unwrap_or(0);
     let mut last_stats_at = Instant::now();
     let mut last_bytes = 0u64;
+    let mut saw_parsed_lfs_progress = false;
 
     loop {
         while let Ok(line) = line_rx.try_recv() {
-            push_tail(&mut stderr_tail, line.clone());
-            progress(GitCommandProgress::Line(line));
+            push_tail(&mut output_tail, line.clone());
+            if let Some(stats) = parse_git_lfs_progress_line(&line, total_bytes) {
+                saw_parsed_lfs_progress = true;
+                last_stats_at = Instant::now();
+                progress(GitCommandProgress::Stats {
+                    bytes: stats.progress_bytes(),
+                    total_bytes: stats.total_bytes,
+                    bytes_per_second: stats.bytes_per_second,
+                });
+            } else {
+                progress(GitCommandProgress::Line(line));
+            }
         }
 
         if let Some(status) = child.try_wait().context("failed to wait for git command")? {
             while let Ok(line) = line_rx.try_recv() {
-                push_tail(&mut stderr_tail, line.clone());
-                progress(GitCommandProgress::Line(line));
+                push_tail(&mut output_tail, line.clone());
+                if let Some(stats) = parse_git_lfs_progress_line(&line, total_bytes) {
+                    progress(GitCommandProgress::Stats {
+                        bytes: stats.progress_bytes(),
+                        total_bytes: stats.total_bytes,
+                        bytes_per_second: stats.bytes_per_second,
+                    });
+                } else {
+                    progress(GitCommandProgress::Line(line));
+                }
             }
 
-            if let Some(reader) = reader {
+            if let Some(reader) = stdout_reader {
                 match reader.join() {
                     Ok(Ok(reader_tail)) => {
                         for line in reader_tail {
-                            push_tail(&mut stderr_tail, line);
+                            push_tail(&mut output_tail, line);
                         }
                     }
                     Ok(Err(err)) => bail!("{error_context}: {err}"),
                     Err(_) => bail!("{error_context}: failed to read git progress output"),
                 }
             }
+            if let Some(reader) = stderr_reader {
+                match reader.join() {
+                    Ok(Ok(reader_tail)) => {
+                        for line in reader_tail {
+                            push_tail(&mut output_tail, line);
+                        }
+                    }
+                    Ok(Err(err)) => bail!("{error_context}: {err}"),
+                    Err(_) => bail!("{error_context}: failed to read git progress output"),
+                }
+            }
+            while let Ok(line) = line_rx.try_recv() {
+                push_tail(&mut output_tail, line.clone());
+                if let Some(stats) = parse_git_lfs_progress_line(&line, total_bytes) {
+                    progress(GitCommandProgress::Stats {
+                        bytes: stats.progress_bytes(),
+                        total_bytes: stats.total_bytes,
+                        bytes_per_second: stats.bytes_per_second,
+                    });
+                } else {
+                    progress(GitCommandProgress::Line(line));
+                }
+            }
 
             if !status.success() {
-                let stderr = stderr_tail.into_iter().collect::<Vec<_>>().join("\n");
-                bail!("{error_context}: {}", stderr.trim());
+                let output = output_tail.into_iter().collect::<Vec<_>>().join("\n");
+                bail!("{error_context}: {}", output.trim());
             }
 
             return Ok(());
         }
 
         if let Some(path) = watch_path
+            && !saw_parsed_lfs_progress
             && last_stats_at.elapsed() >= Duration::from_millis(750)
             && let Ok(current_bytes) = dir_size(path)
         {
@@ -746,11 +844,84 @@ enum GitCommandProgress {
     },
 }
 
+#[derive(Debug, Clone)]
+struct TransferStats {
+    percent: Option<u64>,
+    bytes: u64,
+    total_bytes: Option<u64>,
+    bytes_per_second: f64,
+}
+
+impl TransferStats {
+    fn progress_bytes(&self) -> u64 {
+        // Git LFS percent is object-count progress, so large single-object downloads
+        // can stay at 0% while bytes are moving. Werk's bar is byte-based.
+        let _object_percent = self.percent;
+        self.bytes
+    }
+}
+
 fn push_tail(stderr_tail: &mut VecDeque<String>, line: String) {
     stderr_tail.push_back(line);
     while stderr_tail.len() > 20 {
         stderr_tail.pop_front();
     }
+}
+
+fn parse_git_lfs_progress_line(line: &str, total_hint: Option<u64>) -> Option<TransferStats> {
+    let (_, progress_text) = line.split_once("Downloading LFS objects:")?;
+    let (percent_text, progress_text) = progress_text.trim_start().split_once('%')?;
+    let percent = percent_text.trim().parse::<u64>().ok()?.min(100);
+    let (_, byte_and_speed_text) = progress_text.split_once(',')?;
+    let (bytes_text, speed_text) = byte_and_speed_text.trim().split_once('|')?;
+
+    let bytes = parse_byte_value(bytes_text.trim())?;
+    let speed_text = speed_text.trim();
+    let speed_text = speed_text.strip_suffix("/s").unwrap_or(speed_text).trim();
+    let bytes_per_second = parse_byte_value_f64(speed_text)?;
+    let total_bytes = total_hint.or_else(|| {
+        (percent > 0).then(|| {
+            ((bytes as u128)
+                .saturating_mul(100)
+                .checked_div(percent as u128)
+                .unwrap_or(0)) as u64
+        })
+    });
+
+    Some(TransferStats {
+        percent: Some(percent),
+        bytes,
+        total_bytes,
+        bytes_per_second,
+    })
+}
+
+fn parse_byte_value(text: &str) -> Option<u64> {
+    Some(parse_byte_value_f64(text)?.round() as u64)
+}
+
+fn parse_byte_value_f64(text: &str) -> Option<f64> {
+    let mut parts = text.split_whitespace();
+    let value = parts.next()?.replace(',', "").parse::<f64>().ok()?;
+    let unit = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let multiplier = match unit {
+        "B" => 1.0,
+        "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "TB" => 1_000_000_000_000.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+
+    Some(value * multiplier)
 }
 
 fn dir_size(path: &Path) -> Result<u64> {
@@ -838,22 +1009,181 @@ fn ensure_lfs_file_downloaded(root: &Path, file: &str) -> Result<()> {
     Ok(())
 }
 
-fn remove_lfs_pointer_files(path: &Path) -> Result<()> {
+fn ensure_no_lfs_pointers_remaining(root: &Path) -> Result<()> {
+    ensure_no_lfs_pointers_remaining_in(root, root)
+}
+
+fn ensure_no_lfs_pointers_remaining_in(root: &Path, path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+
+        if entry.file_name() == ".git" {
+            continue;
+        }
+
+        if entry_path.is_dir() {
+            ensure_no_lfs_pointers_remaining_in(root, &entry_path)?;
+        } else if entry_path.is_file() && lfs_pointer_size(&entry_path)?.is_some() {
+            let relative_path = relative_string(root, &entry_path)
+                .unwrap_or_else(|| entry_path.display().to_string());
+
+            bail!(
+                "Git LFS download incomplete: {relative_path} is still a Git LFS pointer. Retry `werk pull` or run `git lfs pull` manually."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prepare_included_file_import_tree(root: &Path, include_file: &str, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::remove_dir_all(dest).with_context(|| {
+            format!(
+                "failed to remove stale filtered import directory {}",
+                dest.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(dest)?;
+
+    let include_path = root.join(include_file);
+    if !include_path.is_file() {
+        bail!("selected file was not downloaded: {include_file}");
+    }
+    copy_repo_file(root, &include_path, dest)?;
+    copy_included_import_metadata(root, root, dest, include_file)?;
+    Ok(())
+}
+
+fn copy_included_import_metadata(
+    root: &Path,
+    path: &Path,
+    dest: &Path,
+    include_file: &str,
+) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_name() == ".git" {
             continue;
         }
 
-        let path = entry.path();
-        if path.is_dir() {
-            remove_lfs_pointer_files(&path)?;
-        } else if path.is_file() && lfs_pointer_size(&path)?.is_some() {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to remove LFS pointer {}", path.display()))?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            copy_included_import_metadata(root, &entry_path, dest, include_file)?;
+            continue;
+        }
+        if !entry_path.is_file() {
+            continue;
+        }
+
+        let Some(relative_path) = relative_string(root, &entry_path) else {
+            continue;
+        };
+        if relative_path == include_file {
+            continue;
+        }
+        if should_copy_included_import_metadata(&entry_path, &relative_path)? {
+            copy_repo_file(root, &entry_path, dest)?;
         }
     }
+
     Ok(())
+}
+
+fn should_copy_included_import_metadata(path: &Path, relative_path: &str) -> Result<bool> {
+    if lfs_pointer_size(path)?.is_some() || is_likely_model_artifact_path(relative_path) {
+        return Ok(false);
+    }
+
+    Ok(is_huggingface_metadata_path(relative_path))
+}
+
+fn copy_repo_file(root: &Path, source: &Path, dest_root: &Path) -> Result<()> {
+    let relative_path = source.strip_prefix(root).with_context(|| {
+        format!(
+            "file {} is not inside repository {}",
+            source.display(),
+            root.display()
+        )
+    })?;
+    let dest = dest_root.join(relative_path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, &dest)
+        .with_context(|| format!("copy {} -> {}", source.display(), dest.display()))?;
+    Ok(())
+}
+
+fn is_huggingface_metadata_path(relative_path: &str) -> bool {
+    let path = Path::new(relative_path);
+    let Some(file_name) = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| name.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|extension| extension.to_ascii_lowercase());
+
+    matches!(
+        file_name.as_str(),
+        ".gitattributes"
+            | "added_tokens.json"
+            | "chat_template.jinja"
+            | "config.json"
+            | "generation_config.json"
+            | "image_processor_config.json"
+            | "merges.txt"
+            | "preprocessor_config.json"
+            | "processor_config.json"
+            | "special_tokens_map.json"
+            | "spiece.model"
+            | "tokenizer.json"
+            | "tokenizer.model"
+            | "tokenizer_config.json"
+            | "vocab.json"
+    ) || matches!(
+        extension.as_deref(),
+        Some("json" | "jinja" | "model" | "txt")
+    )
+}
+
+fn is_likely_model_artifact_path(relative_path: &str) -> bool {
+    let path = Path::new(relative_path);
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|extension| extension.to_ascii_lowercase());
+    if matches!(
+        extension.as_deref(),
+        Some(
+            "bin"
+                | "ckpt"
+                | "engine"
+                | "gguf"
+                | "mlmodel"
+                | "npz"
+                | "onnx"
+                | "pb"
+                | "plan"
+                | "pt"
+                | "pth"
+                | "safetensors"
+                | "tflite"
+        )
+    ) {
+        return true;
+    }
+
+    relative_path
+        .to_ascii_lowercase()
+        .split('/')
+        .any(|part| part.ends_with(".mlpackage"))
 }
 
 fn lfs_pointer_total(path: &Path, include_file: Option<&str>) -> Result<Option<u64>> {
@@ -1021,6 +1351,8 @@ fn extension_eq(path: &Path, ext: &str) -> bool {
 fn detect_format(files: &[PathBuf]) -> ModelFormat {
     if any_extension(files, "gguf") {
         ModelFormat::Gguf
+    } else if any_mlx_safetensors(files) || any_extension(files, "npz") {
+        ModelFormat::Mlx
     } else if any_extension(files, "safetensors") {
         ModelFormat::SafeTensors
     } else if any_extension(files, "onnx") {
@@ -1031,7 +1363,7 @@ fn detect_format(files: &[PathBuf]) -> ModelFormat {
         ModelFormat::OpenVino
     } else if any_extension(files, "mlmodel") || any_path_contains(files, ".mlpackage") {
         ModelFormat::CoreMl
-    } else if any_extension(files, "npz") || any_path_contains(files, "mlx") {
+    } else if any_path_contains(files, "mlx") {
         ModelFormat::Mlx
     } else if any_extension(files, "pt")
         || any_extension(files, "pth")
@@ -1051,6 +1383,36 @@ fn detect_format(files: &[PathBuf]) -> ModelFormat {
 
 fn any_extension(files: &[PathBuf], ext: &str) -> bool {
     files.iter().any(|path| extension_eq(path, ext))
+}
+
+fn any_mlx_safetensors(files: &[PathBuf]) -> bool {
+    files
+        .iter()
+        .filter(|path| extension_eq(path, "safetensors"))
+        .any(|path| safetensors_declares_mlx(path).unwrap_or(false))
+}
+
+fn safetensors_declares_mlx(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut len_bytes = [0_u8; 8];
+    if file.read_exact(&mut len_bytes).is_err() {
+        return Ok(false);
+    }
+
+    let header_len = u64::from_le_bytes(len_bytes);
+    if header_len == 0 || header_len > 16 * 1024 * 1024 {
+        return Ok(false);
+    }
+
+    let mut header = vec![0_u8; header_len as usize];
+    file.read_exact(&mut header)?;
+    let header = serde_json::from_slice::<Value>(&header)?;
+    Ok(header
+        .get("__metadata__")
+        .and_then(|metadata| metadata.get("format"))
+        .and_then(Value::as_str)
+        .map(|format| format.eq_ignore_ascii_case("mlx"))
+        .unwrap_or(false))
 }
 
 fn any_file_name(files: &[PathBuf], name: &str) -> bool {
@@ -1278,7 +1640,27 @@ fn detect_config_architecture(path: &Path) -> Result<Option<String>> {
 
 fn read_manifest(path: &Path) -> Result<ModelManifest> {
     let data = fs::read_to_string(path)?;
-    serde_json::from_str(&data).with_context(|| format!("invalid manifest {}", path.display()))
+    let mut manifest = serde_json::from_str::<ModelManifest>(&data)
+        .with_context(|| format!("invalid manifest {}", path.display()))?;
+    reconcile_mlx_safetensors_manifest(path, &mut manifest);
+    Ok(manifest)
+}
+
+fn reconcile_mlx_safetensors_manifest(manifest_path: &Path, manifest: &mut ModelManifest) {
+    if manifest.format != ModelFormat::SafeTensors {
+        return;
+    }
+    let Some(model_path) = manifest.model_path.as_deref() else {
+        return;
+    };
+    let Some(model_dir) = manifest_path.parent() else {
+        return;
+    };
+
+    if safetensors_declares_mlx(&model_dir.join(model_path)).unwrap_or(false) {
+        manifest.format = ModelFormat::Mlx;
+        manifest.backend = manifest.format.backend_hint().to_string();
+    }
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1488,6 +1870,57 @@ mod tests {
     }
 
     #[test]
+    fn import_detects_mlx_safetensors_metadata() {
+        let tmp = test_dir("store-import-mlx-safetensors");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+        write_safetensors_header(
+            &source.join("model.safetensors"),
+            r#"{"__metadata__":{"format":"mlx"},"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "mlx-model").unwrap();
+
+        assert_eq!(manifest.format, ModelFormat::Mlx);
+        assert_eq!(manifest.backend, "mlx");
+        assert_eq!(
+            manifest.model_path.as_deref(),
+            Some("files/model.safetensors")
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn get_reclassifies_legacy_mlx_safetensors_manifest() {
+        let tmp = test_dir("legacy-mlx-safetensors-manifest");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+        fs::write(source.join("model.safetensors"), b"fake").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "legacy-mlx").unwrap();
+        assert_eq!(manifest.format, ModelFormat::SafeTensors);
+
+        write_safetensors_header(
+            &store
+                .model_dir("legacy-mlx")
+                .join("files")
+                .join("model.safetensors"),
+            r#"{"__metadata__":{"format":"mlx"},"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+
+        let manifest = store.get("legacy-mlx").unwrap();
+        assert_eq!(manifest.format, ModelFormat::Mlx);
+        assert_eq!(manifest.backend, "mlx");
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn remove_deletes_managed_model_directory() {
         let tmp = test_dir("store-remove");
         let source = tmp.join("source");
@@ -1667,6 +2100,147 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_lfs_progress_with_mb_units() {
+        let stats = parse_git_lfs_progress_line(
+            "Downloading LFS objects:  50% (1/2), 28 MB | 3.2 MB/s",
+            Some(2_u64 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+
+        assert_eq!(stats.percent, Some(50));
+        assert_eq!(stats.bytes, 28_000_000);
+        assert_eq!(stats.total_bytes, Some(2_u64 * 1024 * 1024 * 1024));
+        assert_eq!(stats.bytes_per_second.round() as u64, 3_200_000);
+        assert_eq!(stats.progress_bytes(), 28_000_000);
+    }
+
+    #[test]
+    fn parses_git_lfs_progress_with_gib_units() {
+        let stats = parse_git_lfs_progress_line(
+            "Downloading LFS objects: 100% (2/2), 2.00 GiB | 12.3 MiB/s",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(stats.percent, Some(100));
+        assert_eq!(stats.bytes, 2_u64 * 1024 * 1024 * 1024);
+        assert_eq!(stats.total_bytes, Some(2_u64 * 1024 * 1024 * 1024));
+        assert_eq!(
+            stats.bytes_per_second.round() as u64,
+            (12.3_f64 * 1024.0_f64 * 1024.0_f64).round() as u64
+        );
+    }
+
+    #[test]
+    fn parses_git_lfs_zero_percent_progress() {
+        let stats = parse_git_lfs_progress_line(
+            "Downloading LFS objects:   0% (0/1), 65 MB | 8.0 MB/s",
+            Some(2_u64 * 1024 * 1024 * 1024),
+        )
+        .unwrap();
+
+        assert_eq!(stats.percent, Some(0));
+        assert_eq!(stats.bytes, 65_000_000);
+        assert_eq!(stats.total_bytes, Some(2_u64 * 1024 * 1024 * 1024));
+        assert_eq!(stats.bytes_per_second.round() as u64, 8_000_000);
+        assert_eq!(stats.progress_bytes(), 65_000_000);
+    }
+
+    #[test]
+    fn non_git_lfs_progress_text_is_ignored() {
+        assert!(parse_git_lfs_progress_line("Updated Git hooks.", Some(1024)).is_none());
+        assert!(parse_git_lfs_progress_line("Git LFS initialized.", Some(1024)).is_none());
+    }
+
+    #[test]
+    fn lfs_pointer_size_detects_unresolved_pointer() {
+        let tmp = test_dir("lfs-pointer-detection");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let pointer = source.join("model.safetensors");
+        write_lfs_pointer(&pointer, 1234);
+
+        assert_eq!(lfs_pointer_size(&pointer).unwrap(), Some(1234));
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn lfs_pointer_validation_reports_relative_path() {
+        let tmp = test_dir("lfs-pointer-validation");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        write_lfs_pointer(&source.join("nested/model.safetensors"), 4096);
+
+        let err = ensure_no_lfs_pointers_remaining(&source).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("Git LFS download incomplete"));
+        assert!(message.contains("nested/model.safetensors"));
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn lfs_pointer_validation_skips_git_metadata() {
+        let tmp = test_dir("lfs-pointer-validation-git");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join(".git/lfs/objects")).unwrap();
+        fs::write(source.join("model.safetensors"), b"materialized").unwrap();
+        write_lfs_pointer(&source.join(".git/lfs/objects/object"), 4096);
+
+        ensure_no_lfs_pointers_remaining(&source).unwrap();
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn included_file_import_tree_skips_unselected_lfs_pointers() {
+        let tmp = test_dir("included-file-import-tree");
+        let source = tmp.join("source");
+        let filtered = tmp.join("filtered");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Qwen3.5-4B-Q4_K_M.gguf"), b"materialized").unwrap();
+        write_lfs_pointer(&source.join("Qwen3.5-4B-Q4_K_S.gguf"), 4_000_000_000);
+        fs::write(source.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        fs::write(source.join("README.md"), b"not required metadata").unwrap();
+        fs::create_dir_all(source.join(".git/lfs/objects")).unwrap();
+        write_lfs_pointer(&source.join(".git/lfs/objects/object"), 1024);
+
+        prepare_included_file_import_tree(&source, "Qwen3.5-4B-Q4_K_M.gguf", &filtered).unwrap();
+        ensure_no_lfs_pointers_remaining(&filtered).unwrap();
+
+        assert!(filtered.join("Qwen3.5-4B-Q4_K_M.gguf").is_file());
+        assert!(filtered.join("config.json").is_file());
+        assert!(!filtered.join("Qwen3.5-4B-Q4_K_S.gguf").exists());
+        assert!(!filtered.join("README.md").exists());
+        assert!(!filtered.join(".git").exists());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn included_file_import_tree_preserves_nested_selected_file_path() {
+        let tmp = test_dir("included-file-import-tree-nested");
+        let source = tmp.join("source");
+        let filtered = tmp.join("filtered");
+        fs::create_dir_all(source.join("quantized")).unwrap();
+        fs::write(source.join("quantized/model.Q4_K_M.gguf"), b"materialized").unwrap();
+        write_lfs_pointer(&source.join("quantized/model.Q5_K_M.gguf"), 5_000_000_000);
+        fs::write(source.join("tokenizer_config.json"), b"{}").unwrap();
+
+        prepare_included_file_import_tree(&source, "quantized/model.Q4_K_M.gguf", &filtered)
+            .unwrap();
+        ensure_no_lfs_pointers_remaining(&filtered).unwrap();
+
+        assert!(filtered.join("quantized/model.Q4_K_M.gguf").is_file());
+        assert!(filtered.join("tokenizer_config.json").is_file());
+        assert!(!filtered.join("quantized/model.Q5_K_M.gguf").exists());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn set_model_file_updates_manifest_selection() {
         let tmp = test_dir("set-model-file");
         let source = tmp.join("source");
@@ -1733,6 +2307,14 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn write_safetensors_header(path: &Path, header: &str) {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        data.extend_from_slice(header.as_bytes());
+        data.extend_from_slice(&[0_u8; 4]);
+        fs::write(path, data).unwrap();
     }
 
     fn assert_import_format(

@@ -213,7 +213,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Rocm => rocm_candidates(manifest),
         RequestedBackend::Vulkan => vulkan_candidates(manifest),
         RequestedBackend::Metal => metal_candidates(manifest),
-        RequestedBackend::Mlx => vec![RuntimeId::Mlx],
+        RequestedBackend::Mlx => vec![RuntimeId::MlxVlm, RuntimeId::Mlx],
         RequestedBackend::Burn => burn_candidates(),
         RequestedBackend::Candle => candle_candidates(manifest),
         RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
@@ -234,13 +234,24 @@ fn runtime_candidate_ids_for_plan(
             .any(|availability| availability.runtime_id == RuntimeId::LlamaServerRocm)
         && !candidates.contains(&RuntimeId::LlamaServerRocm)
     {
-        let insert_at = candidates
-            .iter()
-            .position(|id| *id == RuntimeId::LlamaServerVulkan)
-            .unwrap_or(candidates.len());
+        let insert_at = llama_rocm_insert_position(&candidates);
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
     }
     candidates
+}
+
+fn llama_rocm_insert_position(candidates: &[RuntimeId]) -> usize {
+    candidates
+        .iter()
+        .position(|id| {
+            matches!(
+                id,
+                RuntimeId::LlamaServerVulkan
+                    | RuntimeId::LlamaServerMetal
+                    | RuntimeId::LlamaServerCpu
+            )
+        })
+        .unwrap_or(candidates.len())
 }
 
 fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
@@ -250,9 +261,14 @@ fn auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
         ModelFormat::Onnx => onnx_auto_candidates(),
         ModelFormat::Mlx => {
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                vec![RuntimeId::Mlx, RuntimeId::CandleMetal, RuntimeId::CandleCpu]
+                vec![
+                    RuntimeId::MlxVlm,
+                    RuntimeId::Mlx,
+                    RuntimeId::CandleMetal,
+                    RuntimeId::CandleCpu,
+                ]
             } else {
-                vec![RuntimeId::Mlx]
+                vec![RuntimeId::MlxVlm, RuntimeId::Mlx]
             }
         }
         ModelFormat::TensorRt
@@ -286,6 +302,7 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
         ]
     } else if cfg!(target_os = "macos") {
         vec![
+            RuntimeId::LlamaServerMetal,
             RuntimeId::LlamaServerCpu,
             RuntimeId::CandleMetal,
             RuntimeId::CandleCpu,
@@ -297,7 +314,12 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
 
 fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        vec![RuntimeId::Mlx, RuntimeId::CandleMetal, RuntimeId::CandleCpu]
+        vec![
+            RuntimeId::MlxVlm,
+            RuntimeId::Mlx,
+            RuntimeId::CandleMetal,
+            RuntimeId::CandleCpu,
+        ]
     } else if cfg!(target_os = "macos") {
         vec![RuntimeId::CandleMetal, RuntimeId::CandleCpu]
     } else if cfg!(any(windows, target_os = "linux")) {
@@ -374,7 +396,10 @@ fn vulkan_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
 
 fn metal_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
     match manifest.format {
-        ModelFormat::SafeTensors | ModelFormat::Gguf => vec![RuntimeId::CandleMetal],
+        ModelFormat::Gguf if cfg!(target_os = "macos") => {
+            vec![RuntimeId::LlamaServerMetal, RuntimeId::CandleMetal]
+        }
+        ModelFormat::SafeTensors => vec![RuntimeId::CandleMetal],
         _ => Vec::new(),
     }
 }
@@ -443,6 +468,11 @@ fn rejection_reason(
     if request_capabilities.text_generation && !descriptor.capabilities.text_generation {
         return Some("runtime does not support text generation".to_string());
     }
+    if runtime_id == RuntimeId::MlxVlm && !request_capabilities.image_input {
+        return Some(
+            "MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm".to_string(),
+        );
+    }
     if request_capabilities.image_input && !descriptor.capabilities.vision_language {
         return Some("runtime is not VLM-capable".to_string());
     }
@@ -485,6 +515,9 @@ fn model_support_rejection(manifest: &ModelManifest, runtime: BackendRuntime) ->
         (BackendRuntime::Vllm, ModelFormat::SafeTensors) => {
             "vLLM is not selected for this architecture".to_string()
         }
+        (BackendRuntime::MlxVlm, ModelFormat::Mlx | ModelFormat::SafeTensors) => {
+            "MLX-VLM is selected for supported VLM architectures".to_string()
+        }
         _ => "model format or architecture is not supported".to_string(),
     }
 }
@@ -521,12 +554,19 @@ fn selection_reason(
         (_, BackendRuntime::Candle, _) => {
             "fallback runtime supports the selected model architecture".to_string()
         }
+        (ModelFormat::Mlx, BackendRuntime::MlxVlm, _) => {
+            "MLX VLM image request uses mlx-vlm".to_string()
+        }
         (ModelFormat::Mlx, BackendRuntime::Mlx, _) => "MLX model uses mlx-lm".to_string(),
+        (_, BackendRuntime::MlxVlm, _) => {
+            "MLX VLM runtime selected for compatible model".to_string()
+        }
         (_, BackendRuntime::Mlx, _) => "MLX runtime selected for compatible model".to_string(),
         (_, _, RequestedBackend::Cpu) => "best CPU runtime for this model".to_string(),
         (_, _, RequestedBackend::Cuda) => "best CUDA runtime for this model".to_string(),
         (_, _, RequestedBackend::Rocm) => "best ROCm runtime for this model".to_string(),
         (_, _, RequestedBackend::Vulkan) => "best Vulkan runtime for this model".to_string(),
+        (_, _, RequestedBackend::Metal) => "best Metal runtime for this model".to_string(),
         _ => "best available runtime for this model".to_string(),
     }
 }
@@ -550,9 +590,16 @@ mod tests {
     fn gguf_auto_prefers_llama_server_before_candle() {
         let manifest = manifest(ModelFormat::Gguf, Some("llama"));
         let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
-        assert_eq!(candidates[0], RuntimeId::LlamaServerCuda);
-        assert_eq!(candidates[1], RuntimeId::LlamaServerVulkan);
-        assert_eq!(candidates[2], RuntimeId::LlamaServerCpu);
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(candidates[0], RuntimeId::LlamaServerCuda);
+            assert_eq!(candidates[1], RuntimeId::LlamaServerVulkan);
+            assert_eq!(candidates[2], RuntimeId::LlamaServerCpu);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(candidates[0], RuntimeId::LlamaServerMetal);
+            assert_eq!(candidates[1], RuntimeId::LlamaServerCpu);
+        } else {
+            assert_eq!(candidates[0], RuntimeId::LlamaServerCpu);
+        }
         assert!(candidates.contains(&RuntimeId::CandleCpu));
     }
 
@@ -694,11 +741,18 @@ mod tests {
             .iter()
             .position(|id| *id == RuntimeId::LlamaServerRocm)
             .unwrap();
-        let vulkan = ids
+        let first_lower_priority_llama = ids
             .iter()
-            .position(|id| *id == RuntimeId::LlamaServerVulkan)
+            .position(|id| {
+                matches!(
+                    id,
+                    RuntimeId::LlamaServerVulkan
+                        | RuntimeId::LlamaServerMetal
+                        | RuntimeId::LlamaServerCpu
+                )
+            })
             .unwrap();
-        assert!(rocm < vulkan);
+        assert!(rocm <= first_lower_priority_llama);
     }
 
     #[test]
@@ -743,6 +797,65 @@ mod tests {
             plan.candidates
                 .iter()
                 .any(|decision| decision.reason.contains("VLM"))
+        );
+    }
+
+    #[test]
+    fn gemma4_unified_image_request_prefers_mlx_vlm() {
+        let manifest = manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MlxVlm,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::Mlx,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text_with_images(true, true),
+            &available,
+        )
+        .unwrap();
+
+        assert_eq!(selected.runtime_id, RuntimeId::MlxVlm);
+    }
+
+    #[test]
+    fn gemma4_unified_text_request_uses_mlx_not_mlx_vlm() {
+        let manifest = manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MlxVlm,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::Mlx,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let plan = plan_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &available,
+        );
+
+        assert_eq!(plan.selected.unwrap().runtime_id, RuntimeId::Mlx);
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|decision| decision.runtime_id == RuntimeId::MlxVlm
+                    && decision.reason.contains("text-only MLX uses mlx-lm"))
         );
     }
 

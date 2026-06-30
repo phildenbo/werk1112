@@ -1043,6 +1043,7 @@ mod imp {
             LlamaCppMode::Cuda => cfg!(feature = "llama-legacy-cuda"),
             LlamaCppMode::Rocm => false,
             LlamaCppMode::Vulkan => cfg!(feature = "llama-legacy-vulkan"),
+            LlamaCppMode::Metal => false,
         }
     }
 
@@ -1051,6 +1052,7 @@ mod imp {
             LlamaCppMode::Cuda => "CUDA",
             LlamaCppMode::Rocm => "ROCm/HIP",
             LlamaCppMode::Vulkan => "Vulkan",
+            LlamaCppMode::Metal => "Metal",
             LlamaCppMode::Cpu => "CPU",
         }
     }
@@ -1060,6 +1062,7 @@ mod imp {
             LlamaCppMode::Cuda => "llama-legacy-cuda",
             LlamaCppMode::Rocm => "llama-legacy-rocm",
             LlamaCppMode::Vulkan => "llama-legacy-vulkan",
+            LlamaCppMode::Metal => "llama-legacy-metal",
             LlamaCppMode::Cpu => "llama-legacy-cpu",
         }
     }
@@ -1067,7 +1070,10 @@ mod imp {
     fn gpu_layers(mode: LlamaCppMode) -> i32 {
         match mode {
             LlamaCppMode::Cpu => 0,
-            LlamaCppMode::Cuda | LlamaCppMode::Rocm | LlamaCppMode::Vulkan => 999,
+            LlamaCppMode::Cuda
+            | LlamaCppMode::Rocm
+            | LlamaCppMode::Vulkan
+            | LlamaCppMode::Metal => 999,
         }
     }
 
@@ -1081,6 +1087,9 @@ mod imp {
             }
             LlamaCppMode::Vulkan => {
                 "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
+            }
+            LlamaCppMode::Metal => {
+                "llama.cpp legacy FFI Metal backend is not implemented; use the persistent llama.cpp server Metal route with --backend metal".to_string()
             }
             LlamaCppMode::Cpu => {
                 "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()
@@ -1265,6 +1274,7 @@ mod imp {
                     LlamaCppMode::Cuda => "llama-legacy-cuda",
                     LlamaCppMode::Rocm => "llama-legacy-rocm",
                     LlamaCppMode::Vulkan => "llama-legacy-vulkan",
+                    LlamaCppMode::Metal => "llama-legacy-metal",
                     LlamaCppMode::Cpu => "llama-legacy-cpu",
                 },
                 compiled: false,
@@ -1342,6 +1352,9 @@ mod imp {
             }
             LlamaCppMode::Vulkan => {
                 "llama.cpp legacy FFI Vulkan backend is not compiled into this binary; build/install with --features llama-legacy-vulkan".to_string()
+            }
+            LlamaCppMode::Metal => {
+                "llama.cpp legacy FFI Metal backend is not implemented; use the persistent llama.cpp server Metal route with --backend metal".to_string()
             }
             LlamaCppMode::Cpu => {
                 "llama.cpp legacy FFI CPU backend is not compiled into this binary; build/install with --features llama-fast".to_string()

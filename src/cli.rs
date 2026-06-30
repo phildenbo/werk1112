@@ -11,6 +11,8 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{io::Read, os::fd::AsRawFd};
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "burn-experimental")]
@@ -22,9 +24,9 @@ use crate::{
         ChatGenerationSession, GenerateRequest, GenerateStreamEvent, GenerationBackend,
         GenerationTimings, LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport,
         LlamaKvCacheType, LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery,
-        MlxBackend, OnnxProvisionOptions, OnnxRuntimeAvailability, OnnxRuntimeBackend,
-        OnnxRuntimeMode, RuntimeId, StreamGranularity, VllmBackend, backend_doctor_checks,
-        backend_supports_accelerator, backend_supports_format,
+        MlxBackend, MlxVlmBackend, OnnxProvisionOptions, OnnxRuntimeAvailability,
+        OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity, VllmBackend,
+        backend_doctor_checks, backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, install_managed_llama_server,
         install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
         managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
@@ -275,6 +277,7 @@ pub enum BackendInstallArg {
     LlamaCuda,
     LlamaRocm,
     LlamaVulkan,
+    LlamaMetal,
     LlamaCpu,
     OnnxCuda,
     OnnxRocm,
@@ -289,6 +292,7 @@ impl BackendInstallArg {
             Self::LlamaCuda => Some(LlamaCppMode::Cuda),
             Self::LlamaRocm => Some(LlamaCppMode::Rocm),
             Self::LlamaVulkan => Some(LlamaCppMode::Vulkan),
+            Self::LlamaMetal => Some(LlamaCppMode::Metal),
             Self::LlamaCpu => Some(LlamaCppMode::Cpu),
             Self::OnnxCuda | Self::OnnxRocm | Self::OnnxCpu | Self::Vllm => None,
         }
@@ -379,7 +383,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            default_value_t = 256,
+            default_value_t = 2048,
             help = "Maximum generated tokens per turn"
         )]
         max_tokens: usize,
@@ -713,6 +717,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 || backend.generate(&manifest, request),
             )?;
             println!("{}", response.text.trim());
+            io::stdout().flush()?;
             if verbose {
                 let mut stderr = io::stderr().lock();
                 writeln!(stderr)?;
@@ -722,6 +727,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     response.prompt_tokens,
                     response.completion_tokens,
                     response.timings,
+                    &response.backend_diagnostics,
                 )?;
             }
             Ok(())
@@ -1026,6 +1032,576 @@ fn with_terminal_spinner<T>(
     result
 }
 
+enum ChatInputReader {
+    #[cfg(unix)]
+    Terminal(TerminalLineReader),
+    Stdin(io::Stdin),
+}
+
+impl ChatInputReader {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            if io::stdin().is_terminal() && io::stdout().is_terminal() {
+                return Self::Terminal(TerminalLineReader::default());
+            }
+        }
+
+        Self::Stdin(io::stdin())
+    }
+
+    fn read_line(&mut self, prompt: &str) -> Result<Option<String>> {
+        match self {
+            #[cfg(unix)]
+            Self::Terminal(reader) => reader.read_line(prompt),
+            Self::Stdin(stdin) => {
+                print!("{prompt}");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                let n = stdin.read_line(&mut input)?;
+                if n == 0 {
+                    println!();
+                    return Ok(None);
+                }
+
+                Ok(Some(input))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct TerminalLineReader {
+    history: Vec<String>,
+}
+
+#[cfg(unix)]
+impl TerminalLineReader {
+    fn read_line(&mut self, prompt: &str) -> Result<Option<String>> {
+        let _raw_mode = TerminalRawMode::enable()?;
+        {
+            let mut stdout = io::stdout().lock();
+            write!(stdout, "{prompt}")?;
+            stdout.flush()?;
+        }
+
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let mut line = EditableLine::default();
+        let mut draft = String::new();
+        let mut history_index = None;
+
+        loop {
+            let byte = read_raw_byte(&mut stdin)?;
+            let mut redraw = false;
+
+            match byte {
+                b'\r' | b'\n' => {
+                    println!();
+                    let input = line.as_string();
+                    self.push_history(&input);
+                    return Ok(Some(input));
+                }
+                0x04 if line.is_empty() => {
+                    println!();
+                    return Ok(None);
+                }
+                0x03 => {
+                    println!("^C");
+                    return Ok(None);
+                }
+                0x01 => redraw = line.move_home(),
+                0x05 => redraw = line.move_end(),
+                0x0b => redraw = line.delete_to_end(),
+                0x15 => redraw = line.clear(),
+                0x17 => redraw = line.delete_word_before_cursor(),
+                0x7f | 0x08 => redraw = line.backspace(),
+                b'\x1b' => {
+                    let command = read_escape_command(&mut stdin)?;
+                    redraw = self.apply_command(command, &mut line, &mut draft, &mut history_index);
+                }
+                byte if byte >= 0x20 => {
+                    if let Some(ch) = read_utf8_char(byte, &mut stdin)? {
+                        line.insert(ch);
+                        redraw = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if redraw {
+                redraw_editable_line(prompt, &line)?;
+            }
+        }
+    }
+
+    fn push_history(&mut self, input: &str) {
+        if input.trim().is_empty() || self.history.last().is_some_and(|last| last == input) {
+            return;
+        }
+
+        self.history.push(input.to_string());
+        const HISTORY_LIMIT: usize = 200;
+        if self.history.len() > HISTORY_LIMIT {
+            self.history.remove(0);
+        }
+    }
+
+    fn apply_command(
+        &self,
+        command: LineEditCommand,
+        line: &mut EditableLine,
+        draft: &mut String,
+        history_index: &mut Option<usize>,
+    ) -> bool {
+        match command {
+            LineEditCommand::None => false,
+            LineEditCommand::MoveLeft => line.move_left(),
+            LineEditCommand::MoveRight => line.move_right(),
+            LineEditCommand::MoveWordLeft => line.move_word_left(),
+            LineEditCommand::MoveWordRight => line.move_word_right(),
+            LineEditCommand::MoveHome => line.move_home(),
+            LineEditCommand::MoveEnd => line.move_end(),
+            LineEditCommand::Delete => line.delete(),
+            LineEditCommand::HistoryPrevious => self.history_previous(line, draft, history_index),
+            LineEditCommand::HistoryNext => self.history_next(line, draft, history_index),
+        }
+    }
+
+    fn history_previous(
+        &self,
+        line: &mut EditableLine,
+        draft: &mut String,
+        history_index: &mut Option<usize>,
+    ) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+
+        let next_index = match *history_index {
+            Some(0) => return false,
+            Some(index) => index - 1,
+            None => {
+                *draft = line.as_string();
+                self.history.len() - 1
+            }
+        };
+
+        *history_index = Some(next_index);
+        line.replace(&self.history[next_index]);
+        true
+    }
+
+    fn history_next(
+        &self,
+        line: &mut EditableLine,
+        draft: &str,
+        history_index: &mut Option<usize>,
+    ) -> bool {
+        let Some(index) = *history_index else {
+            return false;
+        };
+
+        if index + 1 < self.history.len() {
+            let next_index = index + 1;
+            *history_index = Some(next_index);
+            line.replace(&self.history[next_index]);
+        } else {
+            *history_index = None;
+            line.replace(draft);
+        }
+
+        true
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct EditableLine {
+    buffer: Vec<char>,
+    cursor: usize,
+}
+
+#[cfg(unix)]
+impl EditableLine {
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    fn as_string(&self) -> String {
+        self.buffer.iter().collect()
+    }
+
+    fn replace(&mut self, value: &str) {
+        self.buffer = value.chars().collect();
+        self.cursor = self.buffer.len();
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        self.cursor -= 1;
+        self.buffer.remove(self.cursor);
+        true
+    }
+
+    fn delete(&mut self) -> bool {
+        if self.cursor >= self.buffer.len() {
+            return false;
+        }
+
+        self.buffer.remove(self.cursor);
+        true
+    }
+
+    fn delete_to_end(&mut self) -> bool {
+        if self.cursor >= self.buffer.len() {
+            return false;
+        }
+
+        self.buffer.truncate(self.cursor);
+        true
+    }
+
+    fn clear(&mut self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+
+        self.buffer.clear();
+        self.cursor = 0;
+        true
+    }
+
+    fn delete_word_before_cursor(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        let original_cursor = self.cursor;
+        while self.cursor > 0 && self.buffer[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !self.buffer[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        self.buffer.drain(self.cursor..original_cursor);
+        true
+    }
+
+    fn move_left(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        self.cursor -= 1;
+        true
+    }
+
+    fn move_right(&mut self) -> bool {
+        if self.cursor >= self.buffer.len() {
+            return false;
+        }
+
+        self.cursor += 1;
+        true
+    }
+
+    fn move_word_left(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        while self.cursor > 0 && self.buffer[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !self.buffer[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        true
+    }
+
+    fn move_word_right(&mut self) -> bool {
+        if self.cursor >= self.buffer.len() {
+            return false;
+        }
+
+        while self.cursor < self.buffer.len() && !self.buffer[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        while self.cursor < self.buffer.len() && self.buffer[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        true
+    }
+
+    fn move_home(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+
+        self.cursor = 0;
+        true
+    }
+
+    fn move_end(&mut self) -> bool {
+        if self.cursor == self.buffer.len() {
+            return false;
+        }
+
+        self.cursor = self.buffer.len();
+        true
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEditCommand {
+    None,
+    MoveLeft,
+    MoveRight,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveHome,
+    MoveEnd,
+    Delete,
+    HistoryPrevious,
+    HistoryNext,
+}
+
+#[cfg(unix)]
+struct TerminalRawMode {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalRawMode {
+    fn enable() -> Result<Self> {
+        let fd = io::stdin().as_raw_fd();
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 1;
+
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalRawMode {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_raw_byte(reader: &mut impl Read) -> Result<u8> {
+    loop {
+        if let Some(byte) = read_raw_byte_optional(reader)? {
+            return Ok(byte);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_raw_byte_optional(reader: &mut impl Read) -> Result<Option<u8>> {
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(byte[0])),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_utf8_char(first_byte: u8, reader: &mut impl Read) -> Result<Option<char>> {
+    if first_byte < 0x80 {
+        return Ok(Some(first_byte as char));
+    }
+
+    let width = match first_byte {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return Ok(None),
+    };
+
+    let mut bytes = vec![first_byte];
+    for _ in 1..width {
+        let Some(byte) = read_raw_byte_optional(reader)? else {
+            return Ok(None);
+        };
+        bytes.push(byte);
+    }
+
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| value.chars().next()))
+}
+
+#[cfg(unix)]
+fn read_escape_command(reader: &mut impl Read) -> Result<LineEditCommand> {
+    let Some(first) = read_raw_byte_optional(reader)? else {
+        return Ok(LineEditCommand::None);
+    };
+
+    match first {
+        b'b' => Ok(LineEditCommand::MoveWordLeft),
+        b'f' => Ok(LineEditCommand::MoveWordRight),
+        b'[' => read_csi_command(reader),
+        b'O' => match read_raw_byte_optional(reader)? {
+            Some(b'H') => Ok(LineEditCommand::MoveHome),
+            Some(b'F') => Ok(LineEditCommand::MoveEnd),
+            _ => Ok(LineEditCommand::None),
+        },
+        _ => Ok(LineEditCommand::None),
+    }
+}
+
+#[cfg(unix)]
+fn read_csi_command(reader: &mut impl Read) -> Result<LineEditCommand> {
+    let Some(first) = read_raw_byte_optional(reader)? else {
+        return Ok(LineEditCommand::None);
+    };
+
+    match first {
+        b'A' => Ok(LineEditCommand::HistoryPrevious),
+        b'B' => Ok(LineEditCommand::HistoryNext),
+        b'C' => Ok(LineEditCommand::MoveRight),
+        b'D' => Ok(LineEditCommand::MoveLeft),
+        b'H' => Ok(LineEditCommand::MoveHome),
+        b'F' => Ok(LineEditCommand::MoveEnd),
+        b'1'..=b'9' => read_numbered_csi_command(first, reader),
+        _ => Ok(LineEditCommand::None),
+    }
+}
+
+#[cfg(unix)]
+fn read_numbered_csi_command(first: u8, reader: &mut impl Read) -> Result<LineEditCommand> {
+    let mut bytes = vec![first];
+
+    loop {
+        let Some(byte) = read_raw_byte_optional(reader)? else {
+            return Ok(LineEditCommand::None);
+        };
+
+        match byte {
+            b'~' => {
+                return Ok(match bytes.as_slice() {
+                    b"1" | b"7" => LineEditCommand::MoveHome,
+                    b"3" => LineEditCommand::Delete,
+                    b"4" | b"8" => LineEditCommand::MoveEnd,
+                    _ => LineEditCommand::None,
+                });
+            }
+            b'C' => {
+                return Ok(if bytes.contains(&b';') {
+                    LineEditCommand::MoveWordRight
+                } else {
+                    LineEditCommand::MoveRight
+                });
+            }
+            b'D' => {
+                return Ok(if bytes.contains(&b';') {
+                    LineEditCommand::MoveWordLeft
+                } else {
+                    LineEditCommand::MoveLeft
+                });
+            }
+            b'H' => return Ok(LineEditCommand::MoveHome),
+            b'F' => return Ok(LineEditCommand::MoveEnd),
+            byte if byte.is_ascii_digit() || byte == b';' => bytes.push(byte),
+            _ => return Ok(LineEditCommand::None),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn redraw_editable_line(prompt: &str, line: &EditableLine) -> Result<()> {
+    let text = line.as_string();
+    let chars_after_cursor = line.buffer.len().saturating_sub(line.cursor);
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\r\x1b[2K{prompt}{text}")?;
+    if chars_after_cursor > 0 {
+        write!(stdout, "\x1b[{chars_after_cursor}D")?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AssistantPendingSpinner {
+    enabled: bool,
+    visible: bool,
+    frame_index: usize,
+}
+
+impl AssistantPendingSpinner {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            visible: false,
+            frame_index: 0,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+        let frame = FRAMES[self.frame_index % FRAMES.len()];
+        self.frame_index += 1;
+        self.visible = true;
+
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "\r\x1b[2Kassistant> {frame}")?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        if !self.visible {
+            return Ok(());
+        }
+
+        self.visible = false;
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "\r\x1b[2Kassistant> ")?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
@@ -1048,18 +1624,13 @@ async fn chat_loop(
         manifest.id
     );
     let mut messages = Vec::new();
-    let stdin = io::stdin();
+    let mut input_reader = ChatInputReader::new();
 
     loop {
-        print!("you> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        let n = stdin.read_line(&mut input)?;
-        if n == 0 {
-            println!();
+        let Some(input) = input_reader.read_line("you> ")? else {
             break;
-        }
+        };
+
         let input = input.trim();
         if input.is_empty() {
             continue;
@@ -1095,16 +1666,37 @@ async fn chat_loop(
         let mut assistant = String::new();
         let mut prompt_tokens = 0usize;
         let mut completion_tokens = 0usize;
+        let mut finish_reason = String::new();
         let mut timings = None;
+        let mut backend_diagnostics = Vec::new();
         let mut last_flush = Instant::now();
+        let mut pending_spinner =
+            AssistantPendingSpinner::new(io::stdout().is_terminal() && !debug);
         let mut stream = if let Some(session) = chat_session.as_ref() {
             session.generate_stream(request)
         } else {
             backend.generate_stream(manifest.clone(), request)
         };
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = tokio::time::timeout(Duration::from_millis(120), stream.next()).await;
+            let Some(event) = (match event {
+                Ok(event) => event,
+                Err(_) => {
+                    if assistant.is_empty() && pending_spinner.is_enabled() {
+                        pending_spinner.tick()?;
+                    }
+                    continue;
+                }
+            }) else {
+                pending_spinner.clear()?;
+                break;
+            };
+
             match event {
                 Ok(GenerateStreamEvent::TextChunk(chunk)) => {
+                    if !chunk.is_empty() {
+                        pending_spinner.clear()?;
+                    }
                     print!("{chunk}");
                     if chunk.contains('\n') || last_flush.elapsed() >= Duration::from_millis(16) {
                         io::stdout().flush()?;
@@ -1113,17 +1705,22 @@ async fn chat_loop(
                     assistant.push_str(&chunk);
                 }
                 Ok(GenerateStreamEvent::Done {
+                    finish_reason: response_finish_reason,
                     prompt_tokens: tokens_in,
                     completion_tokens: tokens,
                     timings: response_timings,
-                    ..
+                    backend_diagnostics: response_backend_diagnostics,
                 }) => {
+                    finish_reason = response_finish_reason;
                     prompt_tokens = tokens_in;
                     completion_tokens = tokens;
                     timings = Some(response_timings);
+                    backend_diagnostics = response_backend_diagnostics;
+                    pending_spinner.clear()?;
                     break;
                 }
                 Err(message) => {
+                    pending_spinner.clear()?;
                     println!("\nerror: {message}");
                     break;
                 }
@@ -1131,6 +1728,11 @@ async fn chat_loop(
         }
         io::stdout().flush()?;
         println!();
+        if finish_reason == "length" && !assistant.trim().is_empty() {
+            println!(
+                "note: response reached --max-tokens ({max_tokens}) and may be incomplete; rerun with a larger --max-tokens value for more."
+            );
+        }
         if verbose && let Some(timings) = timings {
             let mut stdout = io::stdout().lock();
             writeln!(stdout)?;
@@ -1140,6 +1742,7 @@ async fn chat_loop(
                 prompt_tokens,
                 completion_tokens,
                 timings,
+                &backend_diagnostics,
             )?;
         }
 
@@ -1492,6 +2095,7 @@ fn print_backend_list(store: &ModelStore) {
         LlamaCppMode::Cuda,
         LlamaCppMode::Rocm,
         LlamaCppMode::Vulkan,
+        LlamaCppMode::Metal,
         LlamaCppMode::Cpu,
     ] {
         let discovery = LlamaServerBackend::discover(store, mode);
@@ -1674,6 +2278,10 @@ fn print_backend_doctor(store: &ModelStore, debug: bool) {
         "ROCm cache: {}",
         managed_backend_dir(store, LlamaCppMode::Rocm).display()
     );
+    println!(
+        "Metal cache: {}",
+        managed_backend_dir(store, LlamaCppMode::Metal).display()
+    );
     println!();
     for check in backend_doctor_checks(store) {
         println!(
@@ -1831,6 +2439,7 @@ fn write_verbose_stats<W: Write>(
     prompt_tokens: usize,
     completion_tokens: usize,
     timings: GenerationTimings,
+    backend_diagnostics: &[String],
 ) -> io::Result<()> {
     if let Some(backend) = backend {
         writeln!(writer, "{:<22}{}", "backend:", backend)?;
@@ -1896,7 +2505,15 @@ fn write_verbose_stats<W: Write>(
         "{:<22}{:.2} tokens/s",
         "eval rate:",
         rate(completion_tokens, timings.decode_seconds)
-    )
+    )?;
+    if !backend_diagnostics.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "backend stats:")?;
+        for line in backend_diagnostics {
+            writeln!(writer, "  {line}")?;
+        }
+    }
+    Ok(())
 }
 
 fn rate(tokens: usize, seconds: f64) -> f64 {
@@ -1941,6 +2558,7 @@ enum BackendChoice {
     LlamaHighlevel(LlamaCppMode),
     Burn(BurnMode),
     Mlx,
+    MlxVlm,
     OnnxRuntime(OnnxRuntimeMode),
     Vllm,
     VllmRocm,
@@ -2195,7 +2813,10 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
             llama: LlamaCppMode::Cuda,
             candle: CandleDeviceMode::Cuda,
         },
-        BackendArg::Metal => BackendChoice::Candle(CandleDeviceMode::Metal),
+        BackendArg::Metal => BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Metal,
+            candle: CandleDeviceMode::Metal,
+        },
         BackendArg::Mlx => BackendChoice::Mlx,
         BackendArg::Onnx => BackendChoice::OnnxRuntime(preferred_onnx_mode()),
         BackendArg::Rocm => BackendChoice::GgufPreferred {
@@ -2213,7 +2834,9 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
 }
 
 fn preferred_llama_mode() -> LlamaCppMode {
-    if cfg!(feature = "llama-legacy-cuda") {
+    if cfg!(target_os = "macos") {
+        LlamaCppMode::Metal
+    } else if cfg!(feature = "llama-legacy-cuda") {
         LlamaCppMode::Cuda
     } else if cfg!(feature = "llama-legacy-vulkan") {
         LlamaCppMode::Vulkan
@@ -2296,6 +2919,7 @@ fn build_concrete_backend(
         BackendChoice::LlamaHighlevel(mode) => Ok(Arc::new(LlamaCppBackend::new(store, mode))),
         BackendChoice::Burn(mode) => Ok(Arc::new(BurnBackend::new(store, mode))),
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
+        BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
         BackendChoice::Vllm | BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new(store))),
     }
@@ -2322,11 +2946,13 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::LlamaServerCuda => Some(BackendChoice::LlamaServer(LlamaCppMode::Cuda)),
         RuntimeId::LlamaServerRocm => Some(BackendChoice::LlamaServer(LlamaCppMode::Rocm)),
         RuntimeId::LlamaServerVulkan => Some(BackendChoice::LlamaServer(LlamaCppMode::Vulkan)),
+        RuntimeId::LlamaServerMetal => Some(BackendChoice::LlamaServer(LlamaCppMode::Metal)),
         RuntimeId::LlamaServerCpu => Some(BackendChoice::LlamaServer(LlamaCppMode::Cpu)),
         RuntimeId::CandleCuda => Some(BackendChoice::Candle(CandleDeviceMode::Cuda)),
         RuntimeId::CandleMetal => Some(BackendChoice::Candle(CandleDeviceMode::Metal)),
         RuntimeId::CandleCpu => Some(BackendChoice::Candle(CandleDeviceMode::Cpu)),
         RuntimeId::Mlx => Some(BackendChoice::Mlx),
+        RuntimeId::MlxVlm => Some(BackendChoice::MlxVlm),
         RuntimeId::OnnxRuntimeCuda => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda)),
         RuntimeId::OnnxRuntimeRocm => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)),
         RuntimeId::OnnxRuntimeCpu => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu)),
@@ -2353,12 +2979,14 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => Some(RuntimeId::LlamaServerCuda),
         BackendChoice::LlamaServer(LlamaCppMode::Rocm) => Some(RuntimeId::LlamaServerRocm),
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => Some(RuntimeId::LlamaServerVulkan),
+        BackendChoice::LlamaServer(LlamaCppMode::Metal) => Some(RuntimeId::LlamaServerMetal),
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => Some(RuntimeId::LlamaServerCpu),
         BackendChoice::Candle(CandleDeviceMode::Cuda) => Some(RuntimeId::CandleCuda),
         BackendChoice::Candle(CandleDeviceMode::Metal) => Some(RuntimeId::CandleMetal),
         BackendChoice::Candle(CandleDeviceMode::Cpu)
         | BackendChoice::Candle(CandleDeviceMode::Auto) => Some(RuntimeId::CandleCpu),
         BackendChoice::Mlx => Some(RuntimeId::Mlx),
+        BackendChoice::MlxVlm => Some(RuntimeId::MlxVlm),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => Some(RuntimeId::OnnxRuntimeCuda),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => Some(RuntimeId::OnnxRuntimeRocm),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => Some(RuntimeId::OnnxRuntimeCpu),
@@ -2385,6 +3013,7 @@ fn select_backend_from_runtime_candidates(
     candidates: &[RuntimeId],
     manifest: &ModelManifest,
     requested: RequestedBackend,
+    capabilities: RequestCapabilities,
     selection_options: SelectionOptions,
 ) -> Result<BackendChoice> {
     let mut rejected = Vec::new();
@@ -2404,6 +3033,20 @@ fn select_backend_from_runtime_candidates(
         if !descriptor.implemented {
             rejected.push(format!(
                 "{}: runtime integration is not implemented yet",
+                descriptor.display_name
+            ));
+            continue;
+        }
+        if *candidate == RuntimeId::MlxVlm && !capabilities.image_input {
+            rejected.push(format!(
+                "{}: MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm",
+                descriptor.display_name
+            ));
+            continue;
+        }
+        if capabilities.image_input && !descriptor.capabilities.vision_language {
+            rejected.push(format!(
+                "{}: runtime is not VLM-capable",
                 descriptor.display_name
             ));
             continue;
@@ -2464,6 +3107,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
         BackendChoice::LlamaFast(_) => BackendRuntime::LlamaLegacy,
         BackendChoice::LlamaHighlevel(_) => BackendRuntime::LlamaHighlevel,
         BackendChoice::Mlx => BackendRuntime::Mlx,
+        BackendChoice::MlxVlm => BackendRuntime::MlxVlm,
         BackendChoice::OnnxRuntime(_) => BackendRuntime::OnnxRuntime,
         BackendChoice::Vllm | BackendChoice::VllmRocm => BackendRuntime::Vllm,
     }
@@ -2491,8 +3135,11 @@ fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan)
         | BackendChoice::LlamaFast(LlamaCppMode::Vulkan)
         | BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => BackendAccelerator::Vulkan,
-        BackendChoice::Candle(CandleDeviceMode::Metal) => BackendAccelerator::Metal,
-        BackendChoice::Mlx => BackendAccelerator::Mlx,
+        BackendChoice::Candle(CandleDeviceMode::Metal)
+        | BackendChoice::LlamaServer(LlamaCppMode::Metal)
+        | BackendChoice::LlamaFast(LlamaCppMode::Metal)
+        | BackendChoice::LlamaHighlevel(LlamaCppMode::Metal) => BackendAccelerator::Metal,
+        BackendChoice::Mlx | BackendChoice::MlxVlm => BackendAccelerator::Mlx,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => BackendAccelerator::Cuda,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => BackendAccelerator::Cpu,
         BackendChoice::Vllm => BackendAccelerator::Cuda,
@@ -2527,6 +3174,9 @@ fn backend_unavailability_reason(
         BackendChoice::Mlx => MlxBackend::probe()
             .err()
             .map(|_| "mlx-lm is unavailable".to_string()),
+        BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
+            "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
+        }),
         BackendChoice::Burn(mode) => BurnBackend::probe(store, manifest, mode)
             .err()
             .map(|_| BurnBackend::unavailable_reason(store, manifest, mode)),
@@ -2552,9 +3202,20 @@ fn backend_unavailability_reason(
         BackendChoice::VllmRocm => VllmBackend::probe_rocm(store)
             .err()
             .map(|_| VllmBackend::rocm_unavailable_reason(store)),
-        BackendChoice::LlamaServer(mode) => LlamaServerBackend::probe(store, mode)
-            .err()
-            .map(|_| LlamaServerBackend::missing_message(store, mode)),
+        BackendChoice::LlamaServer(mode) => {
+            if LlamaServerBackend::probe(store, mode).is_ok() {
+                None
+            } else if selection_options.provision_missing_backends
+                && should_auto_install_llama_server(mode)
+            {
+                install_managed_llama_server(store, mode)
+                    .and_then(|_| LlamaServerBackend::probe(store, mode).map(|_| ()))
+                    .err()
+                    .map(|err| compact_reason(&err.to_string()))
+            } else {
+                Some(LlamaServerBackend::missing_message(store, mode))
+            }
+        }
         BackendChoice::LlamaFast(mode) => LlamaFastBackend::probe(mode)
             .err()
             .map(|err| compact_reason(&err.to_string())),
@@ -2594,6 +3255,7 @@ fn selected_backend_for_request(
                 &candidates,
                 manifest,
                 RequestedBackend::Candle,
+                capabilities,
                 selection_options,
             )?;
             ensure_backend_supports_images(selected, has_images)?;
@@ -2602,20 +3264,27 @@ fn selected_backend_for_request(
         BackendChoice::LlamaServer(_)
         | BackendChoice::Burn(_)
         | BackendChoice::Mlx
+        | BackendChoice::MlxVlm
         | BackendChoice::OnnxRuntime(_)
         | BackendChoice::Vllm
         | BackendChoice::VllmRocm => {
-            let Some(runtime_id) = backend_to_runtime_id(backend) else {
-                bail!(
-                    "backend {} is not represented in the runtime planner",
-                    backend_label(backend)
-                );
+            let candidates = if matches!(backend, BackendChoice::Mlx) && has_images {
+                vec![RuntimeId::MlxVlm, RuntimeId::Mlx]
+            } else {
+                let Some(runtime_id) = backend_to_runtime_id(backend) else {
+                    bail!(
+                        "backend {} is not represented in the runtime planner",
+                        backend_label(backend)
+                    );
+                };
+                vec![runtime_id]
             };
             let selected = select_backend_from_runtime_candidates(
                 store,
-                &[runtime_id],
+                &candidates,
                 manifest,
                 requested_backend_for_choice(backend),
+                capabilities,
                 selection_options,
             )?;
             ensure_backend_supports_images(selected, has_images)?;
@@ -2739,18 +3408,33 @@ fn runtime_candidate_ids_for_selection(
         && llama_rocm_auto_probeable(store)
         && !candidates.contains(&RuntimeId::LlamaServerRocm)
     {
-        let insert_at = candidates
-            .iter()
-            .position(|id| *id == RuntimeId::LlamaServerVulkan)
-            .unwrap_or(candidates.len());
+        let insert_at = llama_rocm_insert_position(&candidates);
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
     }
     candidates
 }
 
+fn llama_rocm_insert_position(candidates: &[RuntimeId]) -> usize {
+    candidates
+        .iter()
+        .position(|id| {
+            matches!(
+                id,
+                RuntimeId::LlamaServerVulkan
+                    | RuntimeId::LlamaServerMetal
+                    | RuntimeId::LlamaServerCpu
+            )
+        })
+        .unwrap_or(candidates.len())
+}
+
 fn llama_rocm_auto_probeable(store: &ModelStore) -> bool {
     env::var_os("WERK_LLAMA_SERVER_ROCM").is_some()
         || managed_backend_dir(store, LlamaCppMode::Rocm).exists()
+}
+
+fn should_auto_install_llama_server(mode: LlamaCppMode) -> bool {
+    cfg!(target_os = "macos") && mode == LlamaCppMode::Metal
 }
 
 fn runtime_unavailability_reason(
@@ -2789,6 +3473,11 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         }
         | BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => RequestedBackend::Vulkan,
         BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Metal,
+            ..
+        }
+        | BackendChoice::LlamaServer(LlamaCppMode::Metal) => RequestedBackend::Metal,
+        BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Cpu,
             ..
         }
@@ -2796,7 +3485,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => RequestedBackend::Cpu,
         BackendChoice::Burn(_) => RequestedBackend::Burn,
         BackendChoice::Candle(_) => RequestedBackend::Candle,
-        BackendChoice::Mlx => RequestedBackend::Mlx,
+        BackendChoice::Mlx | BackendChoice::MlxVlm => RequestedBackend::Mlx,
         BackendChoice::Vllm => RequestedBackend::Vllm,
         BackendChoice::VllmRocm => RequestedBackend::Rocm,
         BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
@@ -2867,6 +3556,9 @@ fn unavailable_backend_message(
             VllmBackend::rocm_unavailable_reason(store)
         }
         (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
+        (BackendChoice::MlxVlm, _) => {
+            "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
+        }
         _ => format!(
             "backend {} is unavailable for model '{}' with format {:?}",
             backend_label(backend),
@@ -3203,6 +3895,10 @@ fn backend_label(backend: BackendChoice) -> &'static str {
             llama: LlamaCppMode::Vulkan,
             ..
         } => "vulkan",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Metal,
+            ..
+        } => "metal",
         BackendChoice::Candle(CandleDeviceMode::Auto) => "candle-auto",
         BackendChoice::Burn(BurnMode::Cuda) => "burn-cuda",
         BackendChoice::Burn(BurnMode::Cpu) => "burn-cpu",
@@ -3210,6 +3906,7 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Cuda) => "candle-cuda",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "metal",
         BackendChoice::Mlx => "mlx",
+        BackendChoice::MlxVlm => "mlx-vlm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "onnxruntime-cuda",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "onnxruntime-rocm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "onnxruntime-cpu",
@@ -3218,10 +3915,12 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama-server-cuda",
         BackendChoice::LlamaServer(LlamaCppMode::Rocm) => "llama-server-rocm",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama-server-vulkan",
+        BackendChoice::LlamaServer(LlamaCppMode::Metal) => "llama-server-metal",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama-server-cpu",
         BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama-legacy-cuda",
         BackendChoice::LlamaFast(LlamaCppMode::Rocm) => "llama-legacy-rocm",
         BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama-legacy-vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Metal) => "llama-legacy-metal",
         BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama-legacy-cpu",
         BackendChoice::LlamaHighlevel(mode) => mode.label(),
     }
@@ -3246,6 +3945,10 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
             llama: LlamaCppMode::Vulkan,
             ..
         } => "llama.cpp server Vulkan",
+        BackendChoice::GgufPreferred {
+            llama: LlamaCppMode::Metal,
+            ..
+        } => "llama.cpp server Metal",
         BackendChoice::Candle(CandleDeviceMode::Auto) => "Candle auto",
         BackendChoice::Burn(BurnMode::Cuda) => "Burn CUDA",
         BackendChoice::Burn(BurnMode::Cpu) => "Burn CPU",
@@ -3253,6 +3956,7 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::Candle(CandleDeviceMode::Cuda) => "Candle CUDA",
         BackendChoice::Candle(CandleDeviceMode::Metal) => "Candle Metal",
         BackendChoice::Mlx => "MLX",
+        BackendChoice::MlxVlm => "MLX-VLM",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "ONNX Runtime CUDA",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "ONNX Runtime ROCm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "ONNX Runtime CPU",
@@ -3261,14 +3965,17 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama.cpp server CUDA",
         BackendChoice::LlamaServer(LlamaCppMode::Rocm) => "llama.cpp server ROCm/HIP",
         BackendChoice::LlamaServer(LlamaCppMode::Vulkan) => "llama.cpp server Vulkan",
+        BackendChoice::LlamaServer(LlamaCppMode::Metal) => "llama.cpp server Metal",
         BackendChoice::LlamaServer(LlamaCppMode::Cpu) => "llama.cpp server CPU",
         BackendChoice::LlamaFast(LlamaCppMode::Cuda) => "llama.cpp legacy FFI CUDA",
         BackendChoice::LlamaFast(LlamaCppMode::Rocm) => "llama.cpp legacy FFI ROCm",
         BackendChoice::LlamaFast(LlamaCppMode::Vulkan) => "llama.cpp legacy FFI Vulkan",
+        BackendChoice::LlamaFast(LlamaCppMode::Metal) => "llama.cpp legacy FFI Metal",
         BackendChoice::LlamaFast(LlamaCppMode::Cpu) => "llama.cpp legacy FFI CPU",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Cuda) => "llama.cpp high-level CUDA",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Rocm) => "llama.cpp high-level ROCm",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Vulkan) => "llama.cpp high-level Vulkan",
+        BackendChoice::LlamaHighlevel(LlamaCppMode::Metal) => "llama.cpp high-level Metal",
         BackendChoice::LlamaHighlevel(LlamaCppMode::Cpu) => "llama.cpp high-level CPU",
     }
 }
@@ -3278,6 +3985,7 @@ fn display_llama_mode(mode: LlamaCppMode) -> &'static str {
         LlamaCppMode::Cuda => "CUDA",
         LlamaCppMode::Rocm => "ROCm/HIP",
         LlamaCppMode::Vulkan => "Vulkan",
+        LlamaCppMode::Metal => "Metal",
         LlamaCppMode::Cpu => "CPU",
     }
 }
@@ -3489,6 +4197,65 @@ mod tests {
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn editable_line_inserts_at_cursor() {
+        let mut line = EditableLine::default();
+        for ch in "helo".chars() {
+            line.insert(ch);
+        }
+
+        assert!(line.move_left());
+        line.insert('l');
+
+        assert_eq!(line.as_string(), "hello");
+        assert_eq!(line.cursor, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editable_line_history_restores_draft() {
+        let reader = TerminalLineReader {
+            history: vec!["first".to_string(), "second".to_string()],
+        };
+        let mut line = EditableLine::default();
+        let mut draft = String::new();
+        let mut history_index = None;
+        line.replace("draft");
+
+        assert!(reader.apply_command(
+            LineEditCommand::HistoryPrevious,
+            &mut line,
+            &mut draft,
+            &mut history_index,
+        ));
+        assert_eq!(line.as_string(), "second");
+
+        assert!(reader.apply_command(
+            LineEditCommand::HistoryPrevious,
+            &mut line,
+            &mut draft,
+            &mut history_index,
+        ));
+        assert_eq!(line.as_string(), "first");
+
+        assert!(reader.apply_command(
+            LineEditCommand::HistoryNext,
+            &mut line,
+            &mut draft,
+            &mut history_index,
+        ));
+        assert_eq!(line.as_string(), "second");
+
+        assert!(reader.apply_command(
+            LineEditCommand::HistoryNext,
+            &mut line,
+            &mut draft,
+            &mut history_index,
+        ));
+        assert_eq!(line.as_string(), "draft");
+    }
 
     #[test]
     fn parses_cli_commands() {
@@ -3766,6 +4533,13 @@ mod tests {
             }
         ));
         assert!(matches!(
+            backend_arg_to_choice(BackendArg::Metal),
+            BackendChoice::GgufPreferred {
+                llama: LlamaCppMode::Metal,
+                candle: CandleDeviceMode::Metal
+            }
+        ));
+        assert!(matches!(
             backend_arg_to_choice(BackendArg::LlamaHighlevel),
             BackendChoice::LlamaHighlevel(_)
         ));
@@ -3829,6 +4603,30 @@ mod tests {
             ));
             assert!(matches!(
                 order[4],
+                BackendChoice::Candle(CandleDeviceMode::Cpu)
+            ));
+        }
+    }
+
+    #[test]
+    fn macos_auto_prefers_llama_server_metal_for_gguf() {
+        if cfg!(target_os = "macos") {
+            let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+            let order = auto_candidates_for_manifest(&manifest);
+            assert!(matches!(
+                order[0],
+                BackendChoice::LlamaServer(LlamaCppMode::Metal)
+            ));
+            assert!(matches!(
+                order[1],
+                BackendChoice::LlamaServer(LlamaCppMode::Cpu)
+            ));
+            assert!(matches!(
+                order[2],
+                BackendChoice::Candle(CandleDeviceMode::Metal)
+            ));
+            assert!(matches!(
+                order[3],
                 BackendChoice::Candle(CandleDeviceMode::Cpu)
             ));
         }
@@ -4132,6 +4930,25 @@ mod tests {
     }
 
     #[test]
+    fn backend_selection_routes_gguf_metal_to_llama_server() {
+        if cfg!(target_os = "macos") {
+            let store = test_store("gguf-metal");
+            install_fake_managed_llama_server(&store, LlamaCppMode::Metal);
+            let manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+            let selected = selected_backend_for_manifest(
+                &store,
+                backend_arg_to_choice(BackendArg::Metal),
+                &manifest,
+            )
+            .unwrap();
+            assert!(matches!(
+                selected,
+                BackendChoice::LlamaServer(LlamaCppMode::Metal)
+            ));
+        }
+    }
+
+    #[test]
     fn backend_selection_routes_safetensors_cuda_without_burn_or_cpu_fallback() {
         let store = test_store("safetensors-cuda");
         let manifest = test_manifest(ModelFormat::SafeTensors, Some("unknown"));
@@ -4333,6 +5150,24 @@ mod tests {
             Ok(selected) => assert!(matches!(selected, BackendChoice::Mlx)),
             Err(err) => assert!(err.to_string().contains("mlx-lm is unavailable")),
         }
+    }
+
+    #[test]
+    fn image_request_does_not_select_plain_mlx_fallback() {
+        let store = test_store("mlx-image-fallback");
+        let manifest = test_manifest(ModelFormat::Mlx, Some("gemma4_unified"));
+        let err = select_backend_from_runtime_candidates(
+            &store,
+            &[RuntimeId::Mlx],
+            &manifest,
+            RequestedBackend::Mlx,
+            RequestCapabilities::text_with_images(true, true),
+            SelectionOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("MLX"));
+        assert!(err.to_string().contains("VLM"));
     }
 
     #[test]

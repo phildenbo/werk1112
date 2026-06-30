@@ -148,6 +148,7 @@ impl GenerationBackend for CandleBackend {
                         prompt_tokens: response.prompt_tokens,
                         completion_tokens: response.completion_tokens,
                         timings: response.timings,
+                        backend_diagnostics: response.backend_diagnostics,
                     }));
                 }
                 Err(err) => {
@@ -394,6 +395,7 @@ fn generate_with_loaded_model(
             decode_seconds,
             total_seconds: tokenize_started.elapsed().as_secs_f64(),
         },
+        backend_diagnostics: Vec::new(),
     })
 }
 

@@ -206,6 +206,7 @@ impl LlamaServerBackend {
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
             },
+            backend_diagnostics: Vec::new(),
         })
     }
 }
@@ -264,6 +265,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                 decode_seconds: completion.decode_seconds,
                 total_seconds: total_started.elapsed().as_secs_f64(),
             },
+            backend_diagnostics: Vec::new(),
         })
     }
 
@@ -288,6 +290,7 @@ impl ChatGenerationSession for LlamaServerChatSession {
                         decode_seconds: completion.decode_seconds,
                         total_seconds: total_started.elapsed().as_secs_f64(),
                     },
+                    backend_diagnostics: Vec::new(),
                 });
             send_stream_result(tx, result);
         });
@@ -853,6 +856,10 @@ fn supported_args(executable: &PathBuf) -> SupportedArgs {
 }
 
 pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> Result<PathBuf> {
+    if mode == LlamaCppMode::Metal && !cfg!(target_os = "macos") {
+        bail!("llama.cpp Metal backend can only be built on macOS");
+    }
+
     let root = managed_backend_dir(store, mode);
     let source_dir = root.join("llama.cpp");
     let build_dir = root.join("build");
@@ -934,6 +941,9 @@ pub fn install_managed_llama_server(store: &ModelStore, mode: LlamaCppMode) -> R
         }
         LlamaCppMode::Vulkan => {
             configure.arg("-DGGML_VULKAN=ON");
+        }
+        LlamaCppMode::Metal => {
+            configure.arg("-DGGML_METAL=ON");
         }
         LlamaCppMode::Cpu => {}
     }
@@ -1401,6 +1411,7 @@ fn mode_env_name(mode: LlamaCppMode) -> &'static str {
         LlamaCppMode::Cuda => "WERK_LLAMA_SERVER_CUDA",
         LlamaCppMode::Rocm => "WERK_LLAMA_SERVER_ROCM",
         LlamaCppMode::Vulkan => "WERK_LLAMA_SERVER_VULKAN",
+        LlamaCppMode::Metal => "WERK_LLAMA_SERVER_METAL",
         LlamaCppMode::Cpu => "WERK_LLAMA_SERVER_CPU",
     }
 }
@@ -1410,6 +1421,7 @@ fn install_target_name(mode: LlamaCppMode) -> &'static str {
         LlamaCppMode::Cuda => "llama-cuda",
         LlamaCppMode::Rocm => "llama-rocm",
         LlamaCppMode::Vulkan => "llama-vulkan",
+        LlamaCppMode::Metal => "llama-metal",
         LlamaCppMode::Cpu => "llama-cpu",
     }
 }
@@ -1460,6 +1472,7 @@ fn send_stream_result(
                 prompt_tokens: response.prompt_tokens,
                 completion_tokens: response.completion_tokens,
                 timings: response.timings,
+                backend_diagnostics: response.backend_diagnostics,
             }));
         }
         Err(err) => {
@@ -1548,7 +1561,7 @@ fn estimate_tokens(text: &str) -> usize {
 fn gpu_layers(mode: LlamaCppMode) -> i32 {
     match mode {
         LlamaCppMode::Cpu => 0,
-        LlamaCppMode::Cuda | LlamaCppMode::Rocm | LlamaCppMode::Vulkan => 999,
+        LlamaCppMode::Cuda | LlamaCppMode::Rocm | LlamaCppMode::Vulkan | LlamaCppMode::Metal => 999,
     }
 }
 
@@ -1557,6 +1570,7 @@ fn display_name(mode: LlamaCppMode) -> &'static str {
         LlamaCppMode::Cuda => "CUDA",
         LlamaCppMode::Rocm => "ROCm/HIP",
         LlamaCppMode::Vulkan => "Vulkan",
+        LlamaCppMode::Metal => "Metal",
         LlamaCppMode::Cpu => "CPU",
     }
 }
@@ -1566,6 +1580,7 @@ fn label(mode: LlamaCppMode) -> &'static str {
         LlamaCppMode::Cuda => "llama-server-cuda",
         LlamaCppMode::Rocm => "llama-server-rocm",
         LlamaCppMode::Vulkan => "llama-server-vulkan",
+        LlamaCppMode::Metal => "llama-server-metal",
         LlamaCppMode::Cpu => "llama-server-cpu",
     }
 }
@@ -1636,6 +1651,10 @@ mod tests {
         assert_eq!(
             managed_backend_dir(&store, LlamaCppMode::Vulkan),
             root.join("backends").join("llama-vulkan")
+        );
+        assert_eq!(
+            managed_backend_dir(&store, LlamaCppMode::Metal),
+            root.join("backends").join("llama-metal")
         );
         assert_eq!(
             managed_backend_dir(&store, LlamaCppMode::Cpu),

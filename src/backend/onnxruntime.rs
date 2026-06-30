@@ -308,6 +308,7 @@ impl OnnxRuntimeBackend {
                 decode_seconds: elapsed,
                 total_seconds: total_started.elapsed().as_secs_f64(),
             },
+            backend_diagnostics: Vec::new(),
         })
     }
 }
@@ -343,6 +344,7 @@ impl GenerationBackend for OnnxRuntimeBackend {
                         prompt_tokens: response.prompt_tokens,
                         completion_tokens: response.completion_tokens,
                         timings: response.timings,
+                        backend_diagnostics: response.backend_diagnostics,
                     }));
                 }
                 Err(err) => {

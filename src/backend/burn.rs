@@ -750,6 +750,7 @@ impl GenerationBackend for BurnBackend {
                         prompt_tokens: response.prompt_tokens,
                         completion_tokens: response.completion_tokens,
                         timings: response.timings,
+                        backend_diagnostics: response.backend_diagnostics,
                     }));
                 }
                 Err(err) => {

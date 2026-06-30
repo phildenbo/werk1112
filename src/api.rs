@@ -306,6 +306,7 @@ mod tests {
                     decode_seconds: 0.01,
                     total_seconds: 0.02,
                 },
+                backend_diagnostics: Vec::new(),
             })
         }
 
@@ -328,6 +329,7 @@ mod tests {
                         decode_seconds: 0.01,
                         total_seconds: 0.02,
                     },
+                    backend_diagnostics: Vec::new(),
                 }),
             ];
             Box::pin(tokio_stream::iter(events))

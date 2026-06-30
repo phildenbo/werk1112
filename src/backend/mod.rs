@@ -12,7 +12,7 @@ use tokio_stream::Stream;
 
 pub use burn::{BurnBackend, BurnMode, BurnProbeReport, BurnRuntimeStatus, burn_doctor_checks};
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
-pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend};
+pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend, MlxVlmBackend};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
 pub use llama_server::{
     BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, backend_doctor_checks,
@@ -41,6 +41,7 @@ pub enum BackendRuntime {
     Vllm,
     OnnxRuntime,
     Mlx,
+    MlxVlm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +67,13 @@ pub enum RuntimeId {
     LlamaServerCuda,
     LlamaServerRocm,
     LlamaServerVulkan,
+    LlamaServerMetal,
     LlamaServerCpu,
     CandleCuda,
     CandleMetal,
     CandleCpu,
     Mlx,
+    MlxVlm,
     VllmCuda,
     VllmRocm,
     OnnxRuntimeCuda,
@@ -111,7 +114,14 @@ const MLX_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
     text_generation: true,
     vision_language: true,
     embeddings: false,
-    streaming: false,
+    streaming: true,
+};
+
+const MLX_TEXT_CAPABILITIES: RuntimeCapabilities = RuntimeCapabilities {
+    text_generation: true,
+    vision_language: false,
+    embeddings: false,
+    streaming: true,
 };
 
 const GGUF_FORMATS: &[ModelFormat] = &[ModelFormat::Gguf];
@@ -124,6 +134,7 @@ const ANY_ARCH: &[&str] = &[];
 const VLLM_ARCHES: &[&str] = &[
     "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
 ];
+const MLX_VLM_ARCHES: &[&str] = &["gemma4_unified"];
 pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
         id: RuntimeId::BurnCuda,
@@ -184,6 +195,18 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         priority: 900,
         implemented: true,
         install_target: Some("llama-vulkan"),
+    },
+    RuntimeDescriptor {
+        id: RuntimeId::LlamaServerMetal,
+        runtime: BackendRuntime::LlamaServer,
+        display_name: "llama.cpp server Metal",
+        supported_formats: GGUF_FORMATS,
+        supported_architectures: ANY_ARCH,
+        accelerators: &[BackendAccelerator::Metal],
+        capabilities: TEXT_STREAMING,
+        priority: 925,
+        implemented: true,
+        install_target: Some("llama-metal"),
     },
     RuntimeDescriptor {
         id: RuntimeId::LlamaServerCpu,
@@ -294,13 +317,25 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: Some("vllm"),
     },
     RuntimeDescriptor {
+        id: RuntimeId::MlxVlm,
+        runtime: BackendRuntime::MlxVlm,
+        display_name: "MLX-VLM",
+        supported_formats: MLX_FORMATS,
+        supported_architectures: MLX_VLM_ARCHES,
+        accelerators: &[BackendAccelerator::Mlx],
+        capabilities: MLX_CAPABILITIES,
+        priority: 875,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
         id: RuntimeId::Mlx,
         runtime: BackendRuntime::Mlx,
         display_name: "MLX",
         supported_formats: MLX_FORMATS,
         supported_architectures: ANY_ARCH,
         accelerators: &[BackendAccelerator::Mlx],
-        capabilities: MLX_CAPABILITIES,
+        capabilities: MLX_TEXT_CAPABILITIES,
         priority: 850,
         implemented: true,
         install_target: None,
@@ -354,12 +389,14 @@ pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) ->
         BackendRuntime::OnnxRuntime => {
             matches!(format, ModelFormat::SafeTensors | ModelFormat::Onnx)
         }
-        BackendRuntime::Mlx => matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors),
+        BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
+            matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors)
+        }
     }
 }
 
 pub fn backend_supports_images(runtime: BackendRuntime) -> bool {
-    matches!(runtime, BackendRuntime::Mlx)
+    matches!(runtime, BackendRuntime::MlxVlm)
 }
 
 pub fn backend_supports_accelerator(
@@ -397,7 +434,9 @@ pub fn backend_supports_accelerator(
                 BackendAccelerator::Cuda | BackendAccelerator::Rocm | BackendAccelerator::Cpu
             )
         }
-        BackendRuntime::Mlx => matches!(accelerator, BackendAccelerator::Mlx),
+        BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
+            matches!(accelerator, BackendAccelerator::Mlx)
+        }
     }
 }
 
@@ -419,6 +458,7 @@ pub fn explain_backend_rejection(
                 "ONNX Runtime supports ONNX models and selected HF safetensors models with managed ONNX artifacts"
             }
             BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
+            BackendRuntime::MlxVlm => "MLX-VLM supports MLX and HF-style safetensors VLMs only",
         });
     }
     if has_images && !backend_supports_images(runtime) {
@@ -470,6 +510,7 @@ pub struct GenerateResponse {
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub timings: GenerationTimings,
+    pub backend_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -522,6 +563,7 @@ pub enum GenerateStreamEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
         timings: GenerationTimings,
+        backend_diagnostics: Vec<String>,
     },
 }
 
