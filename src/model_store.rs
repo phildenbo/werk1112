@@ -10,7 +10,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -257,6 +257,9 @@ impl ModelStore {
             bail!("model '{id}' already exists");
         }
 
+        let url = format!("https://huggingface.co/{repo}");
+        ensure_huggingface_repo_reachable(repo, &url)?;
+
         let tmp = self
             .tmp_dir()
             .join(format!("pull-{}-{}", sanitize_id(id), std::process::id()));
@@ -269,7 +272,6 @@ impl ModelStore {
             })?;
         }
 
-        let url = format!("https://huggingface.co/{repo}");
         progress(PullProgress::Started { url: url.clone() });
 
         run_git_with_progress(
@@ -693,6 +695,104 @@ fn validate_hf_repo(repo: &str) -> Result<()> {
         bail!("invalid Hugging Face repo id: {repo}");
     }
     Ok(())
+}
+
+fn ensure_huggingface_repo_reachable(repo: &str, url: &str) -> Result<()> {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["ls-remote", "--exit-code", url, "HEAD"]);
+    let output = run_command_with_timeout(&mut command, Duration::from_secs(20))
+        .context("failed to execute git; install git and git-lfs for Hugging Face pulls")?;
+
+    if output.timed_out {
+        bail!("timed out checking Hugging Face repo {url}; check your network and retry");
+    }
+    let status = output
+        .status
+        .context("git repo check exited without a status")?;
+    if !status.success() {
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        bail!("{}", hf_repo_unreachable_message(repo, url, detail));
+    }
+
+    Ok(())
+}
+
+struct TimedCommandOutput {
+    status: Option<ExitStatus>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<TimedCommandOutput> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let (stdout, stderr) = read_child_output(&mut child)?;
+            return Ok(TimedCommandOutput {
+                status: Some(status),
+                stdout,
+                stderr,
+                timed_out: false,
+            });
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child.wait().ok();
+            let (stdout, stderr) = read_child_output(&mut child)?;
+            return Ok(TimedCommandOutput {
+                status,
+                stdout,
+                stderr,
+                timed_out: true,
+            });
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn read_child_output(child: &mut std::process::Child) -> Result<(String, String)> {
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)?;
+    }
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+
+    Ok((stdout, stderr))
+}
+
+fn hf_repo_unreachable_message(repo: &str, url: &str, detail: &str) -> String {
+    let mut message = format!(
+        "Hugging Face repo not found or inaccessible: {repo} ({url}). Check the repo id and your access."
+    );
+    if let Some(rest) = repo.strip_prefix("icrosoft/") {
+        message.push_str(&format!(" Did you mean `microsoft/{rest}`?"));
+    }
+    if !detail.trim().is_empty() {
+        message.push_str(&format!(" git said: {}", detail.trim()));
+    }
+    message
 }
 
 fn run_git_with_progress<F>(
@@ -2192,6 +2292,31 @@ mod tests {
         ensure_no_lfs_pointers_remaining(&source).unwrap();
 
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn hf_repo_unreachable_message_suggests_microsoft_owner_typo() {
+        let message = hf_repo_unreachable_message(
+            "icrosoft/Phi-3-mini-4k-instruct-onnx",
+            "https://huggingface.co/icrosoft/Phi-3-mini-4k-instruct-onnx",
+            "Repository not found",
+        );
+
+        assert!(message.contains("not found or inaccessible"));
+        assert!(message.contains("microsoft/Phi-3-mini-4k-instruct-onnx"));
+        assert!(message.contains("Repository not found"));
+    }
+
+    #[test]
+    fn hf_repo_unreachable_message_keeps_generic_repos_generic() {
+        let message = hf_repo_unreachable_message(
+            "unknown/model",
+            "https://huggingface.co/unknown/model",
+            "",
+        );
+
+        assert!(message.contains("unknown/model"));
+        assert!(!message.contains("Did you mean"));
     }
 
     #[test]

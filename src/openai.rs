@@ -146,6 +146,9 @@ pub fn messages_to_prompt(messages: &[ChatMessage]) -> String {
 pub struct PromptSpec {
     pub prompt: String,
     pub stop: Vec<String>,
+    pub chat_template: &'static str,
+    pub chat_template_applied: bool,
+    pub assistant_end_token: Option<&'static str>,
 }
 
 pub fn messages_to_prompt_for_model(
@@ -159,6 +162,19 @@ pub fn messages_to_prompt_for_model(
                 uses_qwen3_non_thinking_prompt(manifest),
             ),
             stop: qwen_stop_strings(),
+            chat_template: "qwen-chatml",
+            chat_template_applied: true,
+            assistant_end_token: Some("<|im_end|>"),
+        };
+    }
+
+    if uses_phi3_chat_template(manifest) {
+        return PromptSpec {
+            prompt: messages_to_phi3_prompt(messages),
+            stop: phi3_stop_strings(),
+            chat_template: "phi3",
+            chat_template_applied: true,
+            assistant_end_token: Some("<|end|>"),
         };
     }
 
@@ -170,12 +186,18 @@ pub fn messages_to_prompt_for_model(
                 "<|system|>".to_string(),
                 "</s>".to_string(),
             ],
+            chat_template: "chatml",
+            chat_template_applied: true,
+            assistant_end_token: Some("</s>"),
         };
     }
 
     PromptSpec {
         prompt: messages_to_prompt(messages),
         stop: vec!["\nuser:".to_string()],
+        chat_template: "generic",
+        chat_template_applied: false,
+        assistant_end_token: None,
     }
 }
 
@@ -199,6 +221,10 @@ fn uses_tinyllama_chat_template(manifest: &ModelManifest) -> bool {
     manifest_text_contains(manifest, "tinyllama")
 }
 
+fn uses_phi3_chat_template(manifest: &ModelManifest) -> bool {
+    manifest_text_contains(manifest, "phi3") || manifest_text_contains(manifest, "phi-3")
+}
+
 fn manifest_text_contains(manifest: &ModelManifest, needle: &str) -> bool {
     if manifest.id.to_ascii_lowercase().contains(needle) {
         return true;
@@ -217,6 +243,17 @@ fn manifest_text_contains(manifest: &ModelManifest, needle: &str) -> bool {
     }
 }
 
+fn phi3_stop_strings() -> Vec<String> {
+    vec![
+        "<|end|>".to_string(),
+        "<|endoftext|>".to_string(),
+        "</s>".to_string(),
+        "<|user|>".to_string(),
+        "<|system|>".to_string(),
+        "<|assistant|>".to_string(),
+    ]
+}
+
 fn qwen_stop_strings() -> Vec<String> {
     vec![
         "<|im_end|>".to_string(),
@@ -228,6 +265,33 @@ fn qwen_stop_strings() -> Vec<String> {
         "\nUser:".to_string(),
         "\nAssistant:".to_string(),
     ]
+}
+
+fn messages_to_phi3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let content = message
+            .content
+            .as_ref()
+            .map(MessageContent::as_text)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        let role = match message.role.trim() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        prompt.push_str("<|");
+        prompt.push_str(role);
+        prompt.push_str("|>\n");
+        prompt.push_str(content.trim());
+        prompt.push_str("<|end|>\n");
+    }
+    prompt.push_str("<|assistant|>\n");
+    prompt
 }
 
 fn messages_to_qwen_chatml_prompt(messages: &[ChatMessage], non_thinking: bool) -> String {
@@ -462,5 +526,115 @@ mod tests {
         );
         assert!(prompt.stop.contains(&"<|im_end|>".to_string()));
         assert!(prompt.stop.contains(&"\nHuman:".to_string()));
+    }
+
+    #[test]
+    fn phi3_uses_expected_chat_template_and_assistant_turn_end() {
+        let manifest = ModelManifest {
+            id: "microsoft/Phi-3-mini-4k-instruct-onnx".to_string(),
+            source: ModelSource::HuggingFace {
+                repo: "microsoft/Phi-3-mini-4k-instruct-onnx".to_string(),
+            },
+            format: ModelFormat::Onnx,
+            architecture: Some("phi3".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("files/model.onnx".to_string()),
+            backend: "onnxruntime".to_string(),
+            created_unix: 1,
+            files: Vec::<ModelFile>::new(),
+            artifacts: Vec::new(),
+        };
+        let prompt = messages_to_prompt_for_model(
+            &manifest,
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text(
+                        "write a sentence about Rust.".to_string(),
+                    )),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Text(
+                        "Rust is a systems programming language.".to_string(),
+                    )),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text(
+                        "write a sentence about Rust.".to_string(),
+                    )),
+                    name: None,
+                },
+            ],
+        );
+
+        assert!(prompt.chat_template_applied);
+        assert_eq!(prompt.chat_template, "phi3");
+        assert_eq!(prompt.assistant_end_token, Some("<|end|>"));
+        assert!(
+            prompt.prompt.contains(
+                "<|assistant|>\nRust is a systems programming language.<|end|>\n<|user|>"
+            )
+        );
+        assert!(prompt.prompt.ends_with("<|assistant|>\n"));
+        assert_eq!(prompt.prompt.matches("<|user|>").count(), 2);
+        assert_eq!(prompt.prompt.matches("<|assistant|>").count(), 2);
+        assert!(prompt.stop.contains(&"<|end|>".to_string()));
+        assert!(prompt.stop.contains(&"<|endoftext|>".to_string()));
+    }
+
+    #[test]
+    fn phi3_repeated_short_prompt_history_keeps_turns_separate() {
+        let manifest = ModelManifest {
+            id: "Phi3".to_string(),
+            source: ModelSource::LocalPath {
+                path: "phi3".to_string(),
+            },
+            format: ModelFormat::Onnx,
+            architecture: Some("phi3".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: Some("files/model.onnx".to_string()),
+            backend: "onnxruntime".to_string(),
+            created_unix: 1,
+            files: Vec::<ModelFile>::new(),
+            artifacts: Vec::new(),
+        };
+        let prompt = messages_to_prompt_for_model(
+            &manifest,
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text("Say one fact.".to_string())),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Text("Rust has ownership.".to_string())),
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MessageContent::Text("Say one fact.".to_string())),
+                    name: None,
+                },
+            ],
+        );
+
+        assert!(
+            prompt
+                .prompt
+                .contains("Rust has ownership.<|end|>\n<|user|>")
+        );
+        assert!(
+            !prompt
+                .prompt
+                .contains("assistant: Rust has ownership.\nuser:")
+        );
+        assert!(prompt.prompt.ends_with("<|assistant|>\n"));
     }
 }

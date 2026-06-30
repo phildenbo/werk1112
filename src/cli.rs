@@ -37,12 +37,14 @@ use crate::{
     model_store::{
         ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelStore, PullProgress,
     },
-    openai::{ChatMessage, MessageContent, messages_to_prompt_for_model},
+    openai::{ChatMessage, MessageContent, PromptSpec, messages_to_prompt_for_model},
     runtime_planner::{
         RequestCapabilities, RequestedBackend, RuntimeAvailability, RuntimeDecisionStatus,
         plan_runtime, runtime_candidate_ids, select_runtime,
     },
 };
+
+const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -350,7 +352,7 @@ pub enum Commands {
         #[arg(required = true, num_args = 1.., help = "Prompt text")]
         prompt: Vec<String>,
 
-        #[arg(long, default_value_t = 128, help = "Maximum generated tokens")]
+        #[arg(long, default_value_t = DEFAULT_MAX_NEW_TOKENS, help = "Maximum generated tokens")]
         max_tokens: usize,
 
         #[arg(long, help = "Sampling temperature")]
@@ -383,7 +385,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            default_value_t = 2048,
+            default_value_t = DEFAULT_MAX_NEW_TOKENS,
             help = "Maximum generated tokens per turn"
         )]
         max_tokens: usize,
@@ -396,6 +398,13 @@ pub enum Commands {
 
         #[arg(long, help = "RNG seed")]
         seed: Option<u64>,
+
+        #[arg(
+            long = "no-history",
+            alias = "single-turn",
+            help = "Do not include previous chat turns in the next prompt"
+        )]
+        no_history: bool,
 
         #[arg(
             long = "image",
@@ -698,6 +707,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 name: None,
             }];
             let prompt = messages_to_prompt_for_model(&manifest, &messages);
+            let prompt_diagnostics = prompt_diagnostics(&prompt, messages.len(), None);
             let request = GenerateRequest {
                 prompt: prompt.prompt,
                 messages,
@@ -726,8 +736,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     Some(verbose_backend_label(selected_backend)),
                     response.prompt_tokens,
                     response.completion_tokens,
+                    &response.finish_reason,
                     response.timings,
-                    &response.backend_diagnostics,
+                    &merged_diagnostics(&prompt_diagnostics, &response.backend_diagnostics),
                 )?;
             }
             Ok(())
@@ -738,6 +749,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             temperature,
             top_p,
             seed,
+            no_history,
             images,
             stream_granularity,
             verbose,
@@ -786,6 +798,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 temperature,
                 top_p,
                 seed,
+                !no_history,
                 images,
                 stream_granularity.into(),
                 verbose,
@@ -1610,6 +1623,7 @@ async fn chat_loop(
     temperature: Option<f64>,
     top_p: Option<f64>,
     seed: Option<u64>,
+    history_enabled: bool,
     images: Vec<String>,
     stream_granularity: StreamGranularity,
     verbose: bool,
@@ -1639,16 +1653,20 @@ async fn chat_loop(
             break;
         }
 
-        messages.push(ChatMessage {
+        let user_message = ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Text(input.to_string())),
             name: None,
-        });
+        };
 
-        let prompt = messages_to_prompt_for_model(&manifest, &messages);
+        let request_messages =
+            request_messages_for_turn(&mut messages, user_message, history_enabled);
+        let prompt = messages_to_prompt_for_model(&manifest, &request_messages);
+        let prompt_diagnostics =
+            prompt_diagnostics(&prompt, request_messages.len(), Some(history_enabled));
         let request = GenerateRequest {
             prompt: prompt.prompt,
-            messages: messages.clone(),
+            messages: request_messages,
             image_urls: images.clone(),
             max_tokens,
             temperature,
@@ -1715,7 +1733,8 @@ async fn chat_loop(
                     prompt_tokens = tokens_in;
                     completion_tokens = tokens;
                     timings = Some(response_timings);
-                    backend_diagnostics = response_backend_diagnostics;
+                    backend_diagnostics = prompt_diagnostics.clone();
+                    backend_diagnostics.extend(response_backend_diagnostics);
                     pending_spinner.clear()?;
                     break;
                 }
@@ -1728,7 +1747,9 @@ async fn chat_loop(
         }
         io::stdout().flush()?;
         println!();
-        if finish_reason == "length" && !assistant.trim().is_empty() {
+        if matches!(finish_reason.as_str(), "length" | "max_new_tokens")
+            && !assistant.trim().is_empty()
+        {
             println!(
                 "note: response reached --max-tokens ({max_tokens}) and may be incomplete; rerun with a larger --max-tokens value for more."
             );
@@ -1741,12 +1762,13 @@ async fn chat_loop(
                 Some(backend_name),
                 prompt_tokens,
                 completion_tokens,
+                &finish_reason,
                 timings,
                 &backend_diagnostics,
             )?;
         }
 
-        if !assistant.trim().is_empty() {
+        if history_enabled && !assistant.trim().is_empty() {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(assistant)),
@@ -1756,6 +1778,54 @@ async fn chat_loop(
     }
 
     Ok(())
+}
+
+fn request_messages_for_turn(
+    history: &mut Vec<ChatMessage>,
+    user_message: ChatMessage,
+    history_enabled: bool,
+) -> Vec<ChatMessage> {
+    if history_enabled {
+        history.push(user_message);
+        history.clone()
+    } else {
+        vec![user_message]
+    }
+}
+
+fn prompt_diagnostics(
+    prompt: &PromptSpec,
+    message_count: usize,
+    history_enabled: Option<bool>,
+) -> Vec<String> {
+    let mut diagnostics = vec![
+        format!("history messages: {message_count}"),
+        format!(
+            "chat template applied: {}",
+            if prompt.chat_template_applied {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("chat template: {}", prompt.chat_template),
+    ];
+    if let Some(token) = prompt.assistant_end_token {
+        diagnostics.push(format!("assistant end token: {token}"));
+    }
+    if let Some(history_enabled) = history_enabled {
+        diagnostics.push(format!(
+            "history enabled: {}",
+            if history_enabled { "yes" } else { "no" }
+        ));
+    }
+    diagnostics
+}
+
+fn merged_diagnostics(first: &[String], second: &[String]) -> Vec<String> {
+    let mut merged = first.to_vec();
+    merged.extend_from_slice(second);
+    merged
 }
 
 fn prepare_backend_for_chat(
@@ -2438,6 +2508,7 @@ fn write_verbose_stats<W: Write>(
     backend: Option<&str>,
     prompt_tokens: usize,
     completion_tokens: usize,
+    finish_reason: &str,
     timings: GenerationTimings,
     backend_diagnostics: &[String],
 ) -> io::Result<()> {
@@ -2473,14 +2544,18 @@ fn write_verbose_stats<W: Write>(
         writer,
         "{:<22}{}",
         "prompt eval duration:",
-        format_duration(timings.prompt_seconds)
+        format_optional_duration(timings.prompt_seconds)
     )?;
-    writeln!(
-        writer,
-        "{:<22}{:.2} tokens/s",
-        "prompt eval rate:",
-        rate(prompt_tokens, timings.prompt_seconds)
-    )?;
+    if timings.prompt_seconds.is_finite() {
+        writeln!(
+            writer,
+            "{:<22}{:.2} tokens/s",
+            "prompt eval rate:",
+            rate(prompt_tokens, timings.prompt_seconds)
+        )?;
+    } else {
+        writeln!(writer, "{:<22}N/A", "prompt eval rate:")?;
+    }
     writeln!(
         writer,
         "{:<22}{} token(s)",
@@ -2506,6 +2581,9 @@ fn write_verbose_stats<W: Write>(
         "eval rate:",
         rate(completion_tokens, timings.decode_seconds)
     )?;
+    if !finish_reason.is_empty() {
+        writeln!(writer, "{:<22}{}", "finish reason:", finish_reason)?;
+    }
     if !backend_diagnostics.is_empty() {
         writeln!(writer)?;
         writeln!(writer, "backend stats:")?;
@@ -2517,10 +2595,18 @@ fn write_verbose_stats<W: Write>(
 }
 
 fn rate(tokens: usize, seconds: f64) -> f64 {
-    if seconds <= 0.0 {
+    if !seconds.is_finite() || seconds <= 0.0 {
         0.0
     } else {
         tokens as f64 / seconds
+    }
+}
+
+fn format_optional_duration(seconds: f64) -> String {
+    if seconds.is_finite() {
+        format_duration(seconds)
+    } else {
+        "N/A".to_string()
     }
 }
 
@@ -4322,15 +4408,24 @@ mod tests {
             Commands::Run {
                 model,
                 prompt,
+                max_tokens,
                 images,
                 debug,
                 ..
             } => {
                 assert_eq!(model, "gemma-2b-it");
                 assert_eq!(prompt, vec!["hello"]);
+                assert_eq!(max_tokens, DEFAULT_MAX_NEW_TOKENS);
                 assert_eq!(images, vec!["image.png"]);
                 assert!(debug);
             }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["werk", "run", "tiny", "hello", "--max-tokens", "42"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { max_tokens, .. } => assert_eq!(max_tokens, 42),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -4422,7 +4517,24 @@ mod tests {
         let cli = Cli::try_parse_from(["werk", "--backend", "vllm", "chat", "tiny"]).unwrap();
         assert_eq!(cli.backend, BackendArg::Vllm);
         match cli.command.unwrap() {
-            Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
+            Commands::Chat {
+                model, max_tokens, ..
+            } => {
+                assert_eq!(model, "tiny");
+                assert_eq!(max_tokens, DEFAULT_MAX_NEW_TOKENS);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--max-tokens", "64"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Chat { max_tokens, .. } => assert_eq!(max_tokens, 64),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--single-turn"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Chat { no_history, .. } => assert!(no_history),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -5259,6 +5371,7 @@ mod tests {
             temperature: None,
             top_p: None,
             seed: None,
+            no_history: false,
             images: Vec::new(),
             stream_granularity: StreamGranularityArg::Token,
             verbose: false,
@@ -5295,6 +5408,99 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn verbose_stats_report_stop_reason_and_unknown_prompt_eval() {
+        let mut output = Vec::new();
+        write_verbose_stats(
+            &mut output,
+            Some("ONNX Runtime CPU"),
+            12,
+            24,
+            "stop_sequence",
+            GenerationTimings {
+                load_seconds: 0.25,
+                warmup_seconds: 0.0,
+                first_token_seconds: 0.5,
+                prompt_seconds: f64::NAN,
+                decode_seconds: 1.0,
+                total_seconds: 1.25,
+            },
+            &["effective max new tokens: 256".to_string()],
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("prompt eval duration: N/A"));
+        assert!(output.contains("prompt eval rate:"));
+        assert!(output.contains("N/A"));
+        assert!(output.contains("finish reason:"));
+        assert!(output.contains("stop_sequence"));
+        assert!(output.contains("effective max new tokens: 256"));
+    }
+
+    #[test]
+    fn chat_request_messages_keep_history_by_default() {
+        let mut history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("first".to_string())),
+            name: None,
+        }];
+        let request_messages = request_messages_for_turn(
+            &mut history,
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("second".to_string())),
+                name: None,
+            },
+            true,
+        );
+
+        assert_eq!(request_messages.len(), 2);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            request_messages[1]
+                .content
+                .as_ref()
+                .map(MessageContent::as_text),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn single_turn_request_messages_only_include_current_user_message() {
+        let mut history = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("first".to_string())),
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Text("answer".to_string())),
+                name: None,
+            },
+        ];
+        let request_messages = request_messages_for_turn(
+            &mut history,
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("second".to_string())),
+                name: None,
+            },
+            false,
+        );
+
+        assert_eq!(request_messages.len(), 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            request_messages[0]
+                .content
+                .as_ref()
+                .map(MessageContent::as_text),
+            Some("second".to_string())
+        );
     }
 
     fn test_store(name: &str) -> ModelStore {
