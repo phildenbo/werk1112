@@ -159,11 +159,13 @@ werk import /path/to/model-dir --name local-model
 werk pull org/model-repo --name hf-model
 ```
 
-For gated Hugging Face models, accept the model conditions on Hugging Face first, then run `werk auth huggingface login` or set `HF_TOKEN` before pulling.
+For gated Hugging Face models, accept the model conditions on Hugging Face first, then run `werk auth huggingface login` or set `HF_TOKEN` before pulling or remote-estimating.
 
 Run one prompt or start an interactive terminal chat:
 
 ```bash
+werk estimate local-model
+werk estimate org/model-repo
 werk run local-model "Write one sentence about Rust."
 werk chat local-model
 ```
@@ -184,7 +186,7 @@ http://127.0.0.1:11434/v1
 
 | Format | Typical Use | Import/List/Inspect | Backend Status |
 | --- | --- | --- | --- |
-| Safetensors | Hugging Face training/fine-tuning standard | Yes | vLLM CUDA for supported architectures; vLLM ROCm through `--backend rocm`; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected |
+| Safetensors | Hugging Face training/fine-tuning standard | Yes | vLLM CUDA for supported architectures; vLLM ROCm through `--backend rocm`; Transformers compatibility for raw ChatGLM/GLM repos; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected |
 | GGUF | llama.cpp, Ollama, LM Studio, CPU inference | Yes | CUDA/ROCm/Vulkan/CPU through persistent llama.cpp server; Candle is legacy/fallback only |
 | PyTorch (`.pt`, `.pth`, `pytorch_model.bin`) | Training, research, checkpoints | Yes | Catalog/import only; no generation backend yet |
 | ONNX (`.onnx`) | Framework-independent inference | Yes | ONNX Runtime CUDA/ROCm/CPU when a runner is available |
@@ -204,12 +206,13 @@ Werk routes by requested backend, model format, model architecture, input capabi
 | vLLM | Selected HF safetensors | CUDA, ROCm through `--backend rocm` | Backend-dependent | Preferred route for supported HF safetensors architectures |
 | ONNX Runtime | Managed ONNX artifacts/direct ONNX when selected | CUDA, ROCm, CPU | No | Explicit opt-in route |
 | Candle | GGUF legacy, safetensors | CUDA, Metal, CPU | No | Implemented for selected architectures |
+| Transformers compatibility | Raw ChatGLM/GLM safetensors | PyTorch-selected device (`cuda`, `mps`, or `cpu`) | No | Uses local Hugging Face custom code with `trust_remote_code=True` |
 | MLX | MLX dirs, selected HF safetensors | Apple Silicon / MLX | Backend-dependent | Implemented through `mlx-lm` when configured |
 
 Planner policy:
 
 - GGUF routes to llama.cpp server CUDA, optional ROCm/HIP when detected for auto, Vulkan, or CPU first. Candle GGUF is legacy fallback/debug only.
-- Safetensors routing is format-based: auto/CUDA prefer vLLM CUDA for supported architectures, then Candle compatibility fallback. Auto may use Candle CPU only after preferred GPU runtimes reject.
+- Safetensors routing is format-based: raw ChatGLM/GLM repositories use the Transformers compatibility route; otherwise auto/CUDA prefer vLLM CUDA for supported architectures, then Candle compatibility fallback. Auto may use Candle CPU only after preferred GPU runtimes reject.
 - `--backend vllm` is a strict vLLM-only safetensors route with the existing default vLLM accelerator behavior. ROCm-specific vLLM is selected through `--backend rocm`, and the probe requires a ROCm/HIP-capable PyTorch stack or an explicitly marked ROCm remote endpoint.
 - `--backend cpu` is CPU-only, `--backend cuda` is CUDA-only, `--backend rocm` is ROCm-only, `--backend vulkan` is Vulkan-only, and `--backend candle` is an explicit Candle route.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
@@ -461,15 +464,16 @@ werk --backend rocm chat Qwen3-14B
 werk --backend metal chat gemma-2b-it
 werk --backend vulkan chat TinyLLama-1B-GGUF
 werk --backend mlx chat mlx-model
+werk --backend transformers chat THUDM/glm-4-9b-chat
 werk --backend candle chat debug-model
 werk --backend onnx chat phi-3-mini-4k-instruct
 werk --backend vllm chat phi-3-mini-4k-instruct
 werk --backend cuda serve --model gemma-2b-it
 ```
 
-`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, includes ROCm/HIP only when a ROCm-specific signal or managed ROCm server is present, then Vulkan, CPU, and Candle legacy GPU/CPU fallback. For safetensors it tries vLLM for supported CUDA architectures, then Candle CUDA, then Candle CPU as an auto-only fallback. Normal chat/run output skips noisy unavailable runtime diagnostics; use `--debug` or `werk backend doctor --debug` for attempted runtimes and probe rejection reasons. On Apple Silicon it prefers MLX for MLX models and may use MLX or Candle for safetensors depending on availability.
+`--backend auto` is format-aware. For GGUF on Windows/Linux it tries llama.cpp server CUDA, includes ROCm/HIP only when a ROCm-specific signal or managed ROCm server is present, then Vulkan, CPU, and Candle legacy GPU/CPU fallback. For raw ChatGLM/GLM safetensors, it uses the Transformers compatibility route so model-provided Hugging Face code and chat templates can run. For other safetensors it tries vLLM for supported CUDA architectures, then Candle CUDA, then Candle CPU as an auto-only fallback. Normal chat/run output skips noisy unavailable runtime diagnostics; use `--debug` or `werk backend doctor --debug` for attempted runtimes and probe rejection reasons. On Apple Silicon it prefers MLX for MLX models and may use MLX or Candle for safetensors depending on availability.
 
-For GGUF models, `--backend cuda`, `--backend rocm`, `--backend vulkan`, and `--backend cpu` use the matching persistent llama.cpp server backend when that server is available. For safetensors models, CUDA tries vLLM CUDA for supported architectures and then Candle CUDA; ROCm tries only vLLM ROCm and verifies the discovered vLLM environment is ROCm/HIP-capable. CPU uses Candle CPU. `--backend onnx` is strict ONNX Runtime only: it never falls back to Candle and fails with actionable diagnostics if no runner is installed. `--backend vllm` remains a strict vLLM-only route with the existing default vLLM accelerator behavior and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
+For GGUF models, `--backend cuda`, `--backend rocm`, `--backend vulkan`, and `--backend cpu` use the matching persistent llama.cpp server backend when that server is available. For safetensors models, CUDA tries vLLM CUDA for supported architectures and then Candle CUDA; ROCm tries only vLLM ROCm and verifies the discovered vLLM environment is ROCm/HIP-capable. CPU uses Candle CPU unless the model needs the raw ChatGLM/GLM compatibility route. `--backend transformers` explicitly selects the compatibility route and requires a Python environment with `torch`, `transformers`, and usually `accelerate`; set `WERK_TRANSFORMERS_PYTHON`, `WERK_TRANSFORMERS_DEVICE`, or `WERK_TRANSFORMERS_DTYPE` to override discovery. `--backend onnx` is strict ONNX Runtime only: it never falls back to Candle and fails with actionable diagnostics if no runner is installed. `--backend vllm` remains a strict vLLM-only route with the existing default vLLM accelerator behavior and fails clearly if vLLM is missing, broken, or cannot load the model. Explicit GPU backend requests do not silently fall back to CPU; they fail with an actionable error if the requested runtime is unavailable. `--backend candle` is available for debugging or fallback verification. `--device` remains as a Candle-only compatibility override, but `--backend` is what end users should use.
 
 ## Packaging Release Artifacts
 
@@ -635,6 +639,28 @@ Inspect a model manifest:
 ```bash
 werk inspect llama-local
 ```
+
+Estimate whether a model is likely to fit in memory before starting inference:
+
+```bash
+werk estimate llama-local
+werk estimate llama-local --verbose
+werk estimate llama-local --json
+werk estimate org/model-repo
+werk estimate org/model-repo --file model.Q4_K_M.gguf --verbose
+```
+
+`estimate` first checks the managed Werk store. If the model is installed, it resolves the local manifest, counts likely model weight files, parses `config.json` when available for a KV-cache estimate, applies a small runtime overhead heuristic, and compares the result with best-effort system memory detection.
+
+If the model is not installed and the argument looks like a Hugging Face repo id, `estimate` queries Hugging Face repository metadata and small JSON files such as `config.json` or `*.safetensors.index.json`, but it does not download model weights into the Werk store. Use it before `werk pull` when you want to compare model size, selected GGUF quantization, estimated KV cache, and backend hint against your machine. Use `--file` for GGUF repos with many quantizations.
+
+For gated repositories, remote `estimate` needs the same access as `werk pull`: accept the model conditions in your browser, then run `werk auth huggingface login` or set `HF_TOKEN`. Werk cannot accept model conditions for you through the Hugging Face API.
+
+Remote estimates are metadata-based. They are useful for memory planning, but backend compatibility can still depend on the actual model format. For example, raw Hugging Face GLM/ChatGLM repositories may need an MLX-converted model or a GGUF build even when the memory estimate looks feasible.
+
+The estimate includes a confidence level. `HIGH` means the selected weights were clear and KV cache could be computed from model dimensions. `MEDIUM` means Werk had enough information for a reasonable estimate but used partial defaults. `LOW` means the model files or KV-cache shape were ambiguous and the result is intentionally conservative.
+
+Use `--verbose` with either estimator to see the selected model file(s), counted weight files, ignored metadata/tokenizer files, and total counted weight bytes. If `<WERK_HOME>/benchmarks/estimate-observations.json` contains a previous measured peak-memory observation for an installed model, `estimate` displays that as `Measured peak`. JSON output includes the same accounting fields, confidence, whether config data was used, notes, source URL when known, and nullable measured peak memory.
 
 Switch an already-installed model to another tracked model file:
 

@@ -3,7 +3,8 @@ use std::{collections::HashMap, fmt};
 use crate::{
     backend::{
         BackendAccelerator, BackendRuntime, RuntimeId, backend_supports_images,
-        explain_backend_rejection, runtime_descriptor, runtime_supports_model,
+        explain_backend_rejection, is_transformers_compat_model, runtime_descriptor,
+        runtime_supports_model,
     },
     model_store::{ModelFormat, ModelManifest},
 };
@@ -19,6 +20,7 @@ pub enum RequestedBackend {
     Mlx,
     Burn,
     Candle,
+    Transformers,
     Vllm,
     LlamaLegacy,
     LlamaHighlevel,
@@ -216,6 +218,7 @@ pub fn runtime_candidate_ids(
         RequestedBackend::Mlx => vec![RuntimeId::MlxVlm, RuntimeId::Mlx],
         RequestedBackend::Burn => burn_candidates(),
         RequestedBackend::Candle => candle_candidates(manifest),
+        RequestedBackend::Transformers => vec![RuntimeId::TransformersCompat],
         RequestedBackend::Vllm => vec![RuntimeId::VllmCuda],
         RequestedBackend::LlamaLegacy | RequestedBackend::LlamaHighlevel => Vec::new(),
     }
@@ -313,6 +316,9 @@ fn gguf_auto_candidates() -> Vec<RuntimeId> {
 }
 
 fn safetensors_auto_candidates(manifest: &ModelManifest) -> Vec<RuntimeId> {
+    if is_transformers_compat_model(manifest) {
+        return vec![RuntimeId::TransformersCompat];
+    }
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         vec![
             RuntimeId::MlxVlm,
@@ -518,6 +524,9 @@ fn model_support_rejection(manifest: &ModelManifest, runtime: BackendRuntime) ->
         (BackendRuntime::MlxVlm, ModelFormat::Mlx | ModelFormat::SafeTensors) => {
             "MLX-VLM is selected for supported VLM architectures".to_string()
         }
+        (BackendRuntime::TransformersCompat, ModelFormat::SafeTensors) => {
+            "Transformers compatibility is selected for raw ChatGLM/GLM repositories".to_string()
+        }
         _ => "model format or architecture is not supported".to_string(),
     }
 }
@@ -541,6 +550,9 @@ fn selection_reason(
         }
         (ModelFormat::SafeTensors, BackendRuntime::Burn, _) => {
             "HF safetensors hot path uses Burn".to_string()
+        }
+        (ModelFormat::SafeTensors, BackendRuntime::TransformersCompat, _) => {
+            "raw ChatGLM/GLM compatibility route uses Transformers trust_remote_code".to_string()
         }
         (ModelFormat::SafeTensors, BackendRuntime::Vllm, RequestedBackend::Vllm) => {
             "explicit vLLM route requested".to_string()
@@ -567,6 +579,9 @@ fn selection_reason(
         (_, _, RequestedBackend::Rocm) => "best ROCm runtime for this model".to_string(),
         (_, _, RequestedBackend::Vulkan) => "best Vulkan runtime for this model".to_string(),
         (_, _, RequestedBackend::Metal) => "best Metal runtime for this model".to_string(),
+        (_, _, RequestedBackend::Transformers) => {
+            "explicit Transformers compatibility route requested".to_string()
+        }
         _ => "best available runtime for this model".to_string(),
     }
 }
@@ -658,6 +673,14 @@ mod tests {
         }
         assert!(!candidates.contains(&RuntimeId::BurnCuda));
         assert!(!candidates.contains(&RuntimeId::BurnCpu));
+    }
+
+    #[test]
+    fn chatglm_safetensors_auto_uses_transformers_compatibility_route() {
+        let chatglm = manifest(ModelFormat::SafeTensors, Some("chatglm"));
+        let candidates = runtime_candidate_ids(&chatglm, RequestedBackend::Auto);
+
+        assert_eq!(candidates, vec![RuntimeId::TransformersCompat]);
     }
 
     #[test]

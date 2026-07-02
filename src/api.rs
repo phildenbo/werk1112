@@ -21,16 +21,23 @@ use crate::{
     model_store::{ModelManifest, ModelStore, unix_ts},
     openai::{
         AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ErrorObject, ErrorResponse, ModelListResponse, ModelObject, Usage,
-        image_urls_from_messages, messages_to_prompt_for_model,
+        ChatTemplateOptions, ErrorObject, ErrorResponse, ModelListResponse, ModelObject, Usage,
+        image_urls_from_messages, messages_to_prompt_for_model_with_template,
     },
 };
+
+pub type PromptOptionsResolver = Arc<
+    dyn Fn(&ModelStore, &ModelManifest, bool) -> anyhow::Result<ChatTemplateOptions<'static>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<ModelStore>,
     backend: Arc<dyn GenerationBackend>,
     default_model: Option<String>,
+    prompt_options_resolver: Option<PromptOptionsResolver>,
 }
 
 impl ApiState {
@@ -43,11 +50,32 @@ impl ApiState {
         backend: Arc<dyn GenerationBackend>,
         default_model: Option<String>,
     ) -> Self {
+        Self::new_with_default_model_and_prompt_options(store, backend, default_model, None)
+    }
+
+    pub fn new_with_default_model_and_prompt_options(
+        store: ModelStore,
+        backend: Arc<dyn GenerationBackend>,
+        default_model: Option<String>,
+        prompt_options_resolver: Option<PromptOptionsResolver>,
+    ) -> Self {
         Self {
             store: Arc::new(store),
             backend,
             default_model,
+            prompt_options_resolver,
         }
+    }
+
+    fn prompt_options(
+        &self,
+        manifest: &ModelManifest,
+        has_images: bool,
+    ) -> anyhow::Result<ChatTemplateOptions<'static>> {
+        self.prompt_options_resolver
+            .as_ref()
+            .map(|resolver| resolver(&self.store, manifest, has_images))
+            .unwrap_or_else(|| Ok(ChatTemplateOptions::default()))
     }
 }
 
@@ -113,8 +141,13 @@ async fn chat_completions_handler(
         }
     };
 
-    let prompt = messages_to_prompt_for_model(&manifest, &request.messages);
     let image_urls = image_urls_from_messages(&request.messages);
+    let prompt_options = match state.prompt_options(&manifest, !image_urls.is_empty()) {
+        Ok(options) => options,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string(), None),
+    };
+    let prompt =
+        messages_to_prompt_for_model_with_template(&manifest, &request.messages, prompt_options);
     let max_tokens = request.max_completion_tokens();
     let mut stop = prompt.stop;
     stop.extend(request.stop_strings());
@@ -279,6 +312,7 @@ mod tests {
     use crate::{
         backend::{GenerateStream, GenerateStreamEvent, GenerationTimings},
         model_store::{ModelFormat, ModelSource},
+        openai::ChatTemplateSource,
     };
     use axum::{body, body::Body, http::Request};
     use std::fs;
@@ -320,6 +354,58 @@ mod tests {
                 Ok(GenerateStreamEvent::Done {
                     finish_reason: "stop".to_string(),
                     prompt_tokens: 2,
+                    completion_tokens: 1,
+                    timings: GenerationTimings {
+                        load_seconds: 0.0,
+                        warmup_seconds: 0.0,
+                        first_token_seconds: 0.0,
+                        prompt_seconds: 0.01,
+                        decode_seconds: 0.01,
+                        total_seconds: 0.02,
+                    },
+                    backend_diagnostics: Vec::new(),
+                }),
+            ];
+            Box::pin(tokio_stream::iter(events))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PromptEchoBackend;
+
+    impl GenerationBackend for PromptEchoBackend {
+        fn generate(
+            &self,
+            _manifest: &ModelManifest,
+            request: GenerateRequest,
+        ) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                text: request.prompt,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop".to_string(),
+                timings: GenerationTimings {
+                    load_seconds: 0.0,
+                    warmup_seconds: 0.0,
+                    first_token_seconds: 0.0,
+                    prompt_seconds: 0.01,
+                    decode_seconds: 0.01,
+                    total_seconds: 0.02,
+                },
+                backend_diagnostics: Vec::new(),
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            _manifest: ModelManifest,
+            request: GenerateRequest,
+        ) -> GenerateStream {
+            let events = vec![
+                Ok(GenerateStreamEvent::TextChunk(request.prompt)),
+                Ok(GenerateStreamEvent::Done {
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 1,
                     completion_tokens: 1,
                     timings: GenerationTimings {
                         load_seconds: 0.0,
@@ -474,6 +560,69 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["model"], "mock");
+    }
+
+    #[tokio::test]
+    async fn chat_route_uses_prompt_options_resolver_before_generation() {
+        let store = test_store();
+        let manifest = ModelManifest {
+            id: "mock".to_string(),
+            source: ModelSource::LocalPath {
+                path: "test".to_string(),
+            },
+            format: ModelFormat::SafeTensors,
+            architecture: Some("starcoder2".to_string()),
+            tokenizer_path: None,
+            config_path: None,
+            model_path: None,
+            backend: "onnxruntime".to_string(),
+            created_unix: 1,
+            files: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        fs::create_dir_all(store.model_dir("mock")).unwrap();
+        fs::write(
+            store
+                .model_dir("mock")
+                .join(crate::model_store::MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resolver: PromptOptionsResolver = Arc::new(|_, _, _| {
+            Ok(ChatTemplateOptions {
+                default_source: ChatTemplateSource::Model,
+                model_template_preferred: true,
+                override_name: None,
+            })
+        });
+        let app = router(ApiState::new_with_default_model_and_prompt_options(
+            store,
+            Arc::new(PromptEchoBackend),
+            None,
+            Some(resolver),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"mock","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "hi");
     }
 
     fn test_store() -> ModelStore {

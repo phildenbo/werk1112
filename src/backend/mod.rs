@@ -12,7 +12,10 @@ use tokio_stream::Stream;
 
 pub use burn::{BurnBackend, BurnMode, BurnProbeReport, BurnRuntimeStatus, burn_doctor_checks};
 pub use candle::{CandleBackend, CandleDeviceMode, probe_device};
-pub use external::{LlamaCppBackend, LlamaCppMode, MlxBackend, MlxVlmBackend};
+pub use external::{
+    LlamaCppBackend, LlamaCppMode, MlxBackend, MlxVlmBackend, TransformersCompatBackend,
+    is_transformers_compat_model,
+};
 pub use llama_fast::{LlamaFastBackend, LlamaFastRuntimeReport};
 pub use llama_server::{
     BackendDoctorCheck, LlamaServerBackend, LlamaServerDiscovery, backend_doctor_checks,
@@ -38,6 +41,7 @@ pub enum BackendRuntime {
     LlamaServer,
     LlamaLegacy,
     LlamaHighlevel,
+    TransformersCompat,
     Vllm,
     OnnxRuntime,
     Mlx,
@@ -72,6 +76,7 @@ pub enum RuntimeId {
     CandleCuda,
     CandleMetal,
     CandleCpu,
+    TransformersCompat,
     Mlx,
     MlxVlm,
     VllmCuda,
@@ -134,6 +139,7 @@ const ANY_ARCH: &[&str] = &[];
 const VLLM_ARCHES: &[&str] = &[
     "llama", "qwen2", "qwen3", "mistral", "mixtral", "phi3", "gemma", "gemma2", "gemma3",
 ];
+const TRANSFORMERS_COMPAT_ARCHES: &[&str] = &["chatglm"];
 const MLX_VLM_ARCHES: &[&str] = &["gemma4_unified"];
 pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
     RuntimeDescriptor {
@@ -293,6 +299,18 @@ pub const RUNTIME_REGISTRY: &[RuntimeDescriptor] = &[
         install_target: None,
     },
     RuntimeDescriptor {
+        id: RuntimeId::TransformersCompat,
+        runtime: BackendRuntime::TransformersCompat,
+        display_name: "Transformers compatibility",
+        supported_formats: SAFETENSORS_FORMATS,
+        supported_architectures: TRANSFORMERS_COMPAT_ARCHES,
+        accelerators: &[BackendAccelerator::Auto],
+        capabilities: TEXT_STREAMING,
+        priority: 840,
+        implemented: true,
+        install_target: None,
+    },
+    RuntimeDescriptor {
         id: RuntimeId::VllmCuda,
         runtime: BackendRuntime::Vllm,
         display_name: "vLLM CUDA",
@@ -389,6 +407,7 @@ pub fn backend_supports_format(runtime: BackendRuntime, format: &ModelFormat) ->
         BackendRuntime::OnnxRuntime => {
             matches!(format, ModelFormat::SafeTensors | ModelFormat::Onnx)
         }
+        BackendRuntime::TransformersCompat => matches!(format, ModelFormat::SafeTensors),
         BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
             matches!(format, ModelFormat::Mlx | ModelFormat::SafeTensors)
         }
@@ -434,6 +453,13 @@ pub fn backend_supports_accelerator(
                 BackendAccelerator::Cuda | BackendAccelerator::Rocm | BackendAccelerator::Cpu
             )
         }
+        BackendRuntime::TransformersCompat => matches!(
+            accelerator,
+            BackendAccelerator::Auto
+                | BackendAccelerator::Cpu
+                | BackendAccelerator::Cuda
+                | BackendAccelerator::Metal
+        ),
         BackendRuntime::Mlx | BackendRuntime::MlxVlm => {
             matches!(accelerator, BackendAccelerator::Mlx)
         }
@@ -456,6 +482,9 @@ pub fn explain_backend_rejection(
             BackendRuntime::Vllm => "vLLM supports selected HF safetensors models only",
             BackendRuntime::OnnxRuntime => {
                 "ONNX Runtime supports ONNX models and selected HF safetensors models with managed ONNX artifacts"
+            }
+            BackendRuntime::TransformersCompat => {
+                "Transformers compatibility supports selected raw HF safetensors models"
             }
             BackendRuntime::Mlx => "MLX supports MLX and HF-style safetensors only",
             BackendRuntime::MlxVlm => "MLX-VLM supports MLX and HF-style safetensors VLMs only",

@@ -1,13 +1,15 @@
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
     io::{self, IsTerminal, Write},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -25,8 +27,9 @@ use crate::{
         GenerationTimings, LlamaCppBackend, LlamaCppMode, LlamaFastBackend, LlamaFastRuntimeReport,
         LlamaKvCacheType, LlamaRuntimeOptions, LlamaServerBackend, LlamaServerDiscovery,
         MlxBackend, MlxVlmBackend, OnnxProvisionOptions, OnnxRuntimeAvailability,
-        OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity, VllmBackend,
-        backend_doctor_checks, backend_supports_accelerator, backend_supports_format,
+        OnnxRuntimeBackend, OnnxRuntimeMode, RuntimeId, StreamGranularity,
+        TransformersCompatBackend, VllmBackend, backend_doctor_checks,
+        backend_supports_accelerator, backend_supports_format,
         backend_supports_images as runtime_supports_images, install_managed_llama_server,
         install_managed_onnx_runtime, install_managed_vllm, llama_server_help_ok,
         managed_backend_dir, managed_runner_path as managed_onnx_runner_path, managed_vllm_dir,
@@ -35,7 +38,8 @@ use crate::{
     },
     banner::print_banner,
     model_store::{
-        ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelStore, PullProgress,
+        ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelSource, ModelStore,
+        PullProgress,
     },
     openai::{
         ChatMessage, ChatTemplateOptions, ChatTemplateSource, MessageContent, PromptSpec,
@@ -48,6 +52,9 @@ use crate::{
 };
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
+const MIB: u64 = 1024 * 1024;
+#[cfg(test)]
+const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -78,7 +85,7 @@ pub struct Cli {
         global = true,
         value_enum,
         default_value_t = BackendArg::Auto,
-        help = "Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, onnx, vllm, candle, llama-highlevel, or llama-legacy"
+        help = "Backend for this process: auto, cpu, cuda, rocm, vulkan, metal, mlx, onnx, transformers, vllm, candle, llama-highlevel, or llama-legacy"
     )]
     pub backend: BackendArg,
 
@@ -162,6 +169,7 @@ pub enum BackendArg {
     Mlx,
     Onnx,
     Rocm,
+    Transformers,
     Vllm,
     Vulkan,
 }
@@ -473,6 +481,24 @@ pub enum Commands {
         debug: bool,
     },
 
+    #[command(about = "Estimate whether a local or Hugging Face model is likely to fit in memory")]
+    Estimate {
+        #[arg(help = "Installed model id or Hugging Face repo id")]
+        model: String,
+
+        #[arg(
+            long,
+            help = "For remote Hugging Face estimates, estimate one repository file, for example model.Q4_K_M.gguf"
+        )]
+        file: Option<String>,
+
+        #[arg(long, help = "Print machine-readable estimate JSON")]
+        json: bool,
+
+        #[arg(long, help = "Print weight-file accounting details")]
+        verbose: bool,
+    },
+
     #[command(about = "Benchmark an installed model backend")]
     Bench {
         #[arg(help = "Installed model id")]
@@ -721,6 +747,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                 llama_options.clone(),
                 selection_options,
             )?;
+            let prompt_options_resolver = {
+                let backend_choice = backend_choice;
+                let selection_options = selection_options;
+                Arc::new(
+                    move |store: &ModelStore, manifest: &ModelManifest, has_images: bool| {
+                        let selected_backend = selected_backend_for_request(
+                            store,
+                            backend_choice,
+                            manifest,
+                            has_images,
+                            selection_options,
+                        )?;
+                        Ok(chat_template_options_for_backend(
+                            manifest,
+                            selected_backend,
+                            None,
+                        ))
+                    },
+                )
+            };
             if let Some(model) = model.as_deref() {
                 let manifest = store.get(model)?;
                 with_terminal_spinner(
@@ -732,7 +778,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             serve(
                 addr,
-                ApiState::new_with_default_model(store, backend, model),
+                ApiState::new_with_default_model_and_prompt_options(
+                    store,
+                    backend,
+                    model,
+                    Some(prompt_options_resolver),
+                ),
             )
             .await
         }
@@ -892,6 +943,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                 terminal_spinner_enabled(debug),
             )
             .await
+        }
+        Commands::Estimate {
+            model,
+            file,
+            json,
+            verbose,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            let report = estimate_model_or_huggingface(
+                &store,
+                &model,
+                file.as_deref(),
+                detect_system_memory(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_estimate_report(&report, verbose);
+            }
+            Ok(())
         }
         Commands::Bench {
             model,
@@ -1135,6 +1206,7 @@ fn should_print_startup_banner_for(
         Commands::Import { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
+        | Commands::Estimate { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
@@ -1144,6 +1216,1584 @@ fn should_print_startup_banner_for(
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EstimateReport {
+    model: String,
+    source_url: Option<String>,
+    format: String,
+    architecture: String,
+    backend_hint: String,
+    model_files_bytes: u64,
+    weight_files_bytes: u64,
+    runtime_overhead_bytes: u64,
+    kv_cache_bytes: u64,
+    estimated_total_bytes: u64,
+    system_total_bytes: u64,
+    system_available_bytes: Option<u64>,
+    weight_files: Vec<EstimateFileEntry>,
+    ignored_files: Vec<EstimateFileEntry>,
+    selected_model_files: Vec<String>,
+    config_used: bool,
+    confidence: EstimateConfidence,
+    measured_peak_memory_bytes: Option<u64>,
+    notes: Vec<String>,
+    result: EstimateResult,
+    recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EstimateFileEntry {
+    path: String,
+    size: u64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EstimateResult {
+    Ok,
+    Warning,
+    LikelyOom,
+}
+
+impl EstimateResult {
+    fn display(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warning => "warning",
+            Self::LikelyOom => "likely OOM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EstimateConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl EstimateConfidence {
+    fn display(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
+        }
+    }
+
+    fn min(self, other: Self) -> Self {
+        if self <= other { self } else { other }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystemMemory {
+    total_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct WeightAccounting {
+    counted: Vec<EstimateFileEntry>,
+    ignored: Vec<EstimateFileEntry>,
+    selected: Vec<String>,
+    confidence: EstimateConfidence,
+}
+
+impl WeightAccounting {
+    fn total_bytes(&self) -> u64 {
+        self.counted.iter().map(|file| file.size).sum()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct EstimateConfig {
+    hidden_size: Option<u64>,
+    num_hidden_layers: Option<u64>,
+    num_attention_heads: Option<u64>,
+    num_key_value_heads: Option<u64>,
+    head_dim: Option<u64>,
+    max_position_embeddings: Option<u64>,
+    sliding_window: Option<u64>,
+    dtype: Option<String>,
+    vocab_size: Option<u64>,
+    architectures: Vec<String>,
+    model_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KvCacheEstimate {
+    bytes: u64,
+    confidence: EstimateConfidence,
+    config_used: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct EstimateObservation {
+    model: String,
+    backend: Option<String>,
+    architecture: Option<String>,
+    format: Option<String>,
+    measured_peak_memory_bytes: Option<u64>,
+    prompt_tps: Option<f64>,
+    generation_tps: Option<f64>,
+    timestamp: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteHfModel {
+    repo: String,
+    config: Option<Value>,
+    files: Vec<RemoteHfFile>,
+    gated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteHfFile {
+    path: String,
+    size: u64,
+}
+
+fn estimate_model_or_huggingface(
+    store: &ModelStore,
+    model: &str,
+    include_file: Option<&str>,
+    system: SystemMemory,
+) -> Result<EstimateReport> {
+    match store.get(model) {
+        Ok(manifest) => {
+            if include_file.is_some() {
+                bail!(
+                    "`--file` is only supported for remote Hugging Face estimates before a model is pulled"
+                );
+            }
+            Ok(estimate_model_memory(store, &manifest, system))
+        }
+        Err(err) if err.to_string() == format!("model '{model}' is not installed") => {
+            if looks_like_huggingface_repo_id(model) {
+                return estimate_huggingface_model(store, model, include_file, system);
+            }
+            bail!("model '{model}' is not installed; run `werk pull {model}` first")
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn looks_like_huggingface_repo_id(model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty()
+        || model.starts_with('-')
+        || model.starts_with('/')
+        || model.starts_with('.')
+        || model.ends_with('/')
+        || model.contains("..")
+        || model.contains("://")
+        || model.contains('\\')
+    {
+        return false;
+    }
+
+    let mut parts = model.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(namespace), Some(repo), None) if !namespace.is_empty() && !repo.is_empty()
+    )
+}
+
+fn estimate_model_memory(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+    system: SystemMemory,
+) -> EstimateReport {
+    let accounting = estimate_weight_accounting(store, manifest);
+    let model_files_bytes = accounting.total_bytes();
+    let config = read_estimate_config(store, manifest);
+    let runtime_overhead_bytes = runtime_overhead_bytes(&manifest.format, model_files_bytes);
+    let kv_cache = kv_cache_estimate(model_files_bytes, manifest.architecture.as_deref(), &config);
+    let estimated_total_bytes = model_files_bytes
+        .saturating_add(runtime_overhead_bytes)
+        .saturating_add(kv_cache.bytes);
+    let result = estimate_result(
+        estimated_total_bytes,
+        system.total_bytes,
+        system.available_bytes,
+    );
+    let confidence = accounting
+        .confidence
+        .min(kv_cache.confidence)
+        .min(if model_files_bytes > 0 {
+            EstimateConfidence::High
+        } else {
+            EstimateConfidence::Low
+        });
+
+    EstimateReport {
+        model: manifest.id.clone(),
+        source_url: estimate_source_url(manifest),
+        format: format_label(&manifest.format).to_string(),
+        architecture: manifest
+            .architecture
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        backend_hint: estimate_backend_hint(manifest).to_string(),
+        model_files_bytes,
+        weight_files_bytes: model_files_bytes,
+        runtime_overhead_bytes,
+        kv_cache_bytes: kv_cache.bytes,
+        estimated_total_bytes,
+        system_total_bytes: system.total_bytes.unwrap_or(0),
+        system_available_bytes: system.available_bytes,
+        weight_files: accounting.counted,
+        ignored_files: accounting.ignored,
+        selected_model_files: accounting.selected,
+        config_used: kv_cache.config_used,
+        confidence,
+        measured_peak_memory_bytes: latest_estimate_observation(store, manifest)
+            .and_then(|observation| observation.measured_peak_memory_bytes),
+        notes: Vec::new(),
+        result,
+        recommendation: estimate_recommendation(result).to_string(),
+    }
+}
+
+fn estimate_huggingface_model(
+    store: &ModelStore,
+    repo: &str,
+    include_file: Option<&str>,
+    system: SystemMemory,
+) -> Result<EstimateReport> {
+    validate_huggingface_repo_for_estimate(repo)?;
+    let token = store.huggingface_http_token()?;
+    let remote = fetch_remote_huggingface_model(repo, token.as_deref())?;
+    if remote.gated && token.is_none() {
+        bail!(
+            "Hugging Face gated model requires browser agreement: {repo} (https://huggingface.co/{repo}). Open the model page, accept the conditions, then run `werk auth huggingface login` or set HF_TOKEN and retry."
+        );
+    }
+
+    let mut manifest = remote_hf_manifest(&remote, include_file)?;
+    let mut accounting = if manifest.format == ModelFormat::SafeTensors
+        || manifest.format == ModelFormat::Mlx
+        || manifest.format == ModelFormat::PyTorch
+    {
+        remote
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(".safetensors.index.json"))
+            .and_then(|file| {
+                fetch_huggingface_json_file(repo, &file.path, token.as_deref())
+                    .ok()
+                    .and_then(|value| {
+                        safetensors_index_weight_accounting_from_value(
+                            &manifest,
+                            &format!("files/{}", file.path),
+                            &value,
+                        )
+                    })
+            })
+            .unwrap_or_else(|| estimate_weight_accounting_without_store(&manifest))
+    } else {
+        estimate_weight_accounting_without_store(&manifest)
+    };
+
+    if let Some(include_file) = include_file {
+        let selected_path = format!("files/{}", normalize_remote_hf_file_path(include_file)?);
+        if let Some(file) = manifest
+            .files
+            .iter()
+            .find(|file| file.path == selected_path)
+        {
+            accounting = single_selected_weight_accounting(
+                &manifest,
+                file,
+                "explicit --file selected for remote estimate",
+            );
+            manifest.model_path = Some(selected_path);
+        } else {
+            bail!("file '{include_file}' was not found in Hugging Face repo '{repo}'");
+        }
+    }
+
+    let model_files_bytes = accounting.total_bytes();
+    let config = remote.config.as_ref().map(parse_estimate_config);
+    let runtime_overhead_bytes = runtime_overhead_bytes(&manifest.format, model_files_bytes);
+    let kv_cache = kv_cache_estimate(model_files_bytes, manifest.architecture.as_deref(), &config);
+    let estimated_total_bytes = model_files_bytes
+        .saturating_add(runtime_overhead_bytes)
+        .saturating_add(kv_cache.bytes);
+    let result = estimate_result(
+        estimated_total_bytes,
+        system.total_bytes,
+        system.available_bytes,
+    );
+    let confidence = accounting
+        .confidence
+        .min(kv_cache.confidence)
+        .min(if model_files_bytes > 0 {
+            EstimateConfidence::Medium
+        } else {
+            EstimateConfidence::Low
+        });
+    let mut notes = vec![
+        "Remote estimate uses Hugging Face metadata and small config/index files only; it does not download model weights.".to_string(),
+    ];
+    if model_files_bytes == 0 {
+        notes.push(
+            "Hugging Face metadata did not include file sizes, so the memory estimate is incomplete."
+                .to_string(),
+        );
+    }
+    if manifest.architecture.as_deref() == Some("chatglm")
+        && cfg!(target_os = "macos")
+        && manifest.format == ModelFormat::SafeTensors
+    {
+        notes.push(
+            "Raw ChatGLM/GLM Hugging Face repositories may need MLX conversion before mlx-lm can load them."
+                .to_string(),
+        );
+    }
+
+    Ok(EstimateReport {
+        model: repo.to_string(),
+        source_url: Some(format!("https://huggingface.co/{repo}")),
+        format: format_label(&manifest.format).to_string(),
+        architecture: manifest
+            .architecture
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        backend_hint: estimate_backend_hint(&manifest).to_string(),
+        model_files_bytes,
+        weight_files_bytes: model_files_bytes,
+        runtime_overhead_bytes,
+        kv_cache_bytes: kv_cache.bytes,
+        estimated_total_bytes,
+        system_total_bytes: system.total_bytes.unwrap_or(0),
+        system_available_bytes: system.available_bytes,
+        weight_files: accounting.counted,
+        ignored_files: accounting.ignored,
+        selected_model_files: accounting.selected,
+        config_used: kv_cache.config_used,
+        confidence,
+        measured_peak_memory_bytes: None,
+        notes,
+        result,
+        recommendation: estimate_recommendation(result).to_string(),
+    })
+}
+
+fn validate_huggingface_repo_for_estimate(repo: &str) -> Result<()> {
+    if repo.trim().is_empty() || repo.starts_with('-') || repo.contains("..") {
+        bail!("invalid Hugging Face repo id: {repo}");
+    }
+    Ok(())
+}
+
+fn fetch_remote_huggingface_model(repo: &str, token: Option<&str>) -> Result<RemoteHfModel> {
+    let api_url = format!(
+        "https://huggingface.co/api/models/{}?blobs=true",
+        percent_encode_hf_path(repo)
+    );
+    let metadata = fetch_huggingface_json_url(&api_url, token).map_err(|err| {
+        anyhow!(
+            "failed to read Hugging Face metadata for {repo} (https://huggingface.co/{repo}): {err}"
+        )
+    })?;
+    let config = fetch_huggingface_json_file(repo, "config.json", token).ok();
+    Ok(parse_remote_huggingface_model(repo, &metadata, config))
+}
+
+fn fetch_huggingface_json_file(repo: &str, path: &str, token: Option<&str>) -> Result<Value> {
+    let path = normalize_remote_hf_file_path(path)?;
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        percent_encode_hf_path(repo),
+        percent_encode_hf_path(&path)
+    );
+    fetch_huggingface_json_url(&url, token)
+}
+
+fn fetch_huggingface_json_url(url: &str, token: Option<&str>) -> Result<Value> {
+    let text = fetch_huggingface_text_url(url, token)?;
+    serde_json::from_str(&text).map_err(|err| anyhow!("Hugging Face response was not JSON: {err}"))
+}
+
+fn fetch_huggingface_text_url(url: &str, token: Option<&str>) -> Result<String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sSL",
+        "--max-time",
+        "20",
+        "-A",
+        "werk1112",
+        "-w",
+        "\n%{http_code}",
+    ]);
+    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
+        command
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {token}"));
+    }
+    command.arg(url);
+
+    let output = command
+        .output()
+        .map_err(|err| anyhow!("failed to execute curl for Hugging Face metadata: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("curl failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| anyhow!("Hugging Face response was not valid UTF-8: {err}"))?;
+    let Some((body, status)) = stdout.rsplit_once('\n') else {
+        bail!("Hugging Face response did not include an HTTP status");
+    };
+    let status = status.trim().parse::<u16>().unwrap_or(0);
+    if !(200..300).contains(&status) {
+        let detail = body.trim();
+        if detail.is_empty() {
+            bail!("Hugging Face returned HTTP {status}");
+        }
+        bail!("Hugging Face returned HTTP {status}: {detail}");
+    }
+    Ok(body.to_string())
+}
+
+fn parse_remote_huggingface_model(
+    repo: &str,
+    metadata: &Value,
+    config: Option<Value>,
+) -> RemoteHfModel {
+    RemoteHfModel {
+        repo: repo.to_string(),
+        config,
+        files: parse_remote_hf_files(metadata),
+        gated: value_is_remote_hf_gated(metadata.get("gated")),
+    }
+}
+
+fn parse_remote_hf_files(metadata: &Value) -> Vec<RemoteHfFile> {
+    let mut files = metadata
+        .get("siblings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            let path = file
+                .get("rfilename")
+                .or_else(|| file.get("path"))
+                .and_then(Value::as_str)?;
+            Some(RemoteHfFile {
+                path: path.replace('\\', "/"),
+                size: parse_remote_hf_file_size(file).unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
+    files
+}
+
+fn parse_remote_hf_file_size(file: &Value) -> Option<u64> {
+    json_u64(file.get("size"))
+        .or_else(|| json_u64(file.get("blob_size")))
+        .or_else(|| file.get("lfs").and_then(|lfs| json_u64(lfs.get("size"))))
+        .or_else(|| {
+            file.get("lfs")
+                .and_then(|lfs| json_u64(lfs.get("blob_size")))
+        })
+}
+
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_is_remote_hf_gated(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(gated)) => *gated,
+        Some(Value::String(gated)) => !matches!(gated.as_str(), "" | "false" | "False" | "none"),
+        _ => false,
+    }
+}
+
+fn remote_hf_manifest(remote: &RemoteHfModel, include_file: Option<&str>) -> Result<ModelManifest> {
+    let normalized_include = include_file
+        .map(normalize_remote_hf_file_path)
+        .transpose()?;
+    let format = normalized_include
+        .as_deref()
+        .map(remote_detect_format_for_file_path)
+        .unwrap_or_else(|| remote_detect_format(remote));
+    let files = remote
+        .files
+        .iter()
+        .map(|file| crate::model_store::ModelFile {
+            path: format!("files/{}", file.path),
+            size: file.size,
+            checksum: "remote-metadata".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let model_path = if let Some(include_file) = normalized_include.as_deref() {
+        let selected_path = format!("files/{include_file}");
+        if !files.iter().any(|file| file.path == selected_path) {
+            bail!(
+                "file '{include_file}' was not found in Hugging Face repo '{}'",
+                remote.repo
+            );
+        }
+        Some(selected_path)
+    } else {
+        remote_selected_model_path(&remote.files, &format)
+    };
+    let tokenizer_path = remote
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("tokenizer.json"))
+        .map(|file| format!("files/{}", file.path));
+    let config_path = remote
+        .files
+        .iter()
+        .find(|file| file.path == "config.json" || file.path.ends_with("/config.json"))
+        .map(|file| format!("files/{}", file.path));
+    let architecture = remote_architecture_from_config(remote.config.as_ref());
+
+    Ok(ModelManifest {
+        id: remote.repo.clone(),
+        source: ModelSource::HuggingFace {
+            repo: remote.repo.clone(),
+        },
+        format: format.clone(),
+        architecture,
+        tokenizer_path,
+        config_path,
+        model_path,
+        backend: format.backend_hint().to_string(),
+        created_unix: 0,
+        files,
+        artifacts: Vec::new(),
+    })
+}
+
+fn remote_detect_format(remote: &RemoteHfModel) -> ModelFormat {
+    let repo_lower = remote.repo.to_ascii_lowercase();
+    if remote
+        .files
+        .iter()
+        .any(|file| extension_eq_str(&file.path, "gguf"))
+    {
+        ModelFormat::Gguf
+    } else if remote
+        .files
+        .iter()
+        .any(|file| extension_eq_str(&file.path, "npz"))
+        || repo_lower.contains("mlx")
+        || remote
+            .files
+            .iter()
+            .any(|file| file.path.to_ascii_lowercase().contains("mlx"))
+    {
+        ModelFormat::Mlx
+    } else if remote
+        .files
+        .iter()
+        .any(|file| extension_eq_str(&file.path, "safetensors"))
+    {
+        ModelFormat::SafeTensors
+    } else if remote
+        .files
+        .iter()
+        .any(|file| extension_eq_str(&file.path, "onnx"))
+    {
+        ModelFormat::Onnx
+    } else if remote
+        .files
+        .iter()
+        .any(|file| extension_eq_str(&file.path, "pt") || extension_eq_str(&file.path, "pth"))
+        || remote
+            .files
+            .iter()
+            .any(|file| file.path.ends_with("pytorch_model.bin"))
+    {
+        ModelFormat::PyTorch
+    } else {
+        ModelFormat::Unknown
+    }
+}
+
+fn remote_detect_format_for_file_path(path: &str) -> ModelFormat {
+    if extension_eq_str(path, "gguf") {
+        ModelFormat::Gguf
+    } else if extension_eq_str(path, "safetensors") {
+        ModelFormat::SafeTensors
+    } else if extension_eq_str(path, "npz") {
+        ModelFormat::Mlx
+    } else if extension_eq_str(path, "onnx") {
+        ModelFormat::Onnx
+    } else if extension_eq_str(path, "pt")
+        || extension_eq_str(path, "pth")
+        || path.ends_with("pytorch_model.bin")
+    {
+        ModelFormat::PyTorch
+    } else {
+        ModelFormat::Unknown
+    }
+}
+
+fn remote_selected_model_path(files: &[RemoteHfFile], format: &ModelFormat) -> Option<String> {
+    let path = match format {
+        ModelFormat::Gguf => files
+            .iter()
+            .filter(|file| extension_eq_str(&file.path, "gguf"))
+            .min_by(|left, right| {
+                remote_gguf_priority(&left.path)
+                    .cmp(&remote_gguf_priority(&right.path))
+                    .then_with(|| left.path.cmp(&right.path))
+            })
+            .map(|file| file.path.clone()),
+        ModelFormat::SafeTensors => files
+            .iter()
+            .find(|file| extension_eq_str(&file.path, "safetensors"))
+            .map(|file| file.path.clone()),
+        ModelFormat::Mlx => files
+            .iter()
+            .find(|file| extension_eq_str(&file.path, "npz"))
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|file| extension_eq_str(&file.path, "safetensors"))
+            })
+            .map(|file| file.path.clone()),
+        ModelFormat::PyTorch => files
+            .iter()
+            .find(|file| extension_eq_str(&file.path, "pt"))
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|file| extension_eq_str(&file.path, "pth"))
+            })
+            .or_else(|| {
+                files
+                    .iter()
+                    .find(|file| file.path.ends_with("pytorch_model.bin"))
+            })
+            .map(|file| file.path.clone()),
+        ModelFormat::Onnx => files
+            .iter()
+            .find(|file| extension_eq_str(&file.path, "onnx"))
+            .map(|file| file.path.clone()),
+        ModelFormat::TensorRt
+        | ModelFormat::OpenVino
+        | ModelFormat::TensorFlow
+        | ModelFormat::CoreMl
+        | ModelFormat::Unknown => None,
+    }?;
+    Some(format!("files/{path}"))
+}
+
+fn remote_gguf_priority(path: &str) -> usize {
+    let lower = path.to_ascii_lowercase();
+    [
+        "q4_k_m", "q5_k_m", "q4_k_s", "q5_k_s", "q6_k", "q8_0", "q3_k_m", "q3_k_l", "q3_k_s",
+        "q4_0", "q5_0", "q2_k",
+    ]
+    .iter()
+    .position(|quant| lower.contains(quant))
+    .unwrap_or(usize::MAX)
+}
+
+fn remote_architecture_from_config(config: Option<&Value>) -> Option<String> {
+    let value = config?;
+    let text_config = value.get("text_config").unwrap_or(value);
+    text_config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("model_type").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("architectures")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn normalize_remote_hf_file_path(file: &str) -> Result<String> {
+    let mut path = file.trim().replace('\\', "/");
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest.to_string();
+    }
+    if let Some(rest) = path.strip_prefix("files/") {
+        path = rest.to_string();
+    }
+    if path.is_empty()
+        || path.starts_with('/')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("Hugging Face file must be a relative path inside the repository");
+    }
+    Ok(path)
+}
+
+fn percent_encode_hf_path(path: &str) -> String {
+    path.as_bytes()
+        .iter()
+        .flat_map(|byte| match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                vec![*byte as char]
+            }
+            byte => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
+fn estimate_source_url(manifest: &ModelManifest) -> Option<String> {
+    match &manifest.source {
+        ModelSource::HuggingFace { repo } => Some(format!("https://huggingface.co/{repo}")),
+        ModelSource::LocalPath { .. } => None,
+    }
+}
+
+fn print_estimate_report(report: &EstimateReport, verbose: bool) {
+    print!("{}", format_estimate_report(report, verbose));
+}
+
+fn format_estimate_report(report: &EstimateReport, verbose: bool) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Model:        {}\n", report.model));
+    if let Some(source_url) = &report.source_url {
+        output.push_str(&format!("Source:       {source_url}\n"));
+    }
+    output.push_str(&format!("Format:       {}\n", report.format));
+    output.push_str(&format!("Architecture: {}\n", report.architecture));
+    output.push_str(&format!("Backend:      {}\n", report.backend_hint));
+    output.push('\n');
+    output.push_str(&format!(
+        "Weights:      {}\n",
+        format_bytes(report.model_files_bytes)
+    ));
+    output.push_str(&format!(
+        "Runtime:      {}\n",
+        format_bytes(report.runtime_overhead_bytes)
+    ));
+    output.push_str(&format!(
+        "KV cache:     {}\n",
+        format_bytes(report.kv_cache_bytes)
+    ));
+    output.push_str(&format!(
+        "Total:        {}\n",
+        format_bytes(report.estimated_total_bytes)
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "System memory:     {}\n",
+        format_optional_bytes(Some(report.system_total_bytes))
+    ));
+    output.push_str(&format!(
+        "Available memory:  {}\n",
+        format_optional_bytes(report.system_available_bytes)
+    ));
+    output.push_str(&format!(
+        "Confidence:        {}\n",
+        report.confidence.display()
+    ));
+    if let Some(measured_peak) = report.measured_peak_memory_bytes {
+        output.push('\n');
+        output.push_str(&format!(
+            "Measured peak:     {}\n",
+            format_bytes(measured_peak)
+        ));
+    }
+    if !report.notes.is_empty() {
+        output.push('\n');
+        output.push_str("Notes:\n");
+        for note in &report.notes {
+            output.push_str(&format!("  - {note}\n"));
+        }
+    }
+    if verbose {
+        output.push('\n');
+        output.push_str("Selected model file(s):\n");
+        if report.selected_model_files.is_empty() {
+            output.push_str("  - none\n");
+        } else {
+            for path in &report.selected_model_files {
+                output.push_str(&format!("  - {path}\n"));
+            }
+        }
+        output.push_str("Weight files counted:\n");
+        if report.weight_files.is_empty() {
+            output.push_str("  - none\n");
+        } else {
+            for file in &report.weight_files {
+                output.push_str(&format!(
+                    "  - {} ({}, {})\n",
+                    file.path,
+                    format_bytes(file.size),
+                    file.reason
+                ));
+            }
+        }
+        output.push_str("Files ignored:\n");
+        if report.ignored_files.is_empty() {
+            output.push_str("  - none\n");
+        } else {
+            for file in &report.ignored_files {
+                output.push_str(&format!(
+                    "  - {} ({}, {})\n",
+                    file.path,
+                    format_bytes(file.size),
+                    file.reason
+                ));
+            }
+        }
+        output.push_str(&format!(
+            "Total counted weight bytes: {}\n",
+            report.model_files_bytes
+        ));
+    }
+    output.push('\n');
+    output.push_str(&format!("Result:       {}\n", report.result.display()));
+    output.push('\n');
+    output.push_str("Recommendation:\n");
+    output.push_str(&format!("  {}\n", report.recommendation));
+    output
+}
+
+fn format_optional_bytes(bytes: Option<u64>) -> String {
+    bytes
+        .filter(|bytes| *bytes > 0)
+        .map(format_bytes)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn estimate_recommendation(result: EstimateResult) -> &'static str {
+    match result {
+        EstimateResult::Ok => "This model is likely to fit under the current heuristic.",
+        EstimateResult::Warning => {
+            "This model may fit, but it is close to the available-memory limit; close memory-heavy applications or reduce max tokens."
+        }
+        EstimateResult::LikelyOom => {
+            "Use a smaller or quantized model, reduce max tokens, or close memory-heavy applications."
+        }
+    }
+}
+
+fn estimate_result(
+    estimated_total_bytes: u64,
+    system_total_bytes: Option<u64>,
+    system_available_bytes: Option<u64>,
+) -> EstimateResult {
+    if let Some(available) = system_available_bytes.filter(|bytes| *bytes > 0) {
+        return classify_against_limit(estimated_total_bytes, available, 0.70, 0.85);
+    }
+    if let Some(total) = system_total_bytes.filter(|bytes| *bytes > 0) {
+        return classify_against_limit(estimated_total_bytes, total, 0.50, 0.65);
+    }
+    EstimateResult::Warning
+}
+
+fn classify_against_limit(
+    estimated_total_bytes: u64,
+    limit_bytes: u64,
+    ok_ratio: f64,
+    warning_ratio: f64,
+) -> EstimateResult {
+    let estimated = estimated_total_bytes as f64;
+    let limit = limit_bytes as f64;
+    if estimated <= limit * ok_ratio {
+        EstimateResult::Ok
+    } else if estimated <= limit * warning_ratio {
+        EstimateResult::Warning
+    } else {
+        EstimateResult::LikelyOom
+    }
+}
+
+#[cfg(test)]
+fn estimate_model_files_bytes(manifest: &ModelManifest) -> u64 {
+    estimate_weight_accounting_without_store(manifest).total_bytes()
+}
+
+fn estimate_weight_accounting(store: &ModelStore, manifest: &ModelManifest) -> WeightAccounting {
+    if manifest.format == ModelFormat::SafeTensors
+        || manifest.format == ModelFormat::Mlx
+        || manifest.format == ModelFormat::PyTorch
+    {
+        if let Some(accounting) = safetensors_index_weight_accounting(store, manifest) {
+            return accounting;
+        }
+    }
+    estimate_weight_accounting_without_store(manifest)
+}
+
+fn estimate_weight_accounting_without_store(manifest: &ModelManifest) -> WeightAccounting {
+    let selected_model_path = manifest.model_path.clone();
+    let selected = selected_model_path.iter().cloned().collect::<Vec<_>>();
+    let selected_file = selected_model_path
+        .as_deref()
+        .and_then(|path| manifest.files.iter().find(|file| file.path == path));
+
+    if matches!(manifest.format, ModelFormat::Gguf | ModelFormat::Onnx)
+        && let Some(file) = selected_file
+    {
+        return single_selected_weight_accounting(manifest, file, "selected runtime model file");
+    }
+
+    if matches!(
+        manifest.format,
+        ModelFormat::SafeTensors | ModelFormat::Mlx | ModelFormat::PyTorch
+    ) {
+        let safetensors = manifest
+            .files
+            .iter()
+            .filter(|file| extension_eq_str(&file.path, "safetensors"))
+            .collect::<Vec<_>>();
+        if safetensors.len() == 1 {
+            return single_selected_weight_accounting(
+                manifest,
+                safetensors[0],
+                "single safetensors weight file",
+            );
+        }
+    }
+
+    let mut counted = Vec::new();
+    let mut ignored = Vec::new();
+    for file in &manifest.files {
+        if should_ignore_estimate_file(&file.path, false) {
+            ignored.push(estimate_file_entry(file, "non-weight metadata/cache file"));
+        } else if is_estimate_weight_file(&file.path) {
+            counted.push(estimate_file_entry(file, "recognized weight file"));
+        } else {
+            ignored.push(estimate_file_entry(file, "not a recognized weight file"));
+        }
+    }
+
+    let confidence = if counted.is_empty() {
+        EstimateConfidence::Low
+    } else if selected_model_path.is_some()
+        || manifest
+            .files
+            .iter()
+            .filter(|file| is_estimate_weight_file(&file.path))
+            .count()
+            == counted.len()
+    {
+        EstimateConfidence::Medium
+    } else {
+        EstimateConfidence::Low
+    };
+
+    WeightAccounting {
+        counted,
+        ignored,
+        selected,
+        confidence,
+    }
+}
+
+fn single_selected_weight_accounting(
+    manifest: &ModelManifest,
+    selected_file: &crate::model_store::ModelFile,
+    reason: &str,
+) -> WeightAccounting {
+    let mut ignored = Vec::new();
+    for file in &manifest.files {
+        if file.path != selected_file.path {
+            ignored.push(estimate_file_entry(file, "not selected for this model"));
+        }
+    }
+    WeightAccounting {
+        counted: vec![estimate_file_entry(selected_file, reason)],
+        ignored,
+        selected: vec![selected_file.path.clone()],
+        confidence: EstimateConfidence::High,
+    }
+}
+
+fn safetensors_index_weight_accounting(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+) -> Option<WeightAccounting> {
+    let index_path = find_safetensors_index_path(manifest)?;
+    let index_abs = store.model_dir(&manifest.id).join(&index_path);
+    let data = fs::read_to_string(index_abs).ok()?;
+    let value: Value = serde_json::from_str(&data).ok()?;
+    safetensors_index_weight_accounting_from_value(manifest, &index_path, &value)
+}
+
+fn safetensors_index_weight_accounting_from_value(
+    manifest: &ModelManifest,
+    index_path: &str,
+    value: &Value,
+) -> Option<WeightAccounting> {
+    let weight_map = value.get("weight_map")?.as_object()?;
+    let index_dir = Path::new(&index_path)
+        .parent()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let mut shards = weight_map
+        .values()
+        .filter_map(Value::as_str)
+        .map(|path| join_manifest_relative(&index_dir, path))
+        .collect::<Vec<_>>();
+    shards.sort();
+    shards.dedup();
+    if shards.is_empty() {
+        return None;
+    }
+
+    let mut counted = Vec::new();
+    let mut ignored = Vec::new();
+    let mut missing = false;
+    for file in &manifest.files {
+        if shards.iter().any(|path| path == &file.path) {
+            counted.push(estimate_file_entry(file, "referenced by safetensors index"));
+        } else {
+            ignored.push(estimate_file_entry(
+                file,
+                "not referenced by safetensors index",
+            ));
+        }
+    }
+    for shard in &shards {
+        if !manifest.files.iter().any(|file| file.path == *shard) {
+            missing = true;
+        }
+    }
+
+    Some(WeightAccounting {
+        counted,
+        ignored,
+        selected: shards,
+        confidence: if missing {
+            EstimateConfidence::Low
+        } else {
+            EstimateConfidence::High
+        },
+    })
+}
+
+fn find_safetensors_index_path(manifest: &ModelManifest) -> Option<String> {
+    if let Some(model_path) = manifest.model_path.as_deref() {
+        let path = Path::new(model_path);
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        if name.ends_with(".safetensors") {
+            let index_name = format!("{name}.index.json");
+            let candidate = path
+                .parent()
+                .map(|parent| parent.join(&index_name))
+                .unwrap_or_else(|| PathBuf::from(index_name))
+                .to_string_lossy()
+                .replace('\\', "/");
+            if manifest.files.iter().any(|file| file.path == candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    manifest
+        .files
+        .iter()
+        .find(|file| file.path.ends_with(".safetensors.index.json"))
+        .map(|file| file.path.clone())
+}
+
+fn join_manifest_relative(base: &str, path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with("files/") || base.is_empty() {
+        normalized
+    } else {
+        format!("{base}/{normalized}")
+    }
+}
+
+fn estimate_file_entry(file: &crate::model_store::ModelFile, reason: &str) -> EstimateFileEntry {
+    EstimateFileEntry {
+        path: file.path.clone(),
+        size: file.size,
+        reason: reason.to_string(),
+    }
+}
+
+fn should_ignore_estimate_file(path: &str, selected_runtime_artifact: bool) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.split('/').any(|part| {
+        matches!(
+            part,
+            ".git" | ".cache" | "cache" | "tmp" | "temp" | "__pycache__"
+        )
+    }) {
+        return true;
+    }
+    if !selected_runtime_artifact && lower.split('/').any(|part| part == "artifacts") {
+        return true;
+    }
+    let name = Path::new(&lower)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "readme.md"
+            | "license"
+            | "license.md"
+            | "tokenizer.json"
+            | "tokenizer_config.json"
+            | "special_tokens_map.json"
+            | "generation_config.json"
+            | "config.json"
+            | "merges.txt"
+            | "vocab.json"
+            | "added_tokens.json"
+    ) || name.starts_with("chat_template")
+}
+
+fn is_estimate_weight_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = Path::new(&lower)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if lower.ends_with(".onnx_data") {
+        return true;
+    }
+    if extension_eq_str(&lower, "bin") {
+        return name.starts_with("pytorch_model") || name.starts_with("model");
+    }
+    matches!(
+        Path::new(&lower).extension().and_then(|ext| ext.to_str()),
+        Some("safetensors" | "gguf" | "onnx" | "pt" | "pth" | "npz")
+    )
+}
+
+fn extension_eq_str(path: &str, expected: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+}
+
+fn runtime_overhead_bytes(format: &ModelFormat, weights: u64) -> u64 {
+    match format {
+        ModelFormat::Gguf => (256 * MIB).max(scale_bytes(weights, 0.05)),
+        ModelFormat::Mlx => (512 * MIB).max(scale_bytes(weights, 0.08)),
+        _ => (512 * MIB).max(scale_bytes(weights, 0.10)),
+    }
+}
+
+fn kv_cache_estimate(
+    weights: u64,
+    architecture: Option<&str>,
+    config: &Option<EstimateConfig>,
+) -> KvCacheEstimate {
+    if is_memory_heavy_architecture(architecture) {
+        return KvCacheEstimate {
+            bytes: kv_cache_fallback_bytes(weights, architecture),
+            confidence: EstimateConfidence::Low,
+            config_used: false,
+        };
+    }
+
+    if let Some(config) = config
+        && let Some(config_estimate) = kv_cache_from_config(config)
+    {
+        return KvCacheEstimate {
+            bytes: config_estimate.bytes,
+            confidence: config_estimate.confidence,
+            config_used: true,
+        };
+    }
+
+    KvCacheEstimate {
+        bytes: kv_cache_fallback_bytes(weights, architecture),
+        confidence: EstimateConfidence::Low,
+        config_used: false,
+    }
+}
+
+fn kv_cache_from_config(config: &EstimateConfig) -> Option<KvCacheEstimate> {
+    let hidden_size = config.hidden_size?;
+    let layers = config.num_hidden_layers?;
+    let attention_heads = config.num_attention_heads?;
+    if attention_heads == 0 {
+        return None;
+    }
+    let head_dim = config.head_dim.unwrap_or(hidden_size / attention_heads);
+    if head_dim == 0 {
+        return None;
+    }
+    let mut confidence = EstimateConfidence::High;
+    let kv_heads = match config.num_key_value_heads {
+        Some(kv_heads) => kv_heads,
+        None => {
+            confidence = EstimateConfidence::Medium;
+            attention_heads
+        }
+    };
+    let dtype_bytes = dtype_bytes(config.dtype.as_deref());
+    if config.dtype.is_none() {
+        confidence = confidence.min(EstimateConfidence::Medium);
+    }
+    let model_context = match config
+        .sliding_window
+        .or(config.max_position_embeddings)
+        .filter(|ctx| *ctx > 0)
+    {
+        Some(context) => context,
+        None => {
+            confidence = confidence.min(EstimateConfidence::Medium);
+            4096
+        }
+    };
+    let effective_context = model_context.min(4096);
+    Some(KvCacheEstimate {
+        bytes: layers
+            .saturating_mul(kv_heads)
+            .saturating_mul(head_dim)
+            .saturating_mul(2)
+            .saturating_mul(effective_context)
+            .saturating_mul(dtype_bytes),
+        confidence,
+        config_used: true,
+    })
+}
+
+fn dtype_bytes(dtype: Option<&str>) -> u64 {
+    let dtype = dtype.unwrap_or_default().to_ascii_lowercase();
+    if ["fp32", "float32", "f32"]
+        .iter()
+        .any(|needle| dtype.contains(needle))
+    {
+        4
+    } else if ["int8", "uint8", "i8", "u8"]
+        .iter()
+        .any(|needle| dtype.contains(needle))
+    {
+        1
+    } else {
+        2
+    }
+}
+
+fn kv_cache_fallback_bytes(weights: u64, architecture: Option<&str>) -> u64 {
+    let multiplier = if is_memory_heavy_architecture(architecture) {
+        0.60
+    } else {
+        0.35
+    };
+    scale_bytes(weights, multiplier)
+}
+
+fn is_memory_heavy_architecture(architecture: Option<&str>) -> bool {
+    let Some(architecture) = architecture else {
+        return false;
+    };
+    let architecture = architecture.to_ascii_lowercase();
+    ["jamba", "mamba", "mixtral", "moe"]
+        .iter()
+        .any(|needle| architecture.contains(needle))
+}
+
+fn scale_bytes(bytes: u64, factor: f64) -> u64 {
+    ((bytes as f64) * factor).ceil() as u64
+}
+
+fn read_estimate_config(store: &ModelStore, manifest: &ModelManifest) -> Option<EstimateConfig> {
+    let config_path = manifest.config_path.as_deref()?;
+    let path = store.model_dir(&manifest.id).join(config_path);
+    let data = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&data).ok()?;
+    Some(parse_estimate_config(&value))
+}
+
+fn parse_estimate_config(value: &Value) -> EstimateConfig {
+    let text_config = value.get("text_config").unwrap_or(value);
+    EstimateConfig {
+        hidden_size: first_config_u64(
+            value,
+            &[
+                &["hidden_size"],
+                &["n_embd"],
+                &["text_config", "hidden_size"],
+            ],
+        ),
+        num_hidden_layers: first_config_u64(
+            value,
+            &[
+                &["num_hidden_layers"],
+                &["n_layer"],
+                &["num_layers"],
+                &["text_config", "num_hidden_layers"],
+            ],
+        ),
+        num_attention_heads: first_config_u64(
+            value,
+            &[
+                &["num_attention_heads"],
+                &["n_head"],
+                &["text_config", "num_attention_heads"],
+            ],
+        ),
+        num_key_value_heads: first_config_u64(
+            value,
+            &[
+                &["num_key_value_heads"],
+                &["n_head_kv"],
+                &["text_config", "num_key_value_heads"],
+            ],
+        ),
+        head_dim: first_config_u64(value, &[&["head_dim"], &["text_config", "head_dim"]]),
+        max_position_embeddings: first_config_u64(
+            value,
+            &[
+                &["max_position_embeddings"],
+                &["seq_length"],
+                &["context_length"],
+                &["model_max_length"],
+                &["n_positions"],
+                &["n_ctx"],
+                &["text_config", "max_position_embeddings"],
+                &["text_config", "context_length"],
+            ],
+        ),
+        sliding_window: first_config_u64(
+            value,
+            &[&["sliding_window"], &["text_config", "sliding_window"]],
+        ),
+        dtype: first_config_string(
+            value,
+            &[
+                &["torch_dtype"],
+                &["dtype"],
+                &["text_config", "torch_dtype"],
+            ],
+        ),
+        vocab_size: first_config_u64(value, &[&["vocab_size"], &["text_config", "vocab_size"]]),
+        architectures: value
+            .get("architectures")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        model_type: text_config
+            .get("model_type")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("model_type").and_then(Value::as_str))
+            .map(ToString::to_string),
+    }
+}
+
+fn first_config_u64(value: &Value, paths: &[&[&str]]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        let mut current = value;
+        for segment in *path {
+            current = current.get(*segment)?;
+        }
+        current.as_u64()
+    })
+}
+
+fn first_config_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        let mut current = value;
+        for segment in *path {
+            current = current.get(*segment)?;
+        }
+        current.as_str().map(ToString::to_string)
+    })
+}
+
+fn latest_estimate_observation(
+    store: &ModelStore,
+    manifest: &ModelManifest,
+) -> Option<EstimateObservation> {
+    let path = store
+        .home()
+        .join("benchmarks")
+        .join("estimate-observations.json");
+    let data = fs::read_to_string(path).ok()?;
+    let observations = serde_json::from_str::<Vec<EstimateObservation>>(&data).ok()?;
+    observations
+        .into_iter()
+        .filter(|observation| observation.model == manifest.id)
+        .filter(|observation| observation.measured_peak_memory_bytes.is_some())
+        .max_by_key(|observation| observation.timestamp.unwrap_or(0))
+}
+
+fn estimate_backend_hint(manifest: &ModelManifest) -> &'static str {
+    match manifest.format {
+        ModelFormat::Mlx => "MLX",
+        ModelFormat::Gguf => "llama.cpp",
+        ModelFormat::Onnx => "ONNX Runtime",
+        ModelFormat::SafeTensors if cfg!(target_os = "macos") => "MLX",
+        ModelFormat::SafeTensors => "Candle",
+        ModelFormat::PyTorch => "PyTorch",
+        ModelFormat::TensorRt => "TensorRT",
+        ModelFormat::OpenVino => "OpenVINO",
+        ModelFormat::TensorFlow => "TensorFlow",
+        ModelFormat::CoreMl => "Core ML",
+        ModelFormat::Unknown => "unknown",
+    }
+}
+
+fn format_label(format: &ModelFormat) -> &'static str {
+    match format {
+        ModelFormat::Gguf => "gguf",
+        ModelFormat::SafeTensors => "safetensors",
+        ModelFormat::PyTorch => "pytorch",
+        ModelFormat::Onnx => "onnx",
+        ModelFormat::Mlx => "mlx",
+        ModelFormat::TensorRt => "tensorrt",
+        ModelFormat::OpenVino => "openvino",
+        ModelFormat::TensorFlow => "tensorflow",
+        ModelFormat::CoreMl => "coreml",
+        ModelFormat::Unknown => "unknown",
+    }
+}
+
+fn detect_system_memory() -> SystemMemory {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_system_memory();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_system_memory();
+    }
+    #[allow(unreachable_code)]
+    SystemMemory {
+        total_bytes: None,
+        available_bytes: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_system_memory() -> SystemMemory {
+    let Ok(data) = fs::read_to_string("/proc/meminfo") else {
+        return SystemMemory {
+            total_bytes: None,
+            available_bytes: None,
+        };
+    };
+    let total_bytes = linux_meminfo_kib(&data, "MemTotal").map(|kib| kib.saturating_mul(1024));
+    let available_bytes =
+        linux_meminfo_kib(&data, "MemAvailable").map(|kib| kib.saturating_mul(1024));
+    SystemMemory {
+        total_bytes,
+        available_bytes,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_meminfo_kib(data: &str, key: &str) -> Option<u64> {
+    data.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name != key {
+            return None;
+        }
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_memory() -> SystemMemory {
+    let vm_stat = command_stdout("vm_stat", &[]);
+    SystemMemory {
+        total_bytes: command_stdout("sysctl", &["-n", "hw.memsize"])
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .or_else(|| vm_stat.as_deref().and_then(macos_total_memory_from_vm_stat)),
+        available_bytes: vm_stat
+            .as_deref()
+            .and_then(macos_available_memory_from_vm_stat),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_available_memory_from_vm_stat(vm_stat: &str) -> Option<u64> {
+    let page_size = parse_macos_vm_page_size(&vm_stat).or_else(|| {
+        command_stdout("sysctl", &["-n", "hw.pagesize"])?
+            .trim()
+            .parse()
+            .ok()
+    })?;
+    let pages = ["Pages free", "Pages inactive", "Pages speculative"]
+        .iter()
+        .filter_map(|name| parse_macos_vm_stat_pages(&vm_stat, name))
+        .sum::<u64>();
+    Some(pages.saturating_mul(page_size))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_total_memory_from_vm_stat(vm_stat: &str) -> Option<u64> {
+    let page_size = parse_macos_vm_page_size(vm_stat).or_else(|| {
+        command_stdout("sysctl", &["-n", "hw.pagesize"])?
+            .trim()
+            .parse()
+            .ok()
+    })?;
+    let pages = [
+        "Pages free",
+        "Pages active",
+        "Pages inactive",
+        "Pages speculative",
+        "Pages wired down",
+        "Pages occupied by compressor",
+    ]
+    .iter()
+    .filter_map(|name| parse_macos_vm_stat_pages(vm_stat, name))
+    .sum::<u64>();
+    if pages == 0 {
+        return None;
+    }
+    Some(pages.saturating_mul(page_size))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_vm_page_size(vm_stat: &str) -> Option<u64> {
+    let first_line = vm_stat.lines().next()?;
+    let marker = "page size of ";
+    let start = first_line.find(marker)? + marker.len();
+    let rest = &first_line[start..];
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
+    vm_stat.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name.trim() != key {
+            return None;
+        }
+        rest.trim()
+            .trim_end_matches('.')
+            .replace('.', "")
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 fn terminal_spinner_enabled(debug: bool) -> bool {
@@ -1972,6 +3622,7 @@ fn chat_template_default_source(
         }
         BackendChoice::Mlx
         | BackendChoice::MlxVlm
+        | BackendChoice::TransformersCompat
         | BackendChoice::Vllm
         | BackendChoice::VllmRocm => ChatTemplateSource::Model,
         _ => ChatTemplateSource::Werk,
@@ -1979,14 +3630,13 @@ fn chat_template_default_source(
 }
 
 fn chat_template_model_preferred(manifest: &ModelManifest, backend: BackendChoice) -> bool {
-    matches!(
-        backend,
-        BackendChoice::LlamaServer(_)
-            | BackendChoice::LlamaFast(_)
-            | BackendChoice::LlamaHighlevel(_)
-            | BackendChoice::Vllm
-            | BackendChoice::VllmRocm
-    ) && manifest.format == ModelFormat::Gguf
+    matches!(backend, BackendChoice::TransformersCompat)
+        || matches!(
+            backend,
+            BackendChoice::LlamaServer(_)
+                | BackendChoice::LlamaFast(_)
+                | BackendChoice::LlamaHighlevel(_)
+        ) && manifest.format == ModelFormat::Gguf
         || matches!(backend, BackendChoice::Vllm | BackendChoice::VllmRocm)
 }
 
@@ -2862,6 +4512,7 @@ enum BackendChoice {
     Mlx,
     MlxVlm,
     OnnxRuntime(OnnxRuntimeMode),
+    TransformersCompat,
     Vllm,
     VllmRocm,
 }
@@ -3125,6 +4776,7 @@ fn backend_arg_to_choice(backend: BackendArg) -> BackendChoice {
             llama: LlamaCppMode::Rocm,
             candle: CandleDeviceMode::Auto,
         },
+        BackendArg::Transformers => BackendChoice::TransformersCompat,
         BackendArg::Vllm => BackendChoice::Vllm,
         BackendArg::Vulkan => BackendChoice::GgufPreferred {
             llama: LlamaCppMode::Vulkan,
@@ -3223,6 +4875,7 @@ fn build_concrete_backend(
         BackendChoice::Mlx => Ok(Arc::new(MlxBackend::new(store))),
         BackendChoice::MlxVlm => Ok(Arc::new(MlxVlmBackend::new(store))),
         BackendChoice::OnnxRuntime(mode) => Ok(Arc::new(OnnxRuntimeBackend::new(store, mode))),
+        BackendChoice::TransformersCompat => Ok(Arc::new(TransformersCompatBackend::new(store))),
         BackendChoice::Vllm | BackendChoice::VllmRocm => Ok(Arc::new(VllmBackend::new(store))),
     }
 }
@@ -3258,6 +4911,7 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::OnnxRuntimeCuda => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda)),
         RuntimeId::OnnxRuntimeRocm => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm)),
         RuntimeId::OnnxRuntimeCpu => Some(BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu)),
+        RuntimeId::TransformersCompat => Some(BackendChoice::TransformersCompat),
         RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
         RuntimeId::VllmRocm => Some(BackendChoice::VllmRocm),
     }
@@ -3292,6 +4946,7 @@ fn backend_to_runtime_id(backend: BackendChoice) -> Option<RuntimeId> {
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => Some(RuntimeId::OnnxRuntimeCuda),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => Some(RuntimeId::OnnxRuntimeRocm),
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => Some(RuntimeId::OnnxRuntimeCpu),
+        BackendChoice::TransformersCompat => Some(RuntimeId::TransformersCompat),
         BackendChoice::Vllm => Some(RuntimeId::VllmCuda),
         BackendChoice::VllmRocm => Some(RuntimeId::VllmRocm),
         BackendChoice::Auto
@@ -3411,6 +5066,7 @@ fn backend_runtime(backend: BackendChoice) -> BackendRuntime {
         BackendChoice::Mlx => BackendRuntime::Mlx,
         BackendChoice::MlxVlm => BackendRuntime::MlxVlm,
         BackendChoice::OnnxRuntime(_) => BackendRuntime::OnnxRuntime,
+        BackendChoice::TransformersCompat => BackendRuntime::TransformersCompat,
         BackendChoice::Vllm | BackendChoice::VllmRocm => BackendRuntime::Vllm,
     }
 }
@@ -3444,6 +5100,7 @@ fn backend_accelerator(backend: BackendChoice) -> BackendAccelerator {
         BackendChoice::Mlx | BackendChoice::MlxVlm => BackendAccelerator::Mlx,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => BackendAccelerator::Cuda,
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => BackendAccelerator::Cpu,
+        BackendChoice::TransformersCompat => BackendAccelerator::Auto,
         BackendChoice::Vllm => BackendAccelerator::Cuda,
     }
 }
@@ -3479,6 +5136,9 @@ fn backend_unavailability_reason(
         BackendChoice::MlxVlm => MlxVlmBackend::probe().err().map(|_| {
             "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
         }),
+        BackendChoice::TransformersCompat => TransformersCompatBackend::probe()
+            .err()
+            .map(|_| TransformersCompatBackend::unavailable_reason()),
         BackendChoice::Burn(mode) => BurnBackend::probe(store, manifest, mode)
             .err()
             .map(|_| BurnBackend::unavailable_reason(store, manifest, mode)),
@@ -3568,6 +5228,7 @@ fn selected_backend_for_request(
         | BackendChoice::Mlx
         | BackendChoice::MlxVlm
         | BackendChoice::OnnxRuntime(_)
+        | BackendChoice::TransformersCompat
         | BackendChoice::Vllm
         | BackendChoice::VllmRocm => {
             let candidates = if matches!(backend, BackendChoice::Mlx) && has_images {
@@ -3788,6 +5449,7 @@ fn requested_backend_for_choice(backend: BackendChoice) -> RequestedBackend {
         BackendChoice::Burn(_) => RequestedBackend::Burn,
         BackendChoice::Candle(_) => RequestedBackend::Candle,
         BackendChoice::Mlx | BackendChoice::MlxVlm => RequestedBackend::Mlx,
+        BackendChoice::TransformersCompat => RequestedBackend::Transformers,
         BackendChoice::Vllm => RequestedBackend::Vllm,
         BackendChoice::VllmRocm => RequestedBackend::Rocm,
         BackendChoice::LlamaFast(_) => RequestedBackend::LlamaLegacy,
@@ -3860,6 +5522,9 @@ fn unavailable_backend_message(
         (BackendChoice::Mlx, _) => "mlx-lm is unavailable".to_string(),
         (BackendChoice::MlxVlm, _) => {
             "mlx-vlm is unavailable; install with `python3 -m pip install mlx-vlm`".to_string()
+        }
+        (BackendChoice::TransformersCompat, ModelFormat::SafeTensors) => {
+            TransformersCompatBackend::unavailable_reason()
         }
         _ => format!(
             "backend {} is unavailable for model '{}' with format {:?}",
@@ -4121,6 +5786,7 @@ fn requested_backend_label(backend: BackendArg) -> &'static str {
         BackendArg::Mlx => "mlx",
         BackendArg::Onnx => "onnx",
         BackendArg::Rocm => "rocm",
+        BackendArg::Transformers => "transformers",
         BackendArg::Vllm => "vllm",
         BackendArg::Vulkan => "vulkan",
     }
@@ -4153,6 +5819,9 @@ fn unsupported_backend_message(backend: BackendChoice, manifest: &ModelManifest)
         }
         (_, ModelFormat::Onnx) => {
             "Direct ONNX model import is catalog-only for now; install a safetensors model and build managed ONNX artifacts with `werk artifacts build <model>`.".to_string()
+        }
+        (BackendChoice::TransformersCompat, _) => {
+            "Transformers compatibility backend supports raw ChatGLM/GLM Hugging Face safetensors models only".to_string()
         }
         (_, ModelFormat::PyTorch) => {
             "PyTorch generation is pending; PyTorch backend is not implemented yet".to_string()
@@ -4212,6 +5881,7 @@ fn backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "onnxruntime-cuda",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "onnxruntime-rocm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "onnxruntime-cpu",
+        BackendChoice::TransformersCompat => "transformers",
         BackendChoice::Vllm => "vllm-cuda",
         BackendChoice::VllmRocm => "vllm-rocm",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama-server-cuda",
@@ -4262,6 +5932,7 @@ fn verbose_backend_label(backend: BackendChoice) -> &'static str {
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cuda) => "ONNX Runtime CUDA",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Rocm) => "ONNX Runtime ROCm",
         BackendChoice::OnnxRuntime(OnnxRuntimeMode::Cpu) => "ONNX Runtime CPU",
+        BackendChoice::TransformersCompat => "Transformers compatibility",
         BackendChoice::Vllm => "vLLM CUDA",
         BackendChoice::VllmRocm => "vLLM ROCm",
         BackendChoice::LlamaServer(LlamaCppMode::Cuda) => "llama.cpp server CUDA",
@@ -4495,7 +6166,7 @@ fn format_bytes_f64(bytes: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_store::ModelSource;
+    use crate::model_store::{ModelFile, ModelSource};
     use std::fs;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4766,6 +6437,14 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli =
+            Cli::try_parse_from(["werk", "--backend", "transformers", "chat", "tiny"]).unwrap();
+        assert_eq!(cli.backend, BackendArg::Transformers);
+        match cli.command.unwrap() {
+            Commands::Chat { model, .. } => assert_eq!(model, "tiny"),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
         let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--max-tokens", "64"]).unwrap();
         match cli.command.unwrap() {
             Commands::Chat { max_tokens, .. } => assert_eq!(max_tokens, 64),
@@ -4823,6 +6502,29 @@ mod tests {
             Commands::SelectFile { id, file } => {
                 assert_eq!(id, "tiny");
                 assert_eq!(file, "tinyllama.Q4_K_M.gguf");
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "estimate",
+            "org/repo",
+            "--file",
+            "model.Q4_K_M.gguf",
+            "--verbose",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Estimate {
+                model,
+                file,
+                verbose,
+                ..
+            } => {
+                assert_eq!(model, "org/repo");
+                assert_eq!(file.as_deref(), Some("model.Q4_K_M.gguf"));
+                assert!(verbose);
             }
             command => panic!("unexpected command: {command:?}"),
         }
@@ -5835,6 +7537,29 @@ mod tests {
     }
 
     #[test]
+    fn transformers_compat_uses_model_chat_template_and_messages() {
+        let manifest = test_manifest(ModelFormat::SafeTensors, Some("chatglm"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            name: None,
+        }];
+        let prompt = prompt_for_backend(
+            &manifest,
+            &messages,
+            BackendChoice::TransformersCompat,
+            None,
+        );
+        let request_messages = generation_request_messages(&prompt, &messages);
+
+        assert_eq!(prompt.chat_template.source, ChatTemplateSource::Model);
+        assert_eq!(prompt.chat_template.name, "model");
+        assert!(!prompt.chat_template.applied_by_werk);
+        assert_eq!(request_messages.len(), 1);
+        assert_eq!(prompt.prompt, "hello");
+    }
+
+    #[test]
     fn chat_request_messages_keep_history_by_default() {
         let mut history = vec![ChatMessage {
             role: "user".to_string(),
@@ -5897,6 +7622,452 @@ mod tests {
         );
     }
 
+    #[test]
+    fn estimate_small_model_fits() {
+        let store = test_store("estimate-small");
+        let manifest = test_manifest_with_weight(
+            ModelFormat::SafeTensors,
+            Some("llama"),
+            "files/model.safetensors",
+            2 * GIB,
+        );
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(32 * GIB),
+                available_bytes: Some(16 * GIB),
+            },
+        );
+
+        assert_eq!(report.result, EstimateResult::Ok);
+    }
+
+    #[test]
+    fn estimate_huggingface_repo_id_detection_is_conservative() {
+        assert!(looks_like_huggingface_repo_id("tiiuae/Falcon3-7B-Instruct"));
+        assert!(looks_like_huggingface_repo_id("org/repo"));
+        assert!(!looks_like_huggingface_repo_id("local-model"));
+        assert!(!looks_like_huggingface_repo_id("/tmp/model"));
+        assert!(!looks_like_huggingface_repo_id(
+            "https://huggingface.co/org/repo"
+        ));
+    }
+
+    #[test]
+    fn estimate_missing_plain_model_keeps_pull_hint() {
+        let store = test_store("estimate-plain-missing");
+        let err = estimate_model_or_huggingface(
+            &store,
+            "local-missing",
+            None,
+            SystemMemory {
+                total_bytes: None,
+                available_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            err,
+            "model 'local-missing' is not installed; run `werk pull local-missing` first"
+        );
+    }
+
+    #[test]
+    fn estimate_near_limit_warns() {
+        let store = test_store("estimate-warning");
+        let manifest = test_manifest_with_weight(
+            ModelFormat::SafeTensors,
+            Some("llama"),
+            "files/model.safetensors",
+            5 * GIB,
+        );
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(16 * GIB),
+                available_bytes: Some(10 * GIB),
+            },
+        );
+
+        assert_eq!(report.result, EstimateResult::Warning);
+    }
+
+    #[test]
+    fn estimate_above_limit_is_likely_oom() {
+        let store = test_store("estimate-oom");
+        let manifest = test_manifest_with_weight(
+            ModelFormat::SafeTensors,
+            Some("llama"),
+            "files/model.safetensors",
+            5 * GIB,
+        );
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(16 * GIB),
+                available_bytes: Some(8 * GIB),
+            },
+        );
+
+        assert_eq!(report.result, EstimateResult::LikelyOom);
+    }
+
+    #[test]
+    fn estimate_memory_heavy_architectures_use_higher_kv_cache() {
+        let normal = kv_cache_fallback_bytes(10 * GIB, Some("llama"));
+        for architecture in ["jamba", "mamba", "mixtral", "deepseek-moe"] {
+            assert!(
+                kv_cache_fallback_bytes(10 * GIB, Some(architecture)) > normal,
+                "{architecture} should use the memory-heavy KV estimate"
+            );
+        }
+    }
+
+    #[test]
+    fn estimate_unknown_available_memory_falls_back_to_total_thresholds() {
+        let store = test_store("estimate-total-fallback");
+        let manifest = test_manifest_with_weight(
+            ModelFormat::SafeTensors,
+            Some("llama"),
+            "files/model.safetensors",
+            6 * GIB,
+        );
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(16 * GIB),
+                available_bytes: None,
+            },
+        );
+
+        assert_eq!(report.result, EstimateResult::Warning);
+    }
+
+    #[test]
+    fn estimate_format_bytes_uses_gib_style_output() {
+        assert_eq!(format_bytes(GIB), "1.00 GiB");
+    }
+
+    #[test]
+    fn estimate_gguf_counts_selected_model_file_only() {
+        let mut manifest = test_manifest(ModelFormat::Gguf, Some("llama"));
+        manifest.model_path = Some("files/model.Q4_K_M.gguf".to_string());
+        manifest.files = vec![
+            model_file("files/model.Q4_K_M.gguf", 4 * GIB),
+            model_file("files/model.Q8_0.gguf", 8 * GIB),
+        ];
+
+        assert_eq!(estimate_model_files_bytes(&manifest), 4 * GIB);
+    }
+
+    #[test]
+    fn estimate_weight_filtering_ignores_metadata_files() {
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
+        manifest.model_path = Some("files/model.safetensors".to_string());
+        manifest.files = vec![
+            model_file("files/model.safetensors", 3 * GIB),
+            model_file("files/tokenizer.json", 1_000),
+            model_file("files/tokenizer_config.json", 1_000),
+            model_file("files/special_tokens_map.json", 1_000),
+            model_file("files/generation_config.json", 1_000),
+            model_file("files/config.json", 1_000),
+            model_file("files/README.md", 1_000),
+            model_file("files/LICENSE", 1_000),
+            model_file("files/merges.txt", 1_000),
+            model_file("files/vocab.json", 1_000),
+            model_file("files/chat_template.jinja", 1_000),
+        ];
+
+        let accounting = estimate_weight_accounting_without_store(&manifest);
+
+        assert_eq!(accounting.total_bytes(), 3 * GIB);
+        assert_eq!(accounting.counted.len(), 1);
+        assert!(
+            accounting
+                .ignored
+                .iter()
+                .any(|file| file.path.ends_with("tokenizer.json"))
+        );
+        assert!(
+            accounting
+                .ignored
+                .iter()
+                .any(|file| file.path.ends_with("README.md"))
+        );
+    }
+
+    #[test]
+    fn estimate_safetensors_index_counts_referenced_shards() {
+        let store = test_store("estimate-safetensors-index");
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
+        manifest.model_path = Some("files/model.safetensors".to_string());
+        manifest.files = vec![
+            model_file("files/model.safetensors.index.json", 128),
+            model_file("files/model-00001-of-00002.safetensors", 2 * GIB),
+            model_file("files/model-00002-of-00002.safetensors", 2 * GIB),
+            model_file("files/unreferenced.safetensors", 10 * GIB),
+            model_file("files/tokenizer.json", 256),
+        ];
+        write_store_file(
+            &store,
+            &manifest,
+            "files/model.safetensors.index.json",
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        );
+
+        let accounting = estimate_weight_accounting(&store, &manifest);
+
+        assert_eq!(accounting.total_bytes(), 4 * GIB);
+        assert_eq!(accounting.confidence, EstimateConfidence::High);
+        assert!(
+            accounting
+                .ignored
+                .iter()
+                .any(|file| file.path == "files/unreferenced.safetensors")
+        );
+    }
+
+    #[test]
+    fn estimate_kv_cache_formula_computes_expected_bytes() {
+        let config = EstimateConfig {
+            hidden_size: Some(2048),
+            num_hidden_layers: Some(24),
+            num_attention_heads: Some(32),
+            num_key_value_heads: Some(8),
+            head_dim: None,
+            max_position_embeddings: Some(8192),
+            dtype: Some("bfloat16".to_string()),
+            ..EstimateConfig::default()
+        };
+
+        let estimate = kv_cache_estimate(4 * GIB, Some("llama"), &Some(config));
+
+        assert_eq!(estimate.bytes, 24 * 8 * 64 * 2 * 4096 * 2);
+        assert_eq!(estimate.confidence, EstimateConfidence::High);
+        assert!(estimate.config_used);
+    }
+
+    #[test]
+    fn estimate_kv_cache_formula_with_defaults_is_medium_confidence() {
+        let config = EstimateConfig {
+            hidden_size: Some(2048),
+            num_hidden_layers: Some(24),
+            num_attention_heads: Some(32),
+            ..EstimateConfig::default()
+        };
+
+        let estimate = kv_cache_estimate(4 * GIB, Some("llama"), &Some(config));
+
+        assert_eq!(estimate.confidence, EstimateConfidence::Medium);
+        assert!(estimate.config_used);
+    }
+
+    #[test]
+    fn estimate_fallback_heuristic_marks_confidence_low() {
+        let estimate = kv_cache_estimate(4 * GIB, Some("llama"), &None);
+
+        assert_eq!(estimate.bytes, scale_bytes(4 * GIB, 0.35));
+        assert_eq!(estimate.confidence, EstimateConfidence::Low);
+        assert!(!estimate.config_used);
+    }
+
+    #[test]
+    fn estimate_memory_heavy_config_keeps_low_confidence() {
+        let config = EstimateConfig {
+            hidden_size: Some(4096),
+            num_hidden_layers: Some(32),
+            num_attention_heads: Some(32),
+            num_key_value_heads: Some(8),
+            max_position_embeddings: Some(4096),
+            dtype: Some("bfloat16".to_string()),
+            model_type: Some("jamba".to_string()),
+            ..EstimateConfig::default()
+        };
+
+        let estimate = kv_cache_estimate(10 * GIB, Some("jamba"), &Some(config));
+
+        assert_eq!(estimate.bytes, scale_bytes(10 * GIB, 0.60));
+        assert_eq!(estimate.confidence, EstimateConfidence::Low);
+        assert!(!estimate.config_used);
+    }
+
+    #[test]
+    fn estimate_smol_lm_like_config_uses_formula_not_weight_fraction() {
+        let store = test_store("estimate-smollm");
+        let mut manifest = test_manifest_with_weight(
+            ModelFormat::SafeTensors,
+            Some("llama"),
+            "files/model.safetensors",
+            3 * GIB,
+        );
+        manifest.config_path = Some("files/config.json".to_string());
+        write_store_file(
+            &store,
+            &manifest,
+            "files/config.json",
+            r#"{
+                "model_type": "llama",
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 32,
+                "max_position_embeddings": 8192,
+                "torch_dtype": "bfloat16"
+            }"#,
+        );
+
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(48 * GIB),
+                available_bytes: Some(32 * GIB),
+            },
+        );
+
+        assert!(report.config_used);
+        assert_eq!(report.confidence, EstimateConfidence::High);
+        assert!(report.kv_cache_bytes < scale_bytes(3 * GIB, 0.35));
+        assert!(report.estimated_total_bytes < 5 * GIB);
+    }
+
+    #[test]
+    fn estimate_output_formatting_ends_with_newline() {
+        let store = test_store("estimate-output-newline");
+        let manifest = test_manifest_with_weight(
+            ModelFormat::Gguf,
+            Some("llama"),
+            "files/model.Q4_K_M.gguf",
+            GIB,
+        );
+        let report = estimate_model_memory(
+            &store,
+            &manifest,
+            SystemMemory {
+                total_bytes: Some(16 * GIB),
+                available_bytes: Some(8 * GIB),
+            },
+        );
+
+        assert!(format_estimate_report(&report, true).ends_with('\n'));
+    }
+
+    #[test]
+    fn remote_hf_metadata_parses_lfs_file_sizes() {
+        let metadata = serde_json::json!({
+            "siblings": [
+                {"rfilename": "model.safetensors", "lfs": {"size": 1234}},
+                {"rfilename": "tokenizer.json", "size": "5678"}
+            ]
+        });
+
+        let files = parse_remote_hf_files(&metadata);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "model.safetensors");
+        assert_eq!(files[0].size, 1234);
+        assert_eq!(files[1].path, "tokenizer.json");
+        assert_eq!(files[1].size, 5678);
+    }
+
+    #[test]
+    fn remote_hf_manifest_prefers_balanced_gguf_quant() {
+        let remote = remote_hf_test_model(
+            "unsloth/Tiny-GGUF",
+            Some(serde_json::json!({"model_type": "llama"})),
+            &[
+                ("tiny.Q2_K.gguf", 2 * GIB),
+                ("tiny.Q4_K_M.gguf", 4 * GIB),
+                ("tiny.Q8_0.gguf", 8 * GIB),
+                ("tokenizer.json", 1024),
+            ],
+        );
+
+        let manifest = remote_hf_manifest(&remote, None).unwrap();
+
+        assert_eq!(manifest.format, ModelFormat::Gguf);
+        assert_eq!(manifest.architecture.as_deref(), Some("llama"));
+        assert_eq!(
+            manifest.model_path.as_deref(),
+            Some("files/tiny.Q4_K_M.gguf")
+        );
+        assert!(matches!(
+            manifest.source,
+            ModelSource::HuggingFace { ref repo } if repo == "unsloth/Tiny-GGUF"
+        ));
+    }
+
+    #[test]
+    fn remote_hf_manifest_respects_explicit_file() {
+        let remote = remote_hf_test_model(
+            "unsloth/Tiny-GGUF",
+            Some(serde_json::json!({"model_type": "llama"})),
+            &[("tiny.Q4_K_M.gguf", 4 * GIB), ("tiny.Q8_0.gguf", 8 * GIB)],
+        );
+
+        let manifest = remote_hf_manifest(&remote, Some("files/tiny.Q8_0.gguf")).unwrap();
+
+        assert_eq!(manifest.format, ModelFormat::Gguf);
+        assert_eq!(manifest.model_path.as_deref(), Some("files/tiny.Q8_0.gguf"));
+    }
+
+    #[test]
+    fn remote_hf_safetensors_index_counts_referenced_shards() {
+        let remote = remote_hf_test_model(
+            "org/sharded",
+            Some(serde_json::json!({"model_type": "llama"})),
+            &[
+                ("model.safetensors.index.json", 128),
+                ("model-00001-of-00002.safetensors", 2 * GIB),
+                ("model-00002-of-00002.safetensors", 2 * GIB),
+                ("unreferenced.safetensors", 10 * GIB),
+                ("tokenizer.json", 1024),
+            ],
+        );
+        let manifest = remote_hf_manifest(&remote, None).unwrap();
+        let index = serde_json::json!({
+            "weight_map": {
+                "a": "model-00001-of-00002.safetensors",
+                "b": "model-00002-of-00002.safetensors"
+            }
+        });
+
+        let accounting = safetensors_index_weight_accounting_from_value(
+            &manifest,
+            "files/model.safetensors.index.json",
+            &index,
+        )
+        .unwrap();
+
+        assert_eq!(accounting.total_bytes(), 4 * GIB);
+        assert_eq!(accounting.confidence, EstimateConfidence::High);
+        assert!(
+            accounting
+                .ignored
+                .iter()
+                .any(|file| file.path == "files/unreferenced.safetensors")
+        );
+    }
+
+    #[test]
+    fn estimate_source_url_reports_huggingface_source() {
+        let mut manifest = test_manifest(ModelFormat::SafeTensors, Some("llama"));
+        manifest.source = ModelSource::HuggingFace {
+            repo: "org/model".to_string(),
+        };
+
+        assert_eq!(
+            estimate_source_url(&manifest).as_deref(),
+            Some("https://huggingface.co/org/model")
+        );
+    }
+
     fn test_store(name: &str) -> ModelStore {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5924,6 +8095,51 @@ mod tests {
             created_unix: 1,
             files: Vec::new(),
             artifacts: Vec::new(),
+        }
+    }
+
+    fn write_store_file(store: &ModelStore, manifest: &ModelManifest, path: &str, data: &str) {
+        let path = store.model_dir(&manifest.id).join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, data).unwrap();
+    }
+
+    fn test_manifest_with_weight(
+        format: ModelFormat,
+        architecture: Option<&str>,
+        path: &str,
+        size: u64,
+    ) -> ModelManifest {
+        let mut manifest = test_manifest(format, architecture);
+        manifest.model_path = Some(path.to_string());
+        manifest.files = vec![model_file(path, size)];
+        manifest
+    }
+
+    fn remote_hf_test_model(
+        repo: &str,
+        config: Option<Value>,
+        files: &[(&str, u64)],
+    ) -> RemoteHfModel {
+        RemoteHfModel {
+            repo: repo.to_string(),
+            config,
+            files: files
+                .iter()
+                .map(|(path, size)| RemoteHfFile {
+                    path: (*path).to_string(),
+                    size: *size,
+                })
+                .collect(),
+            gated: false,
+        }
+    }
+
+    fn model_file(path: &str, size: u64) -> ModelFile {
+        ModelFile {
+            path: path.to_string(),
+            size,
+            checksum: "crc32:00000000".to_string(),
         }
     }
 

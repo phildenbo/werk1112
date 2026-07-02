@@ -226,6 +226,10 @@ impl ModelStore {
         Ok(huggingface_token_with_source(&self.huggingface_token_path())?.map(|(token, _)| token))
     }
 
+    pub fn huggingface_http_token(&self) -> Result<Option<String>> {
+        self.huggingface_token()
+    }
+
     pub fn models_dir(&self) -> PathBuf {
         self.home.join("models")
     }
