@@ -381,6 +381,9 @@ pub enum Commands {
 
         #[arg(long, help = "Default model for API requests that omit model")]
         model: Option<String>,
+
+        #[arg(long, help = "Print HTTP request and generation logs")]
+        verbose: bool,
     },
 
     #[command(about = "Run one prompt against an installed model and print the response")]
@@ -728,6 +731,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 11434,
         model: None,
+        verbose: false,
     });
 
     if should_print_startup_banner(&command) {
@@ -735,7 +739,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     match command {
-        Commands::Serve { host, port, model } => {
+        Commands::Serve {
+            host,
+            port,
+            model,
+            verbose,
+        } => {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
@@ -759,6 +768,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                             has_images,
                             selection_options,
                         )?;
+                        if verbose {
+                            eprintln!(
+                                "[werk serve] route model={} backend={}",
+                                manifest.id,
+                                verbose_backend_label(selected_backend)
+                            );
+                        }
                         Ok(chat_template_options_for_backend(
                             manifest,
                             selected_backend,
@@ -778,11 +794,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             serve(
                 addr,
-                ApiState::new_with_default_model_and_prompt_options(
+                ApiState::new_with_default_model_prompt_options_and_verbose(
                     store,
                     backend,
                     model,
                     Some(prompt_options_resolver),
+                    verbose,
                 ),
             )
             .await
@@ -6239,11 +6256,23 @@ mod tests {
         .unwrap();
         assert_eq!(cli.device, Some(DeviceArg::Cuda));
         match cli.command.unwrap() {
-            Commands::Serve { host, port, model } => {
+            Commands::Serve {
+                host,
+                port,
+                model,
+                verbose,
+            } => {
                 assert_eq!(host, "0.0.0.0");
                 assert_eq!(port, 8080);
                 assert_eq!(model.as_deref(), Some("m"));
+                assert!(!verbose);
             }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["werk", "serve", "--verbose"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve { verbose, .. } => assert!(verbose),
             command => panic!("unexpected command: {command:?}"),
         }
 
@@ -7298,6 +7327,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 11434,
             model: None,
+            verbose: false,
         };
         assert!(should_print_startup_banner_for(&serve, true, true));
         assert!(!should_print_startup_banner_for(&serve, false, true));

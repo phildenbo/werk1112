@@ -36,7 +36,9 @@ llama_cpp = { version = "0.3.2", optional = true }
 llama_cpp_sys = { version = "0.3.2", default-features = false, optional = true }
 
 [features]
-default = ["recommended"]
+# Default builds are backend-neutral so source installs do not require CUDA,
+# ROCm, Metal, MLX, vLLM, llama.cpp, or ONNX Runtime tooling to compile.
+default = []
 recommended = ["cuda"]
 llama-cpp = ["dep:llama_cpp"]
 llama-fast = ["dep:llama_cpp_sys"]
