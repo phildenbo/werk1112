@@ -588,7 +588,7 @@ Generate a persistent API key file for clients such as Open WebUI:
 werk auth api-key generate
 ```
 
-By default this creates `~/.config/werk1112/api-keys.toml`. `werk serve` loads that file automatically when it exists. To create or use a different file:
+By default this creates `~/.config/werk1112/api-keys.toml`. `werk serve` requires API key auth by default and loads that file automatically. To create or use a different file:
 
 ```bash
 werk auth api-key generate --path /path/to/api-keys.toml
@@ -599,6 +599,12 @@ Clients should send the generated value as an OpenAI-compatible bearer token:
 
 ```text
 Authorization: Bearer <key>
+```
+
+For a local development server with no authentication:
+
+```bash
+werk serve --allow-unauthenticated
 ```
 
 Import a local model file or directory. Files are copied into the managed model store:

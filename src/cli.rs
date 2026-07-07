@@ -388,6 +388,7 @@ pub enum Commands {
             long,
             env = "WERK_API_KEY",
             hide_env_values = true,
+            conflicts_with = "api_keys",
             help = "Require OpenAI-style Authorization: Bearer <key> for /v1 requests"
         )]
         api_key: Option<String>,
@@ -399,6 +400,14 @@ pub enum Commands {
             help = "Load OpenAI-style bearer keys from an API keys TOML file"
         )]
         api_keys: Option<PathBuf>,
+
+        #[arg(
+            long,
+            action = ArgAction::SetTrue,
+            conflicts_with_all = ["api_key", "api_keys"],
+            help = "Disable API key auth for local development"
+        )]
+        allow_unauthenticated: bool,
 
         #[arg(long, help = "Print HTTP request and generation logs")]
         verbose: bool,
@@ -784,6 +793,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         model: None,
         api_key: None,
         api_keys: None,
+        allow_unauthenticated: false,
         verbose: false,
     });
     let selection_options =
@@ -800,11 +810,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             model,
             api_key,
             api_keys,
+            allow_unauthenticated,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
             store.ensure()?;
-            let api_keys = resolve_api_keys(api_key, api_keys)?;
+            let api_keys = resolve_api_keys(api_key, api_keys, allow_unauthenticated)?;
             let backend_choice = resolve_backend(backend_override, device_override)?;
             let ip: IpAddr = host.parse()?;
             let addr = SocketAddr::new(ip, port);
@@ -1282,7 +1293,12 @@ fn should_print_startup_banner(command: &Commands) -> bool {
 fn resolve_api_keys(
     api_key: Option<String>,
     api_keys_path: Option<PathBuf>,
+    allow_unauthenticated: bool,
 ) -> Result<Vec<String>> {
+    if allow_unauthenticated {
+        return Ok(Vec::new());
+    }
+
     let mut keys = Vec::new();
     if let Some(key) = api_key {
         let key = key.trim().to_string();
@@ -1292,19 +1308,25 @@ fn resolve_api_keys(
         keys.push(key);
     }
 
-    let path = if let Some(path) = api_keys_path {
-        Some(path)
-    } else {
-        api_keys::default_api_keys_path()
-            .ok()
-            .filter(|path| path.is_file())
-    };
-
-    if let Some(path) = path {
+    if let Some(path) = api_keys_path {
         keys.extend(
             api_keys::load_api_keys_file(&path)?
                 .into_iter()
                 .map(|entry| entry.key),
+        );
+    } else if let Ok(path) = api_keys::default_api_keys_path()
+        && path.is_file()
+    {
+        keys.extend(
+            api_keys::load_api_keys_file(&path)?
+                .into_iter()
+                .map(|entry| entry.key),
+        );
+    }
+
+    if keys.is_empty() {
+        bail!(
+            "werk serve requires API key auth by default. Run `werk auth api-key generate`, pass `--api-key <key>` or WERK_API_KEY, or use `--allow-unauthenticated` for local development."
         );
     }
 
@@ -6410,6 +6432,7 @@ mod tests {
                 model,
                 api_key,
                 api_keys,
+                allow_unauthenticated,
                 verbose,
             } => {
                 assert_eq!(host, "0.0.0.0");
@@ -6417,6 +6440,7 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("m"));
                 assert!(api_key.is_none());
                 assert!(api_keys.is_none());
+                assert!(!allow_unauthenticated);
                 assert!(!verbose);
             }
             command => panic!("unexpected command: {command:?}"),
@@ -6428,24 +6452,53 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
-        let cli = Cli::try_parse_from([
-            "werk",
-            "serve",
-            "--api-key",
-            "sk-test",
-            "--api-keys",
-            "/tmp/api-keys.toml",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["werk", "serve", "--api-key", "sk-test"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Serve {
-                api_key, api_keys, ..
-            } => {
+            Commands::Serve { api_key, .. } => {
                 assert_eq!(api_key.as_deref(), Some("sk-test"));
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["werk", "serve", "--api-keys", "/tmp/api-keys.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve { api_keys, .. } => {
                 assert_eq!(api_keys.as_deref(), Some(Path::new("/tmp/api-keys.toml")));
             }
             command => panic!("unexpected command: {command:?}"),
         }
+
+        let cli = Cli::try_parse_from(["werk", "serve", "--allow-unauthenticated"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Serve {
+                allow_unauthenticated,
+                ..
+            } => assert!(allow_unauthenticated),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "werk",
+                "serve",
+                "--api-key",
+                "sk-test",
+                "--api-keys",
+                "/tmp/api-keys.toml",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "werk",
+                "serve",
+                "--api-key",
+                "sk-test",
+                "--allow-unauthenticated",
+            ])
+            .is_err()
+        );
 
         let cli = Cli::try_parse_from([
             "werk",
@@ -7609,6 +7662,7 @@ mod tests {
             model: None,
             api_key: None,
             api_keys: None,
+            allow_unauthenticated: false,
             verbose: false,
         };
         assert!(should_print_startup_banner_for(&serve, true, true));
