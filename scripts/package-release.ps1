@@ -76,18 +76,12 @@ $Artifact = Join-Path $ReleaseDir "werk1112-v$Version-windows-x86_64.zip"
 Write-Host ""
 Write-Host "==> Building Windows release artifact"
 Write-Host "    Note: release artifacts are universal runtime-router binaries."
-Write-Host "    Running: cargo build-windows"
+Write-Host "    Running: scripts/build-windows.ps1"
 
-if (!$env:NVCC_PREPEND_FLAGS) {
-    $env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"
-} elseif ($env:NVCC_PREPEND_FLAGS -notmatch "CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING") {
-    $env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING $env:NVCC_PREPEND_FLAGS"
-}
-
-cargo build-windows
+& (Join-Path $ScriptDir "build-windows.ps1")
 
 if ($LASTEXITCODE -ne 0) {
-    Die "cargo build-windows failed"
+    Die "scripts/build-windows.ps1 failed"
 }
 
 if (!(Test-Path $BinaryPath)) {

@@ -243,21 +243,24 @@ cargo build-cpu
 
 Target release builds:
 
+```powershell
+.\scripts\build-windows.ps1
+```
+
 ```bash
-cargo build-windows
 cargo build-linux
 cargo build-macos-apple-silicon
 ```
 
 Run target release aliases on the matching build OS/toolchain when cross-compilation is unavailable. In practice:
 
-- Run `cargo build-windows` from native Windows PowerShell with the MSVC Rust toolchain.
+- Run `scripts/build-windows.ps1` from native Windows Developer PowerShell with the MSVC Rust toolchain.
 - Run `cargo build-linux` from Linux or WSL.
 - Run `cargo build-macos-apple-silicon` on Apple Silicon macOS.
 
 Do not use WSL to produce the Windows artifact. WSL can build the Linux artifact.
 
-These aliases expand to normal Cargo target builds:
+The underlying Cargo aliases expand to normal Cargo target builds:
 
 ```text
 cargo build-windows              -> no default features + x86_64-pc-windows-msvc + release-windows
@@ -265,7 +268,7 @@ cargo build-linux                -> no default features + x86_64-unknown-linux-g
 cargo build-macos-apple-silicon  -> no default features + aarch64-apple-darwin + release-macos-apple-silicon
 ```
 
-Cargo aliases are subcommands, so the command is `cargo build-windows`, not `cargo build windows`.
+Cargo aliases are subcommands, so the raw Cargo command is `cargo build-windows`, not `cargo build windows`. On Windows, prefer `scripts/build-windows.ps1` because it applies the CUDA/MSVC environment needed by current CUDA toolkits before invoking the same target build.
 
 If a target build fails with `E0463` / `can't find crate for core` or many dependencies fail immediately, the Rust standard library for that target is not installed in the active toolchain. The checked-in `rust-toolchain.toml` lists the supported release targets, but native target OS builds may still be required when cross-compilation tooling is unavailable.
 
@@ -407,7 +410,7 @@ nvcc --version
 cargo build --release --locked --features cuda
 ```
 
-CUDA 13.3 and newer on Windows may fail in `candle-kernels` with a CCCL error that says MSVC is using the traditional preprocessor. Keep `$env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"` set in the Windows build shell, or use `scripts/package-release.ps1`, which sets it for the Windows package build. Do not carry this Windows-only workaround into Linux or macOS release builds.
+CUDA 13.3 and newer on Windows may fail in `candle-kernels` with a CCCL error that says MSVC is using the traditional preprocessor. Keep `$env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"` set in the Windows build shell, or use `scripts/build-windows.ps1`, which sets it for the Windows release build. Do not carry this Windows-only workaround into Linux or macOS release builds.
 
 The release binary is written to Cargo's target directory:
 
