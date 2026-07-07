@@ -37,9 +37,9 @@ llama_cpp = { version = "0.3.2", optional = true }
 llama_cpp_sys = { version = "0.3.2", default-features = false, optional = true }
 
 [features]
-# Default source installs include the recommended accelerator support.
-# Runtime routing still falls back when host backends are unavailable.
-default = ["recommended"]
+# Default source installs are backend-neutral so `cargo check`, `cargo build`,
+# and `cargo install --path .` do not require CUDA tooling on non-CUDA hosts.
+default = []
 recommended = ["cuda"]
 llama-cpp = ["dep:llama_cpp"]
 llama-fast = ["dep:llama_cpp_sys"]
