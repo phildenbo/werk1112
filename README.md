@@ -389,6 +389,7 @@ $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_HOME
 $env:CUDA_COMPUTE_CAP = "86"
 $env:Path = "$env:CUDA_HOME\bin;$env:Path"
 $env:CL = "/Zc:preprocessor"
+$env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"
 
 if (-not (Test-Path "$env:CUDA_HOME\bin\nvcc.exe")) {
   throw "nvcc.exe not found in $env:CUDA_HOME\bin. Check the CUDA Toolkit installation."
@@ -405,6 +406,8 @@ where.exe nvcc
 nvcc --version
 cargo build --release --locked --features cuda
 ```
+
+CUDA 13.3 and newer on Windows may fail in `candle-kernels` with a CCCL error that says MSVC is using the traditional preprocessor. Keep `$env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"` set in the Windows build shell, or use `scripts/package-release.ps1`, which sets it for the Windows package build. Do not carry this Windows-only workaround into Linux or macOS release builds.
 
 The release binary is written to Cargo's target directory:
 

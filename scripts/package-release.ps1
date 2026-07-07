@@ -78,6 +78,12 @@ Write-Host "==> Building Windows release artifact"
 Write-Host "    Note: release artifacts are universal runtime-router binaries."
 Write-Host "    Running: cargo build-windows"
 
+if (!$env:NVCC_PREPEND_FLAGS) {
+    $env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"
+} elseif ($env:NVCC_PREPEND_FLAGS -notmatch "CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING") {
+    $env:NVCC_PREPEND_FLAGS = "-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING $env:NVCC_PREPEND_FLAGS"
+}
+
 cargo build-windows
 
 if ($LASTEXITCODE -ne 0) {
