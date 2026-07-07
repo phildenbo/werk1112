@@ -7,7 +7,8 @@ $RepoRoot = Resolve-Path (Join-Path $ScriptDir "..")
 
 Set-Location $RepoRoot
 
-if (-not $IsWindows) {
+$IsNativeWindows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+if (-not $IsNativeWindows) {
     throw "scripts/build-windows.ps1 must be run on native Windows."
 }
 
