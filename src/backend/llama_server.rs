@@ -306,7 +306,7 @@ impl LlamaServerProcess {
         store: &ModelStore,
         mode: LlamaCppMode,
         manifest: &ModelManifest,
-        model_path: &PathBuf,
+        model_path: &Path,
         runtime_options: &LlamaRuntimeOptions,
     ) -> Result<Self> {
         let discovery = require_llama_server(store, mode)?;
@@ -352,7 +352,7 @@ impl LlamaServerProcess {
             executable,
             discovery_source: discovery.source,
             args,
-            model_path: model_path.clone(),
+            model_path: model_path.to_path_buf(),
             url,
             pid,
             mode,
@@ -553,7 +553,7 @@ impl SseAccumulator {
 
 fn llama_server_args(
     mode: LlamaCppMode,
-    model_path: &PathBuf,
+    model_path: &Path,
     port: u16,
     runtime_options: &LlamaRuntimeOptions,
     supported: &SupportedArgs,
@@ -1470,10 +1470,10 @@ fn cuda_compiler() -> Option<PathBuf> {
 }
 
 fn cuda_host_compiler() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("WERK_LLAMA_CUDA_HOST_COMPILER").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
+    if let Some(path) = env::var_os("WERK_LLAMA_CUDA_HOST_COMPILER").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
     }
     if cuda_major_version().is_some_and(|major| major <= 11) {
         let candidate = PathBuf::from("/usr/bin/g++-10");

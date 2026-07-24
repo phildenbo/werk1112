@@ -2112,7 +2112,6 @@ fn parse_mlx_stat_line(line: &str, prefix: &str) -> Option<(usize, Option<f64>)>
     let (count_text, rate_text) = rest.split_once(',').unwrap_or((rest, ""));
     let tokens = count_text.split_whitespace().next()?.parse().ok()?;
     let rate = rate_text
-        .trim()
         .split_whitespace()
         .next()
         .and_then(|value| value.parse().ok());
@@ -2276,7 +2275,7 @@ fn backend_program(env_name: &str, default_name: &str) -> PathBuf {
     PathBuf::from(default_name)
 }
 
-fn sibling_program(program: &PathBuf, sibling_name: &str) -> Option<PathBuf> {
+fn sibling_program(program: &Path, sibling_name: &str) -> Option<PathBuf> {
     program
         .parent()
         .map(|dir| dir.join(sibling_name))
@@ -3054,6 +3053,7 @@ ValueError: Model type chatglm not supported."#;
             created_unix: 1,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 

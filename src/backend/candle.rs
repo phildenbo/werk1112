@@ -324,7 +324,7 @@ fn generate_with_loaded_model(
     }
     let prompt_tokens = tokens.len();
 
-    let eos_token = eos_token_id(&tokenizer);
+    let eos_token = eos_token_id(tokenizer);
     let mut token_selector = TokenSelector::new(
         request.seed.unwrap_or(299792458),
         request.temperature,
@@ -532,6 +532,7 @@ impl DecodeLoopProfile {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TokenSelector {
     Greedy,
     Stochastic(LogitsProcessor),

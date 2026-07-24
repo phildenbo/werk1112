@@ -25,7 +25,7 @@ mod tests {
     fn banner_contains_required_identity() {
         let plain = strip_ansi(BANNER);
 
-        assert!(plain.contains("Native AI. runtime management."));
+        assert!(plain.contains("Inference Router."));
         assert!(plain.contains("__        __"));
         assert!(plain.contains("\\ \\      / /"));
         assert!(plain.contains("/ //_/"));

@@ -4,8 +4,9 @@ use crate::{
     backend::{
         BackendAccelerator, BackendRuntime, RuntimeId, backend_supports_images,
         explain_backend_rejection, is_transformers_compat_model, runtime_descriptor,
-        runtime_supports_model,
+        runtime_registry, runtime_supports_layout, runtime_supports_model, runtime_supports_task,
     },
+    capabilities::{InferenceTask, InputModality, OutputModality},
     model_store::{ModelFormat, ModelManifest},
 };
 
@@ -32,6 +33,9 @@ pub struct RequestCapabilities {
     pub image_input: bool,
     pub embeddings: bool,
     pub streaming: bool,
+    pub task: Option<InferenceTask>,
+    pub input_modality: Option<InputModality>,
+    pub output_modality: Option<OutputModality>,
 }
 
 impl RequestCapabilities {
@@ -41,6 +45,9 @@ impl RequestCapabilities {
             image_input: false,
             embeddings: false,
             streaming,
+            task: None,
+            input_modality: None,
+            output_modality: None,
         }
     }
 
@@ -48,6 +55,24 @@ impl RequestCapabilities {
         Self {
             image_input,
             ..Self::text(streaming)
+        }
+    }
+
+    pub fn for_task(task: InferenceTask) -> Self {
+        Self::for_task_with_streaming(task, false)
+    }
+
+    pub fn for_task_with_streaming(task: InferenceTask, streaming: bool) -> Self {
+        Self {
+            text_generation: task == InferenceTask::TextGeneration,
+            image_input: task
+                .required_input_modalities()
+                .contains(&InputModality::Image),
+            embeddings: task == InferenceTask::TextEmbedding,
+            streaming,
+            task: Some(task),
+            input_modality: task.required_input_modalities().first().copied(),
+            output_modality: Some(task.output_modality()),
         }
     }
 }
@@ -141,6 +166,20 @@ pub fn select_runtime(
     })
 }
 
+pub fn select_runtime_for_task(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    task: InferenceTask,
+    available_runtimes: &[RuntimeAvailability],
+) -> Result<SelectedRuntime, RuntimePlanError> {
+    select_runtime(
+        manifest,
+        requested_backend,
+        RequestCapabilities::for_task(task),
+        available_runtimes,
+    )
+}
+
 pub fn plan_runtime(
     manifest: &ModelManifest,
     requested_backend: RequestedBackend,
@@ -152,9 +191,12 @@ pub fn plan_runtime(
     let mut selected = None;
     let mut rejections = Vec::new();
 
-    for runtime_id in
-        runtime_candidate_ids_for_plan(manifest, requested_backend, available_runtimes)
-    {
+    for runtime_id in runtime_candidate_ids_for_plan(
+        manifest,
+        requested_backend,
+        request_capabilities,
+        available_runtimes,
+    ) {
         let descriptor = runtime_descriptor(runtime_id);
         let decision = candidate_decision(
             manifest,
@@ -191,6 +233,20 @@ pub fn plan_runtime(
     }
 }
 
+pub fn plan_runtime_for_task(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    task: InferenceTask,
+    available_runtimes: &[RuntimeAvailability],
+) -> RuntimePlan {
+    plan_runtime(
+        manifest,
+        requested_backend,
+        RequestCapabilities::for_task(task),
+        available_runtimes,
+    )
+}
+
 pub fn runtime_candidates(
     manifest: &ModelManifest,
     requested_backend: RequestedBackend,
@@ -202,6 +258,28 @@ pub fn runtime_candidates(
             runtime_id,
         })
         .collect()
+}
+
+pub fn runtime_candidates_for_task(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    task: InferenceTask,
+) -> Vec<RuntimeCandidate> {
+    runtime_candidate_ids_for_task(manifest, requested_backend, task)
+        .into_iter()
+        .map(|runtime_id| RuntimeCandidate {
+            priority: runtime_descriptor(runtime_id).priority,
+            runtime_id,
+        })
+        .collect()
+}
+
+pub fn runtime_candidate_ids_for_task(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    task: InferenceTask,
+) -> Vec<RuntimeId> {
+    typed_runtime_candidate_ids(manifest, requested_backend, task)
 }
 
 pub fn runtime_candidate_ids(
@@ -227,8 +305,12 @@ pub fn runtime_candidate_ids(
 fn runtime_candidate_ids_for_plan(
     manifest: &ModelManifest,
     requested_backend: RequestedBackend,
+    request_capabilities: RequestCapabilities,
     available_runtimes: &[RuntimeAvailability],
 ) -> Vec<RuntimeId> {
+    if let Some(task) = request_capabilities.task {
+        return typed_runtime_candidate_ids(manifest, requested_backend, task);
+    }
     let mut candidates = runtime_candidate_ids(manifest, requested_backend);
     if requested_backend == RequestedBackend::Auto
         && manifest.format == ModelFormat::Gguf
@@ -241,6 +323,67 @@ fn runtime_candidate_ids_for_plan(
         candidates.insert(insert_at, RuntimeId::LlamaServerRocm);
     }
     candidates
+}
+
+fn typed_runtime_candidate_ids(
+    manifest: &ModelManifest,
+    requested_backend: RequestedBackend,
+    task: InferenceTask,
+) -> Vec<RuntimeId> {
+    if !is_media_task(task) {
+        return runtime_candidate_ids(manifest, requested_backend)
+            .into_iter()
+            .filter(|runtime_id| runtime_supports_task(runtime_descriptor(*runtime_id), task))
+            .collect();
+    }
+
+    let mut candidates = runtime_registry()
+        .iter()
+        .filter(|descriptor| descriptor.runtime == BackendRuntime::MediaCompanion)
+        .filter(|descriptor| runtime_supports_task(descriptor, task))
+        .filter(|descriptor| {
+            runtime_supports_layout(descriptor, manifest.metadata.repository_layout)
+        })
+        .filter(|descriptor| requested_backend_matches_descriptor(requested_backend, descriptor))
+        .map(|descriptor| descriptor.id)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        runtime_descriptor(*right)
+            .priority
+            .cmp(&runtime_descriptor(*left).priority)
+    });
+    candidates
+}
+
+fn is_media_task(task: InferenceTask) -> bool {
+    !matches!(
+        task,
+        InferenceTask::TextGeneration
+            | InferenceTask::TextEmbedding
+            | InferenceTask::ImageUnderstanding
+    )
+}
+
+fn requested_backend_matches_descriptor(
+    requested_backend: RequestedBackend,
+    descriptor: &crate::backend::RuntimeDescriptor,
+) -> bool {
+    match requested_backend {
+        RequestedBackend::Auto => true,
+        RequestedBackend::Cpu => descriptor.accelerators.contains(&BackendAccelerator::Cpu),
+        RequestedBackend::Cuda => descriptor.accelerators.contains(&BackendAccelerator::Cuda),
+        RequestedBackend::Rocm => descriptor.accelerators.contains(&BackendAccelerator::Rocm),
+        RequestedBackend::Metal | RequestedBackend::Mlx => {
+            descriptor.accelerators.contains(&BackendAccelerator::Metal)
+        }
+        RequestedBackend::Vulkan
+        | RequestedBackend::Burn
+        | RequestedBackend::Candle
+        | RequestedBackend::Transformers
+        | RequestedBackend::Vllm
+        | RequestedBackend::LlamaLegacy
+        | RequestedBackend::LlamaHighlevel => false,
+    }
 }
 
 fn llama_rocm_insert_position(candidates: &[RuntimeId]) -> usize {
@@ -464,6 +607,51 @@ fn rejection_reason(
     availability: Option<&RuntimeAvailability>,
 ) -> Option<String> {
     let descriptor = runtime_descriptor(runtime_id);
+    if let Some(task) = request_capabilities.task {
+        if !manifest.supports_task(task) {
+            return Some(format!("model does not advertise support for task {task}"));
+        }
+        if !runtime_supports_task(descriptor, task) {
+            return Some(format!("runtime does not support task {task}"));
+        }
+        if !runtime_supports_layout(descriptor, manifest.metadata.repository_layout) {
+            return Some(format!(
+                "runtime does not support {} repository layout",
+                manifest.metadata.repository_layout
+            ));
+        }
+        if let Some(input_modality) = request_capabilities.input_modality {
+            if !task.required_input_modalities().contains(&input_modality) {
+                return Some(format!(
+                    "input modality {input_modality} is incompatible with task {task}"
+                ));
+            }
+            if !manifest.metadata.input_modalities.is_empty()
+                && !manifest.metadata.input_modalities.contains(&input_modality)
+            {
+                return Some(format!(
+                    "model does not advertise support for {input_modality} input"
+                ));
+            }
+        }
+        if let Some(output_modality) = request_capabilities.output_modality {
+            if output_modality != task.output_modality() {
+                return Some(format!(
+                    "output modality {output_modality} is incompatible with task {task}"
+                ));
+            }
+            if !manifest.metadata.output_modalities.is_empty()
+                && !manifest
+                    .metadata
+                    .output_modalities
+                    .contains(&output_modality)
+            {
+                return Some(format!(
+                    "model does not advertise support for {output_modality} output"
+                ));
+            }
+        }
+    }
     if !runtime_supports_model(
         descriptor,
         &manifest.format,
@@ -471,19 +659,21 @@ fn rejection_reason(
     ) {
         return Some(model_support_rejection(manifest, descriptor.runtime));
     }
-    if request_capabilities.text_generation && !descriptor.capabilities.text_generation {
-        return Some("runtime does not support text generation".to_string());
-    }
-    if runtime_id == RuntimeId::MlxVlm && !request_capabilities.image_input {
-        return Some(
-            "MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm".to_string(),
-        );
-    }
-    if request_capabilities.image_input && !descriptor.capabilities.vision_language {
-        return Some("runtime is not VLM-capable".to_string());
-    }
-    if request_capabilities.embeddings && !descriptor.capabilities.embeddings {
-        return Some("runtime does not support embeddings".to_string());
+    if request_capabilities.task.is_none() {
+        if request_capabilities.text_generation && !descriptor.capabilities.text_generation {
+            return Some("runtime does not support text generation".to_string());
+        }
+        if runtime_id == RuntimeId::MlxVlm && !request_capabilities.image_input {
+            return Some(
+                "MLX-VLM is reserved for image requests; text-only MLX uses mlx-lm".to_string(),
+            );
+        }
+        if request_capabilities.image_input && !descriptor.capabilities.vision_language {
+            return Some("runtime is not VLM-capable".to_string());
+        }
+        if request_capabilities.embeddings && !descriptor.capabilities.embeddings {
+            return Some("runtime does not support embeddings".to_string());
+        }
     }
     if request_capabilities.streaming && !descriptor.capabilities.streaming {
         return Some("runtime does not support streaming".to_string());
@@ -491,11 +681,14 @@ fn rejection_reason(
     if let Some(reason) = explain_backend_rejection(
         descriptor.runtime,
         &manifest.format,
-        request_capabilities.image_input,
+        request_capabilities.task.is_none() && request_capabilities.image_input,
     ) {
         return Some(reason.to_string());
     }
-    if request_capabilities.image_input && !backend_supports_images(descriptor.runtime) {
+    if request_capabilities.task.is_none()
+        && request_capabilities.image_input
+        && !backend_supports_images(descriptor.runtime)
+    {
         return Some("runtime is not VLM-capable".to_string());
     }
     if !descriptor.implemented {
@@ -560,6 +753,9 @@ fn selection_reason(
         (ModelFormat::SafeTensors, BackendRuntime::Vllm, _) => {
             "HF safetensors CUDA hot path uses vLLM for supported architectures".to_string()
         }
+        (_, BackendRuntime::MediaCompanion, _) => {
+            "typed media task uses the managed media companion".to_string()
+        }
         (_, BackendRuntime::Candle, RequestedBackend::Candle) => {
             "explicit Candle route requested".to_string()
         }
@@ -599,6 +795,7 @@ fn availability_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::{InferenceTask, RepositoryLayout};
     use crate::model_store::{ModelManifest, ModelSource};
 
     #[test]
@@ -900,6 +1097,119 @@ mod tests {
         assert_eq!(selected.runtime_id, RuntimeId::CandleCpu);
     }
 
+    #[test]
+    fn image_task_selects_available_media_companion_cuda() {
+        let manifest = media_manifest(InferenceTask::ImageGeneration);
+        let available = [
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCuda,
+                available: true,
+                reason: None,
+            },
+            RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCpu,
+                available: true,
+                reason: None,
+            },
+        ];
+
+        let selected = select_runtime_for_task(
+            &manifest,
+            RequestedBackend::Auto,
+            InferenceTask::ImageGeneration,
+            &available,
+        )
+        .unwrap();
+
+        assert_eq!(selected.runtime_id, RuntimeId::MediaCompanionCuda);
+        assert_eq!(selected.accelerator, BackendAccelerator::Cuda);
+    }
+
+    #[test]
+    fn typed_task_mismatch_rejects_media_runtime() {
+        let manifest = media_manifest(InferenceTask::ImageGeneration);
+        let plan = plan_runtime_for_task(
+            &manifest,
+            RequestedBackend::Auto,
+            InferenceTask::VideoGeneration,
+            &[RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCuda,
+                available: true,
+                reason: None,
+            }],
+        );
+
+        assert!(plan.selected.is_none());
+        assert!(plan.candidates.iter().any(|decision| {
+            decision.runtime_id == RuntimeId::MediaCompanionCuda
+                && decision.reason.contains("model does not advertise")
+        }));
+    }
+
+    #[test]
+    fn typed_media_candidates_filter_layout_and_accelerator() {
+        let mut manifest = media_manifest(InferenceTask::ImageGeneration);
+        assert_eq!(
+            runtime_candidate_ids_for_task(
+                &manifest,
+                RequestedBackend::Cuda,
+                InferenceTask::ImageGeneration,
+            ),
+            vec![RuntimeId::MediaCompanionCuda]
+        );
+
+        manifest.metadata.repository_layout = RepositoryLayout::TensorRtEngine;
+        assert!(
+            runtime_candidate_ids_for_task(
+                &manifest,
+                RequestedBackend::Auto,
+                InferenceTask::ImageGeneration,
+            )
+            .is_empty()
+        );
+        let rejection = rejection_reason(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::for_task(InferenceTask::ImageGeneration),
+            RuntimeId::MediaCompanionCuda,
+            None,
+        )
+        .unwrap();
+        assert!(rejection.contains("repository layout"));
+    }
+
+    #[test]
+    fn legacy_text_auto_path_never_includes_media_companion() {
+        let manifest = manifest(ModelFormat::SafeTensors, Some("qwen2"));
+        let candidates = runtime_candidate_ids(&manifest, RequestedBackend::Auto);
+
+        assert!(candidates.iter().all(|runtime_id| {
+            runtime_descriptor(*runtime_id).runtime != BackendRuntime::MediaCompanion
+        }));
+        let plan = plan_runtime(
+            &manifest,
+            RequestedBackend::Auto,
+            RequestCapabilities::text(true),
+            &[RuntimeAvailability {
+                runtime_id: RuntimeId::MediaCompanionCuda,
+                available: true,
+                reason: None,
+            }],
+        );
+        assert!(plan.candidates.iter().all(|decision| {
+            runtime_descriptor(decision.runtime_id).runtime != BackendRuntime::MediaCompanion
+        }));
+    }
+
+    fn media_manifest(task: InferenceTask) -> ModelManifest {
+        let mut manifest = manifest(ModelFormat::SafeTensors, Some("fixture-media"));
+        manifest.metadata.repository_layout = RepositoryLayout::Diffusers;
+        manifest.metadata.tasks = vec![task];
+        manifest.metadata.input_modalities = task.required_input_modalities().to_vec();
+        manifest.metadata.output_modalities = vec![task.output_modality()];
+        manifest
+    }
+
     fn manifest(format: ModelFormat, architecture: Option<&str>) -> ModelManifest {
         ModelManifest {
             id: "test-model".to_string(),
@@ -915,6 +1225,7 @@ mod tests {
             created_unix: 0,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 }

@@ -357,11 +357,9 @@ impl OnnxRuntimeBackend {
             bail!("ONNX Runtime route requires a safetensors source model or direct ONNX model");
         }
         let mut discovery = discover_onnx_runtime(store, mode);
-        if discovery.path.is_none() {
-            if options.install_missing_runtime {
-                install_managed_onnx_runtime(store, mode)?;
-                discovery = discover_onnx_runtime(store, mode);
-            }
+        if discovery.path.is_none() && options.install_missing_runtime {
+            install_managed_onnx_runtime(store, mode)?;
+            discovery = discover_onnx_runtime(store, mode);
         }
         if discovery.path.is_none() {
             if mode == OnnxRuntimeMode::Cpu
@@ -440,13 +438,13 @@ impl OnnxRuntimeBackend {
             if artifact.status != ArtifactStatus::Ready || artifact.kind != ArtifactKind::Onnx {
                 bail!("ONNX artifact for '{}' is not ready", manifest.id);
             }
-            return Ok(self.store.model_dir(&manifest.id).join(&artifact.path));
+            return Ok(self.store.absolute_artifact_path(manifest, &artifact));
         }
         let artifact = self.store.build_onnx_artifact(&manifest.id, false)?;
         if artifact.status != ArtifactStatus::Ready || artifact.kind != ArtifactKind::Onnx {
             bail!("ONNX artifact for '{}' is not ready", manifest.id);
         }
-        Ok(self.store.model_dir(&manifest.id).join(&artifact.path))
+        Ok(self.store.absolute_artifact_path(manifest, &artifact))
     }
 
     fn generate_inner(
@@ -503,9 +501,9 @@ impl OnnxRuntimeBackend {
             eprintln!("ONNX model: {}", model_path.display());
         }
         let started = Instant::now();
-        let output = Command::new(&runner)
+        let output = Command::new(runner)
             .arg("--model")
-            .arg(&model_path)
+            .arg(model_path)
             .arg("--prompt")
             .arg(&request.prompt)
             .arg("--max-tokens")
@@ -1026,8 +1024,7 @@ fn onnx_genai_model_dir(store: &ModelStore, manifest: &ModelManifest) -> Option<
                 .map(Path::to_path_buf)
         })
         .collect::<Vec<_>>();
-    candidates
-        .sort_by(|left, right| onnx_genai_dir_priority(left).cmp(&onnx_genai_dir_priority(right)));
+    candidates.sort_by_key(|left| onnx_genai_dir_priority(left));
     candidates.into_iter().find(|path| is_onnx_genai_dir(path))
 }
 
@@ -1129,6 +1126,7 @@ mod tests {
             created_unix: 0,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 

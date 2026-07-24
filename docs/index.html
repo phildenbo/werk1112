@@ -7,16 +7,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Werk1112 &ndash; Local-first AI inference router in Rust</title>
   <meta name="description"
-    content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    content="Werk1112 is a local-first multimodal inference router for text, image, video and audio models with a shared CLI and HTTP API.">
   <meta name="keywords"
-    content="Rust, AI, LLM, local AI, inference router, OpenAI-compatible API, llama.cpp, vLLM, ONNX Runtime, Candle, MLX, local-first AI runtime">
+    content="Rust, AI, multimodal AI, image generation, video generation, audio generation, local AI, inference router, OpenAI-compatible API, llama.cpp, Diffusers, Transformers, ONNX Runtime, Candle, MLX">
   <meta name="robots" content="index, follow">
   <link rel="canonical" href="https://philipbodenbach.github.io/werk1112/">
 
   <meta property="og:type" content="website">
   <meta property="og:title" content="Werk1112 &ndash; Local-first AI inference router in Rust">
   <meta property="og:description"
-    content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    content="Werk1112 routes text, image, video and audio inference through one local-first control plane.">
   <meta property="og:url" content="https://philipbodenbach.github.io/werk1112/">
   <meta property="og:site_name" content="Werk1112">
   <meta property="og:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
@@ -27,7 +27,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Werk1112 &ndash; Local-first AI inference router in Rust">
   <meta name="twitter:description"
-    content="Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.">
+    content="Werk1112 routes text, image, video and audio inference through one local-first control plane.">
   <meta name="twitter:image" content="https://philipbodenbach.github.io/werk1112/assets/banner_werk.png">
   <meta name="twitter:image:alt" content="Werk1112 inference router banner">
 
@@ -39,7 +39,7 @@
         "@type": "SoftwareSourceCode",
         "name": "Werk1112",
         "headline": "Werk1112 - Local-first AI inference router in Rust",
-        "description": "Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM, ONNX Runtime, Candle and MLX with an OpenAI-compatible API.",
+        "description": "Werk1112 is a local-first multimodal inference router for text, image, video and audio models with a shared CLI and HTTP API.",
         "url": "https://philipbodenbach.github.io/werk1112/",
         "codeRepository": "https://github.com/philipbodenbach/werk1112",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
@@ -73,9 +73,15 @@
           "AI",
           "LLM",
           "local AI",
+          "multimodal AI",
+          "image generation",
+          "video generation",
+          "audio generation",
           "inference router",
           "OpenAI-compatible API",
           "llama.cpp",
+          "Diffusers",
+          "Transformers",
           "vLLM",
           "ONNX Runtime",
           "Candle",
@@ -424,6 +430,7 @@
     <nav class="nav-links" aria-label="Primary navigation">
       <a href="#features">Features</a>
       <a href="#topics">Topics</a>
+      <a href="media-inference.md">Media inference</a>
       <a href="https://github.com/philipbodenbach/werk1112">Repository</a>
       <a href="https://github.com/philipbodenbach">Author</a>
     </nav>
@@ -432,28 +439,29 @@
   <main>
     <section class="hero" aria-labelledby="hero-title">
       <div>
-        <p class="eyebrow">Rust AI runtime</p>
+        <p class="eyebrow">Multimodal Rust inference router</p>
         <h1 id="hero-title">Werk1112 &ndash; Local-first AI inference router in Rust</h1>
         <p class="lead">
-          Werk1112 is a local-first AI runtime and inference router for llama.cpp, vLLM,
-          ONNX Runtime, Candle and MLX with an OpenAI-compatible API.
+          Normalize, validate, estimate and route text, image, video and audio requests
+          through one Rust control plane and an optional managed media companion.
         </p>
         <div class="actions" aria-label="Project links">
           <a class="button primary" href="https://github.com/philipbodenbach/werk1112">View the GitHub repository</a>
-          <a class="button secondary" href="https://github.com/philipbodenbach">View Philip Bodenbach on GitHub</a>
+          <a class="button secondary" href="media-inference.md">Read the media inference guide</a>
         </div>
       </div>
 
       <aside class="hero-visual" aria-label="Werk1112 terminal preview">
         <img src="assets/banner_werk.png" width="546" height="145"
           alt="Werk1112 startup banner: WERK1112 - Inference Router.">
-        <pre class="terminal"><code>werk serve --model local-model
-curl http://127.0.0.1:11434/v1/models</code></pre>
+        <pre class="terminal"><code>werk image generate flux-dev --prompt "orbital station"
+werk audio transcribe whisper-large audio.wav
+werk serve --model local-model</code></pre>
       </aside>
     </section>
 
     <section class="section" id="features" aria-labelledby="features-title">
-      <h2 id="features-title">Local model routing with one API surface</h2>
+      <h2 id="features-title">One control plane for every modality</h2>
       <p class="section-copy">
         Applications target Werk1112 while Werk1112 chooses the local or companion runtime
         for the model format, requested backend, and host capabilities.
@@ -461,16 +469,16 @@ curl http://127.0.0.1:11434/v1/models</code></pre>
 
       <div class="feature-grid">
         <article class="feature-card">
-          <h3>OpenAI-compatible API</h3>
-          <p>Expose local model chat completions through a familiar HTTP API for existing clients and tools.</p>
+          <h3>Shared CLI and API</h3>
+          <p>Use the same typed request pipeline for chat, image, video, music, speech and transcription workloads.</p>
         </article>
         <article class="feature-card">
-          <h3>Runtime planner</h3>
-          <p>Route GGUF, safetensors, ONNX, and MLX-style model directories to the appropriate backend.</p>
+          <h3>Capability-aware planner</h3>
+          <p>Score task, layout, accelerator, parameter support and memory fit before selecting a backend.</p>
         </article>
         <article class="feature-card">
-          <h3>Local-first workflow</h3>
-          <p>Manage imports, pulls, estimates, CLI chat, and serving without making the app depend on one engine.</p>
+          <h3>Inspectable defaults</h3>
+          <p>Resolve model, runtime, hardware, profile and request defaults with machine-readable provenance.</p>
         </article>
       </div>
     </section>
@@ -478,16 +486,22 @@ curl http://127.0.0.1:11434/v1/models</code></pre>
     <section class="section" id="topics" aria-labelledby="topics-title">
       <h2 id="topics-title">Project topics</h2>
       <p class="section-copy">
-        Werk1112 focuses on Rust-based local AI infrastructure and inference routing for common LLM runtimes.
+        Werk1112 focuses on local AI infrastructure and backend routing without becoming a workflow engine.
       </p>
       <ul class="topics" aria-label="Werk1112 keywords and topics">
         <li>Rust</li>
         <li>AI</li>
         <li>LLM</li>
+        <li>multimodal AI</li>
+        <li>image generation</li>
+        <li>video generation</li>
+        <li>audio generation</li>
         <li>local AI</li>
         <li>inference router</li>
         <li>OpenAI-compatible API</li>
         <li>llama.cpp</li>
+        <li>Diffusers</li>
+        <li>Transformers</li>
         <li>vLLM</li>
         <li>ONNX Runtime</li>
         <li>Candle</li>

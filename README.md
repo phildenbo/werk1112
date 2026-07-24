@@ -4,9 +4,9 @@
   <img src="docs/assets/banner_werk.png" alt="Werk1112 startup banner: WERK1112 - Inference Router." />
 </p>
 
-Werk1112 is a local-first AI runtime written in Rust.
+Werk1112 is a local-first, multimodal AI inference router written in Rust.
 
-It provides a unified inference router for modern language models through a stable CLI and an HTTP API compatible with the OpenAI API.
+It normalizes, validates, estimates, routes, and executes text, image, video, and audio inference through one stable CLI and HTTP service.
 
 Applications target Werk1112. 
 
@@ -30,17 +30,17 @@ Werk1112 provides a single runtime abstraction for model management, backend sel
 
 Werk1112 is infrastructure for running local models with predictable routing:
 
-- native CLI workflows for chat, inference, model management and serving
+- native CLI workflows for chat, image, video, audio, model management, and serving
 - a managed model store for copied local models and pulled Hugging Face repositories
 - a runtime planner that chooses between llama.cpp server, vLLM, ONNX Runtime, Candle, and MLX based on model format and requested backend
-- an HTTP API compatible with the OpenAI API for existing tools and integrations
+- an OpenAI-compatible and Werk-native HTTP API for chat and media inference
 - a stable runtime abstraction for local AI applications
 
 Werk1112 does not ship a built-in GUI. CLI chat is a first-class workflow, and graphical interfaces can be provided by any client compatible with the OpenAI API.
 
 ## What Werk1112 Is Not
 
-Werk1112 is intentionally narrow. It is not an agent framework, workflow engine, sandbox manager, IDE integration layer, or enterprise control plane.
+Werk1112 is intentionally narrow. It is not an agent framework, a node/workflow engine such as ComfyUI, a sandbox manager, IDE integration layer, or enterprise control plane.
 
 Werk1112 intentionally focuses on model management, runtime selection and inference. Higher-level concerns belong in applications built on top of the runtime, not inside it.
 
@@ -52,8 +52,10 @@ Werk1112 is responsible for:
 - model listing and inspection
 - backend and runtime selection
 - local and companion-runtime inference
-- OpenAI-compatible chat completion API
-- CLI `chat`, `run`, and `serve` workflows
+- OpenAI-compatible model/chat shapes plus OpenAI-inspired, Werk-native media
+  and job endpoints
+- CLI `chat`, `image`, `video`, `audio`, and `serve` workflows
+- workload estimates, parameter provenance, runtime plans, outputs, and persisted jobs
 
 Werk1112 is not responsible for:
 
@@ -78,16 +80,24 @@ Werk1112 composes inference runtimes. It does not compete with them.
 
 ## Status
 
-Current capabilities include:
-
 The project focuses on stability, predictable runtime behaviour and long-term compatibility rather than rapidly expanding feature scope.
+
+Current capabilities include:
 
 - Release artifacts are universal runtime-router binaries, one binary per supported OS/architecture, with platform accelerator support compiled in.
 - Installers install only Werk1112; they do not install models, CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, or other runtime dependencies.
 - Backend acceleration is selected at runtime from compiled support, host system capabilities, and installed companion runtimes.
 - CPU-only, CUDNN, MKL, Burn, and legacy llama.cpp remain explicit source/developer build choices.
-- `/v1/models` returns installed model manifests in an OpenAI-style model list.
+- `/v1/models` returns OpenAI-style summaries of installed models. Use
+  `werk inspect MODEL` for the full manifest.
 - `/v1/chat/completions` accepts OpenAI-style chat requests.
+- Typed image, video, audio, speech, and job requests share the same inference
+  resolver, estimator, planner, parameter policy, and output store as their CLI
+  counterparts.
+- Media repositories can always be imported, inspected, and estimated.
+  Execution uses the included Python companion protocol and additionally
+  requires Python plus the task-specific packages reported by `werk doctor`;
+  the bundled adapter is embedded as the default fallback.
 - Streaming uses `text/event-stream` with `chat.completion.chunk` payloads and a final `data: [DONE]`.
 - API streaming deltas are buffered into small text chunks instead of emitting every generated token as its own event.
 - CLI chat streams decoded token-pieces by default so the answer appears progressively in the terminal.
@@ -165,34 +175,94 @@ werk pull org/model-repo --name hf-model
 
 For gated Hugging Face models, accept the model conditions on Hugging Face first, then run `werk auth huggingface login` or set `HF_TOKEN` before pulling or remote-estimating.
 
-Run one prompt or start an interactive terminal chat:
+Start an interactive terminal chat or execute a media task:
 
 ```bash
 werk estimate local-model
 werk estimate org/model-repo
-werk run local-model "Write one sentence about Rust."
 werk chat local-model
+werk image generate flux-dev --prompt "an abandoned orbital station"
+werk video animate wan-i2v --image station.png --prompt "slow orbital drift"
+werk audio speak speech-model --text "Systems nominal."
 ```
 
-Start the OpenAI-compatible HTTP server:
+Start the HTTP server. Authentication is enabled by default; the key generator
+prints the value that clients must use:
 
 ```bash
+werk auth api-key generate
+export WERK_API_KEY='<paste the generated key>'
 werk serve --model local-model
 ```
 
-Then point compatible clients at:
+Then point OpenAI-compatible chat clients at:
 
 ```text
 http://127.0.0.1:11434/v1
 ```
 
+For a loopback-only development server without authentication, use
+`werk serve --model local-model --allow-unauthenticated`.
+
+## Image, Video, and Audio Inference
+
+Werk provides first-class typed inference for generated media. A request names
+one installed model and one canonical task; Werk then resolves effective
+parameters, validates model/runtime support, estimates memory, selects a
+runtime, executes locally, and persists the output with its metadata.
+
+The main CLI workflows are:
+
+```bash
+# Image generation and editing
+werk image generate flux-dev --prompt "an abandoned orbital station" \
+  --width 1024 --height 1024 --steps 28
+werk image edit flux-fill --image station.png --prompt "restore the solar array"
+
+# Video generation and image-to-video
+werk video generate wan-t2v --prompt "a quiet lunar sunrise" \
+  --frames 81 --fps 16
+werk video animate wan-i2v --image station.png --prompt "slow camera orbit"
+
+# Audio/music generation, speech synthesis, and transcription
+werk audio generate musicgen --prompt "cinematic analogue synthwave"
+werk audio speak speech-model --text "Systems nominal."
+werk audio transcribe whisper --input interview.wav
+```
+
+Before execution, inspect and estimate the same typed contract:
+
+```bash
+werk inspect flux-dev
+werk parameters flux-dev --backend auto --json
+werk estimate flux-dev --task image-generation \
+  --width 1024 --height 1024 --steps 28
+werk doctor --model flux-dev --task image-generation
+```
+
+Werk includes an offline media companion adapter for compatible local Diffusers
+and Transformers models. Launcher discovery honors `WERK_MEDIA_COMPANION`,
+`WERK_MEDIA_PYTHON`, and repository scripts before using the embedded adapter
+fallback. The companion never downloads weights or installs packages; Python,
+Torch, model-framework packages, and required codecs must already be available.
+Image, video, audio/music, TTS, and ASR have generic adapters. Song
+continuation/variation, voice conversion, stems, and audio enhancement are
+represented by the request/schema/planner contract but are not yet generically
+executable.
+
+The HTTP service exposes the same media pipeline through synchronous image
+routes, persisted video/audio jobs, synchronous or asynchronous TTS, JSON
+transcription, parameter/capability discovery, and authenticated output
+downloads. See the [HTTP API](#http-api) examples below and the full
+[media inference reference](docs/media-inference.md).
+
 ## Format Support
 
 | Format | Typical Use | Import/List/Inspect | Backend Status |
 | --- | --- | --- | --- |
-| Safetensors | Hugging Face training/fine-tuning standard | Yes | vLLM CUDA for supported architectures; vLLM ROCm through `--backend rocm`; Transformers compatibility for raw ChatGLM/GLM repos; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected |
+| Safetensors | Hugging Face training/fine-tuning standard | Yes | vLLM CUDA for supported text architectures; vLLM ROCm through `--backend rocm`; Transformers compatibility for raw ChatGLM/GLM repos; Candle CUDA/CPU/Metal compatibility fallback; MLX through `mlx-lm` when selected; Werk media companion for compatible media repositories |
 | GGUF | llama.cpp, Ollama, LM Studio, CPU inference | Yes | CUDA/ROCm/Vulkan/CPU through persistent llama.cpp server; Candle is legacy/fallback only |
-| PyTorch (`.pt`, `.pth`, `pytorch_model.bin`) | Training, research, checkpoints | Yes | Catalog/import only; no generation backend yet |
+| PyTorch (`.pt`, `.pth`, `pytorch_model.bin`) | Training, research, media checkpoints | Yes | Werk media companion for compatible local Diffusers/Transformers media models; otherwise catalog/import only |
 | ONNX (`.onnx`) | Framework-independent inference | Yes | ONNX Runtime CUDA/ROCm/CPU when a runner is available |
 | MLX (`.npz`, MLX-style dirs) | Apple Silicon / MLX-LM | Yes | Implemented through external `mlx-lm` backend when configured |
 | TensorRT Engine (`.engine`, `.plan`) | NVIDIA-optimized inference | Yes | Catalog/import only; no generation backend yet |
@@ -200,9 +270,21 @@ http://127.0.0.1:11434/v1
 | TensorFlow (`.ckpt`, `.pb`) | TensorFlow ecosystem | Yes | Catalog/import only; no generation backend yet |
 | CoreML (`.mlmodel`, `.mlpackage`) | iOS/macOS deployment | Yes | Catalog/import only; no generation backend yet |
 
+Repository layout is independent of file format. Manifests distinguish
+`single_file`, `gguf`, `transformers`, `diffusers`, `mlx`, `onnx_bundle`,
+`tensorrt_engine`, and `custom`. Diffusers repositories are recognized through
+`model_index.json` and component directories such as `transformer/`, `unet/`,
+`vae/`, `scheduler/`, and the text encoders/tokenizers—not merely by a filename
+extension.
+
 ## Werk1112 Runtime Planner
 
-Werk routes by requested backend, model format, model architecture, input capabilities, compiled features, and discovered companion runtimes. `--backend auto` may fall back to CPU. Explicit GPU requests such as `--backend cuda`, `--backend rocm`, or `--backend vulkan` do not silently fall back to CPU.
+Werk routes by requested backend, model format, model architecture, input
+capabilities, compiled features, and discovered companion runtimes.
+`--backend auto` may fall back to CPU. Text/chat GPU routes are strict about
+their requested accelerator. For typed media, `cpu`, `cuda`, `rocm`, and
+`metal` map to companion accelerator requirements; the included companion has
+no Vulkan adapter.
 
 | Runtime | Formats | Accelerators | VLM | Status |
 | --- | --- | --- | --- | --- |
@@ -212,15 +294,57 @@ Werk routes by requested backend, model format, model architecture, input capabi
 | Candle | GGUF legacy, safetensors | CUDA, Metal, CPU | No | Implemented for selected architectures |
 | Transformers compatibility | Raw ChatGLM/GLM safetensors | PyTorch-selected device (`cuda`, `mps`, or `cpu`) | No | Uses local Hugging Face custom code with `trust_remote_code=True` |
 | MLX | MLX dirs, selected HF safetensors | Apple Silicon / MLX | Backend-dependent | Implemented through `mlx-lm` when configured |
+| Werk media companion | Safetensors/PyTorch weights in compatible Diffusers/Transformers repositories and compatible single-file media checkpoints | CUDA, ROCm, Metal/MPS, CPU | N/A | Offline/local-only adapter for image, video, audio, TTS, and ASR; task support depends on installed optional packages and model metadata |
+
+### Media Companion Task Support
+
+All canonical media tasks can be represented in schema-v2 manifests, inspected,
+validated, and estimated. Generic companion execution is currently:
+
+| Task group | Catalog / inspect / estimate | Generic companion execution |
+| --- | --- | --- |
+| Image generation, editing, variation, inpainting, outpainting, upscaling | Yes | Diffusers pipeline/model dependent |
+| Video generation, image-to-video, video-to-video, inpainting, extension, upscaling, frame interpolation | Yes | Diffusers plus image/video codec dependencies |
+| Audio and music generation | Yes | Diffusers or Transformers pipeline/model dependent |
+| Text-to-speech | Yes | Transformers TTS pipeline/model dependent |
+| Speech-to-text and translation | Yes | Transformers ASR pipeline/model dependent |
+| Song continuation and variation | Yes | Prepared; no generic adapter yet |
+| Voice conversion | Yes | Prepared; no generic adapter yet |
+| Stem generation and separation | Yes | Prepared; no generic adapter yet |
+| Audio enhancement | Yes | Prepared; no generic adapter yet |
+
+The bundled adapter is embedded in the Werk binary and uses a one-request
+local-only process protocol; an explicit external companion can replace it.
+Neither variant downloads weights or installs packages. Image execution needs
+Python, Torch, Diffusers, and Pillow. Video additionally needs NumPy and
+`imageio` for video I/O; MP4 encoding normally needs an imageio-compatible
+encoder backend such as `imageio-ffmpeg`. Generative audio needs Torch and
+NumPy plus Diffusers or Transformers; TTS and ASR need Torch, Transformers, and
+NumPy. FLAC/OGG output additionally needs `soundfile`; WAV has a direct writer.
+The exact model pipeline can still reject a request when it is loaded.
+
+See [Media inference](docs/media-inference.md) for the canonical tasks,
+parameter contract, output formats, environment variables, and current
+limitations.
 
 Planner policy:
 
 - GGUF routes to llama.cpp server CUDA, optional ROCm/HIP when detected for auto, Vulkan, or CPU first. Candle GGUF is legacy fallback/debug only.
 - Safetensors routing is format-based: raw ChatGLM/GLM repositories use the Transformers compatibility route; otherwise auto/CUDA prefer vLLM CUDA for supported architectures, then Candle compatibility fallback. Auto may use Candle CPU only after preferred GPU runtimes reject.
 - `--backend vllm` is a strict vLLM-only safetensors route with the existing default vLLM accelerator behavior. ROCm-specific vLLM is selected through `--backend rocm`, and the probe requires a ROCm/HIP-capable PyTorch stack or an explicitly marked ROCm remote endpoint.
-- `--backend cpu` is CPU-only, `--backend cuda` is CUDA-only, `--backend rocm` is ROCm-only, `--backend vulkan` is Vulkan-only, and `--backend candle` is an explicit Candle route.
+- For text/chat candidates, `--backend cpu`, `cuda`, `rocm`, and `vulkan` are
+  strict accelerator routes, while `candle`, `onnx`, `vllm`, `mlx`, and the
+  llama routes select their matching runtime families.
+- For media candidates, `cpu`, `cuda`, `rocm`, and `metal` constrain the
+  companion accelerator. Other backend labels such as `vulkan` or `candle` do
+  not name media adapters and may be bypassed by the default `backend` fallback
+  policy; `--fallback-policy none` rejects mismatched candidates.
 - Image requests filter to VLM-capable runtimes before loading; Candle text routes reject image input.
-- `--debug` prints the candidate runtime decisions and rejection reasons. `--verbose` stays focused on backend/timing stats.
+- `--debug` exposes candidate decisions for chat/run and
+  `werk backend doctor --debug`. For media, use
+  `werk doctor --model MODEL --task TASK` for plan/rejection details and
+  `werk parameters MODEL --json` for parameter support.
+- Media plans evaluate model task, runtime task, layout, family/architecture probe, availability, accelerator, explicitly set parameters, and workload fit. Backend fallback and execution degradation are separate. Smaller models, stronger quantization, lower resolution, fewer frames, and shorter duration are recommendations only and are never applied silently.
 
 ## Build
 
@@ -518,16 +642,23 @@ The model store is resolved in this order:
 4. Native Windows fallback: `%USERPROFILE%\AppData\Local\werk1112`
 5. Unix fallback: `~/.local/share/werk1112`
 
-Each imported or pulled model is stored under `models/<model-id>/` inside that store. On a default Linux setup, a pulled model named `TinyLLama-1B-GGUF` is saved here:
+Models, optimized artifacts, generated outputs, and jobs are separate:
 
 ```text
-~/.local/share/werk1112/models/TinyLLama-1B-GGUF/
-├── manifest.json
-├── files/
-│   └── ...
-└── artifacts/
-    └── onnx/
+~/.local/share/werk1112/
+├── models/<model-id>/
+│   ├── manifest.json
+│   └── files/...
+├── artifacts/<model-id>/...
+├── outputs/<result-id>/
+│   ├── metadata.json
+│   └── generated files...
+└── jobs/<job-id>.json
 ```
+
+Each inference result owns one directory. Individual output IDs use
+`<result-id>-<index>` and are resolved through that directory's
+`metadata.json`.
 
 On native Windows, the same model is saved here by default:
 
@@ -535,7 +666,15 @@ On native Windows, the same model is saved here by default:
 %LOCALAPPDATA%\werk1112\models\TinyLLama-1B-GGUF\
 ```
 
-`manifest.json` contains source, format, architecture, tokenizer/config paths, model file path, checksums, backend hints, and optimized artifact metadata. `files/` contains the copied local model files or downloaded Hugging Face files. `artifacts/` contains generated runtime artifacts such as ONNX exports.
+Schema-v2 `manifest.json` contains source, format, family, architecture,
+repository layout, typed tasks and modalities, first-class components,
+precision/quantization, detected defaults and constraints, checksums, runtime
+hints, and optimized-artifact metadata. Schema-v1 manifests remain readable and
+are enriched in memory from their repository contents.
+
+Output retention defaults to 30 days and 20 GiB and only ever removes children
+of `outputs/`; model data is never part of retention. Override the limits with
+`WERK_OUTPUT_RETENTION_SECONDS` and `WERK_OUTPUT_MAX_BYTES`.
 
 For GGUF repositories that contain many quantizations, new imports prefer a balanced `Q4_K_M` file when it is present instead of taking the first filename alphabetically. The selected file is stored in `manifest.json` as `model_path`, and both `chat` and `serve` use that selected file.
 
@@ -550,7 +689,7 @@ cargo install --path . --locked
 From another directory, pass the project path with `--path`:
 
 ```bash
-cargo install --path ../client --locked
+cargo install --path /path/to/werk1112 --locked
 ```
 
 After install, use the command directly:
@@ -566,15 +705,19 @@ During development, you can also run the local CPU-only binary without installin
 cargo run --no-default-features -- <command>
 ```
 
-Start the server:
+Generate an API key and start the server:
 
 ```bash
+werk auth api-key generate
 werk serve
 ```
 
-`serve` starts an OpenAI-compatible API. It exposes all installed models through `/v1/models`; each API request normally chooses the model with its JSON `model` field.
+`serve` exposes OpenAI-compatible model/chat routes and Werk media, discovery,
+output, and job routes. `/v1/models` returns summaries of all installed models;
+use `werk inspect MODEL` for a full manifest. Media requests require their JSON
+`model` field.
 
-Set a default model for requests that omit `model`:
+Set a default model for chat requests that omit `model`:
 
 ```bash
 werk serve --model gemma-2b-it
@@ -669,6 +812,9 @@ List installed models:
 
 ```bash
 werk list
+werk list --task image-generation --layout diffusers
+werk list --input-modality audio --output-modality text
+werk list --family flux --layout diffusers --json
 ```
 
 Inspect a model manifest:
@@ -677,27 +823,50 @@ Inspect a model manifest:
 werk inspect llama-local
 ```
 
-Estimate whether a model is likely to fit in memory before starting inference:
+Estimate model size or a concrete inference workload before starting:
 
 ```bash
+# Legacy model-fit estimate: installed models or remote Hugging Face repositories
 werk estimate llama-local
 werk estimate llama-local --verbose
 werk estimate llama-local --json
 werk estimate org/model-repo
 werk estimate org/model-repo --file model.Q4_K_M.gguf --verbose
+
+# Workload Estimate v2: installed model plus canonical task
+werk estimate flux-dev --task image-generation --width 1024 --height 1024 --steps 28
+werk estimate wan-i2v --task image-to-video --width 832 --height 480 --frames 81
 ```
 
-`estimate` first checks the managed Werk store. If the model is installed, it resolves the local manifest, counts likely model weight files, parses `config.json` when available for a KV-cache estimate, applies a small runtime overhead heuristic, and compares the result with best-effort system memory detection.
+These are intentionally different modes:
 
-If the model is not installed and the argument looks like a Hugging Face repo id, `estimate` queries Hugging Face repository metadata and small JSON files such as `config.json` or `*.safetensors.index.json`, but it does not download model weights into the Werk store. Use it before `werk pull` when you want to compare model size, selected GGUF quantization, estimated KV cache, and backend hint against your machine. Use `--file` for GGUF repos with many quantizations.
+- Without `--task`, the legacy model-fit estimator counts selected weights,
+  runtime overhead, and an estimated text KV cache. It compares the total with
+  detected system memory and reports `ok`, `warning`, or `likely_oom` with
+  `low`, `medium`, or `high` confidence. `--verbose` shows counted and ignored
+  files; a local benchmark observation may add a measured peak.
+- With `--task`, Workload Estimate v2 runs an installed model through the
+  canonical resolver first. It reports download size, weight payload,
+  accelerator peak, host peak, output size, fit (`fits`, `tight`,
+  `likely_oom`, or `unknown`), confidence, assumptions, warnings, and
+  recommendations. Its confidence values are `exact`, `backend_measured`,
+  `architecture_model`, `heuristic`, and `unknown`; the current built-in and
+  bundled companion estimators emit `heuristic`.
 
-For gated repositories, remote `estimate` needs the same access as `werk pull`: accept the model conditions in your browser, then run `werk auth huggingface login` or set `HF_TOKEN`. Werk cannot accept model conditions for you through the Hugging Face API.
+If the model is not installed and its name looks like a Hugging Face repository
+ID, the legacy estimator queries repository metadata and small JSON/index files
+without downloading model weights. Use `--file` to select one quantization from
+a remote GGUF repository. Task estimates require an installed model, and
+`--file` cannot be combined with `--task`.
 
-Remote estimates are metadata-based. They are useful for memory planning, but backend compatibility can still depend on the actual model format. For example, raw Hugging Face GLM/ChatGLM repositories may need an MLX-converted model or a GGUF build even when the memory estimate looks feasible.
+For gated repositories, remote estimates need the same access as `werk pull`:
+accept the model conditions in your browser, then run
+`werk auth huggingface login` or set `HF_TOKEN`. Werk cannot accept model
+conditions for you through the Hugging Face API.
 
-The estimate includes a confidence level. `HIGH` means the selected weights were clear and KV cache could be computed from model dimensions. `MEDIUM` means Werk had enough information for a reasonable estimate but used partial defaults. `LOW` means the model files or KV-cache shape were ambiguous and the result is intentionally conservative.
-
-Use `--verbose` with either estimator to see the selected model file(s), counted weight files, ignored metadata/tokenizer files, and total counted weight bytes. If `<WERK_HOME>/benchmarks/estimate-observations.json` contains a previous measured peak-memory observation for an installed model, `estimate` displays that as `Measured peak`. JSON output includes the same accounting fields, confidence, whether config data was used, notes, source URL when known, and nullable measured peak memory.
+Remote estimates and task estimates are planning aids, not backend execution
+guarantees. Use `--json` for the complete machine-readable report. In workload
+mode, `--verbose` adds the estimator's assumptions.
 
 Switch an already-installed model to another tracked model file:
 
@@ -713,17 +882,116 @@ Use a custom store for any command:
 werk --model-home /tmp/werk-store list
 ```
 
-Run one prompt from the terminal:
+Generate or edit images:
 
 ```bash
-werk run gemma-2b-it "Write one sentence about Rust." --max-tokens 64
+werk image generate flux-dev --prompt "an abandoned orbital station" \
+  --width 1024 --height 1024 --steps 28
+werk image edit flux-fill --image station.png --prompt "restore the solar array"
+werk image upscale realesrgan --image station.png --output upscaled.png
 ```
+
+Generate or transform video:
+
+```bash
+werk video generate wan-t2v --prompt "a quiet lunar sunrise" --frames 81 --fps 16
+werk video animate wan-i2v --image station.png --prompt "slow camera orbit"
+werk video transform cogvideo --video source.mp4 --prompt "winter storm"
+werk video upscale video-upscaler --video source.mp4 --output upscaled.mp4
+```
+
+Generate music/audio, synthesize speech, or transcribe:
+
+```bash
+werk audio generate musicgen --prompt "cinematic synthwave"
+werk audio speak speech-model --text-file narration.txt
+werk audio transcribe whisper --input interview.wav --word-timestamps
+```
+
+The current generic companion executes audio/music generation, TTS, and ASR
+for compatible local models. Song continuation/variation, voice conversion,
+stem generation/separation (including `werk audio separate`), and audio
+enhancement are present in the typed contract but do not yet have generic
+execution adapters.
 
 Start an interactive terminal chat:
 
 ```bash
 werk chat gemma-2b-it --max-tokens 128
 ```
+
+If a generative command has no inline prompt/text, input is resolved in this
+order: explicit value, file, piped stdin, then an interactive `prompt>` or
+`text>` line. Some advanced values are repeatable structured objects. For
+example, a Diffusers pipeline with a LoRA loading hook can use:
+
+```bash
+werk image generate flux-dev --prompt "retro-futurist station" \
+  --image-lora "model=style.safetensors,weight=0.6"
+```
+
+The canonical schema also describes controls, prompt keyframes, music
+instrumentation, and other model-specific features. The bundled companion does
+not currently execute image controls, video prompt keyframes, or audio
+instrumentation. `werk parameters MODEL --json` may label such fields
+`model_dependent`; that is a probe limitation, not an execution guarantee.
+
+Inspect the machine-readable Station contract:
+
+```bash
+werk parameters --task image-generation
+werk parameters flux-dev --backend auto --json
+werk parameters flux-dev --example
+werk parameters flux-dev --sources
+```
+
+The incoming request contains overrides only. Werk resolves every effective
+parameter using this order (later layers win):
+
+1. system default;
+2. task default;
+3. model-family default;
+4. concrete model default;
+5. runtime/backend default;
+6. hardware or quality profile;
+7. saved profile;
+8. request override;
+9. explicit backend adjustment.
+
+Each resolved value can carry its source. Boolean pairs such as
+`--image-vae-tiling` / `--no-image-vae-tiling` preserve the inherited state.
+List values support inherit, replace, add, and clear semantics in the internal
+request contract. Explicit parameters reported as ignored or unsupported fail
+under the default `strict` policy. `warn` continues with a warning and ignores
+those values; `permissive` continues without that warning. Neither mode adds
+backend functionality. `model_dependent` means the probe cannot guarantee
+support and the concrete pipeline may still reject the parameter when loaded.
+
+Parameter policy and runtime fallback are independent. The default
+`--fallback-policy backend` may retry the same model through another accepted
+runtime. `none` disables runtime retry. For a workload estimated as
+`likely_oom`, `degrade` can retain a candidate only when that runtime supports
+offloading and the relevant degradation permission/parameter is already
+enabled. Current companion offload candidates are CUDA/ROCm. The planner may
+record permitted CPU/component/sequential offload, enabled VAE tiling, or
+configured temporal windowing; it does not turn tiling/windowing on by itself.
+Model changes, stronger quantization, lower resolution, fewer frames, and
+shorter duration remain recommendations and are never applied silently.
+
+Check host, task, runtime, or model-specific availability:
+
+```bash
+werk doctor
+werk doctor --task image-generation
+werk doctor --model flux-dev
+werk doctor perf text-model
+```
+
+The unfiltered report checks the companion launcher/protocol and optional
+dependencies. `--task` narrows the installed-manifest summary; it does not load
+a concrete pipeline. `--model` adds a model/task routing probe. Python and
+optional media packages are never installed silently, and a missing optional
+package limits matching tasks without making the global doctor result fail.
 
 `--max-tokens` is a hard cap on generated completion tokens. If you set `--max-tokens 32`, the model may stop mid-sentence because the decoder reached the limit, not because the answer is complete. Use a larger value such as `--max-tokens 64` or `--max-tokens 128` for normal chat.
 
@@ -733,7 +1001,8 @@ Terminal chat prints decoded token-pieces as soon as the backend produces them, 
 werk chat gemma-2b-it --stream-granularity chunk
 ```
 
-Timing and throughput stats are quiet by default. Add `--verbose` to `run` or `chat` for runtime timing stats:
+Timing and throughput stats are quiet by default. Add `--verbose` to `chat`
+for runtime timing stats:
 
 ```bash
 werk chat TinyLlama-1B-GGUF --max-tokens 128 --verbose
@@ -754,26 +1023,48 @@ eval rate:            86.81 tokens/s
 
 `prompt eval` is prompt/prefill time. `eval` is assistant-token decode time. `total` also includes model load and tokenizer overhead for that turn. For TinyLlama GGUF on a CUDA build, use `Q4_K_M` as the default balance of speed and quality; `Q2_K` is smaller but noticeably worse, and larger quants can be slower.
 
-CLI chat is a first-class workflow. The HTTP API allows existing applications compatible with the OpenAI API to integrate with Werk1112 without additional adapters.
+CLI chat is a first-class workflow. OpenAI-compatible chat clients can use
+Werk1112 without a chat-specific adapter.
 
-## OpenAI-Compatible API
+## HTTP API
 
-Configure compatible clients with this base URL:
+`/v1/models` and `/v1/chat/completions` use OpenAI-compatible shapes. Media,
+capability, parameter, output, and job routes are OpenAI-inspired or
+Werk-native JSON APIs. They are not a claim of full OpenAI media API
+compatibility.
 
-```text
-http://127.0.0.1:11434/v1
-```
-
-List models:
+Authentication is required by default. In the first terminal:
 
 ```bash
-curl http://127.0.0.1:11434/v1/models
+werk auth api-key generate
+werk serve --model local-model
+```
+
+Copy the printed key into the client shell:
+
+```bash
+export WERK_BASE_URL='http://127.0.0.1:11434'
+export WERK_API_KEY='sk-werk-replace-with-the-generated-value'
+```
+
+Use `--allow-unauthenticated` only for a deliberately unauthenticated local
+development server. The server's default model applies to chat; every media
+request must include `model`.
+
+### Models and Chat
+
+List installed model summaries:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/models" \
+  -H "Authorization: Bearer $WERK_API_KEY"
 ```
 
 Non-streaming chat completion:
 
 ```bash
-curl http://127.0.0.1:11434/v1/chat/completions \
+curl -fsS "$WERK_BASE_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama-local",
@@ -785,12 +1076,12 @@ curl http://127.0.0.1:11434/v1/chat/completions \
   }'
 ```
 
-Non-streaming calls do not print anything until the full completion is finished. For large models on CPU, prefer streaming while testing.
-
-Streaming chat completion:
+Non-streaming calls return after the full completion. Stream while testing
+larger CPU models:
 
 ```bash
-curl -N http://127.0.0.1:11434/v1/chat/completions \
+curl -N "$WERK_BASE_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama-local",
@@ -802,21 +1093,208 @@ curl -N http://127.0.0.1:11434/v1/chat/completions \
   }'
 ```
 
-The stream sends chunks like:
+`delta` and `finish_reason` are nested inside `choices[0]`:
 
 ```text
-data: {"object":"chat.completion.chunk",...,"delta":{"role":"assistant"}}
-data: {"object":"chat.completion.chunk",...,"delta":{"content":"Rust is a systems"}}
-data: {"object":"chat.completion.chunk",...,"delta":{"content":" programming language..."}}
-data: {"object":"chat.completion.chunk",...,"finish_reason":"stop"}
+data: {"object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"Rust is a systems"},"finish_reason":null}]}
+data: {"object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 data: [DONE]
 ```
 
-Text deltas are intentionally chunked. They are not one event per token.
+Text deltas are intentionally buffered into small chunks rather than one event
+per generated token.
+
+### Media, Discovery, Outputs, and Jobs
+
+| Method | Path | Success behavior |
+| --- | --- | --- |
+| `POST` | `/v1/images/generations` | `200` synchronous image generation |
+| `POST` | `/v1/images/edits` | `200` synchronous JSON local-path/base64 image editing |
+| `POST` | `/v1/videos/generations` | `202` persisted job |
+| `POST` | `/v1/audio/generations` | `202` persisted job |
+| `POST` | `/v1/audio/speech` | `200` raw audio, or `202` job when `async` is true |
+| `POST` | `/v1/audio/transcriptions` | `200` JSON transcription result |
+| `GET` | `/v1/capabilities` | `200` installed declarations and probe-eligible tasks |
+| `GET` | `/v1/parameters` | `200` parameter schema; query parameter `task` is required |
+| `GET` | `/v1/outputs/{id}` | `200` authenticated persisted output bytes |
+| `POST` | `/v1/jobs` | `202` native typed inference job |
+| `GET` | `/v1/jobs/{id}` | `200` persisted job status/result |
+| `DELETE` | `/v1/jobs/{id}` | `200` cooperative cancellation result |
+
+Inspect host capabilities and the parameters for a concrete task/model:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/capabilities" \
+  -H "Authorization: Bearer $WERK_API_KEY"
+
+curl -fsS --get "$WERK_BASE_URL/v1/parameters" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  --data-urlencode 'task=image-generation' \
+  --data-urlencode 'model=flux-dev' \
+  --data-urlencode 'backend=auto'
+```
+
+`task` is required by `/v1/parameters`; `model` and `backend` are optional.
+Supplying a model adds its constraints and probed runtime/parameter-support
+candidates.
+
+`/v1/capabilities` distinguishes manifest-declared `tasks` from
+`available_tasks`, for which at least one runtime candidate passed the current
+metadata, dependency, accelerator, and health probes. Its `tools` list contains
+one function descriptor per distinct available task. This is an eligibility
+result, not an execution guarantee: media probes do not load the concrete model
+pipeline.
+
+Image generation returns `data` entries plus a complete Werk inference result:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/images/generations" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "flux-dev",
+    "prompt": "an abandoned orbital station",
+    "size": "1024x1024",
+    "n": 1,
+    "response_format": "url",
+    "output_format": "png",
+    "steps": 28
+  }'
+```
+
+For images, `response_format` selects `url` or `b64_json` delivery. A URL is
+relative to the Werk server. For video, generated audio, TTS, and transcription,
+`response_format` instead selects the requested output codec/format.
+
+Video and audio generation return `202 Accepted` with a persisted `JobRecord`:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/videos/generations" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "wan-i2v",
+    "prompt": "slow camera orbit",
+    "image": {"path": "/absolute/path/station.png"},
+    "size": "832x480",
+    "frames": 81,
+    "fps": 16,
+    "response_format": "mp4"
+  }'
+
+curl -fsS "$WERK_BASE_URL/v1/audio/generations" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "musicgen",
+    "task": "music-generation",
+    "prompt": "cinematic analogue synthwave",
+    "response_format": "wav"
+  }'
+```
+
+Copy the returned `id`, then poll or cancel it:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/jobs/JOB_ID" \
+  -H "Authorization: Bearer $WERK_API_KEY"
+
+curl -fsS -X DELETE "$WERK_BASE_URL/v1/jobs/JOB_ID" \
+  -H "Authorization: Bearer $WERK_API_KEY"
+```
+
+Job states are `queued`, `loading`, `running`, `encoding`, `completed`,
+`failed`, and `cancelled`. Cancellation is cooperative: the record becomes
+terminal immediately, but a third-party runtime without native cancellation
+may finish its current call before releasing resources.
+
+Text-to-speech is synchronous by default and returns raw audio plus an
+`x-werk-output-id` response header:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/audio/speech" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "speech-model",
+    "input": "Systems nominal.",
+    "response_format": "wav"
+  }' \
+  --output speech.wav
+```
+
+Add `"async": true` to receive a `202` job instead. The generic Transformers
+TTS adapter uses the model's native voice and sample rate and rejects explicit
+voice, speed, pitch, and resampling under the default `strict` policy.
+
+Transcription currently accepts JSON rather than multipart form data. A path
+must be visible to the Werk server:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/audio/transcriptions" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "whisper",
+    "file": {
+      "path": "/absolute/path/interview.wav",
+      "mime_type": "audio/wav"
+    },
+    "language": "en",
+    "response_format": "text"
+  }'
+```
+
+`file` also accepts an inline-base64 object such as
+`{"base64":"<data>","mime_type":"audio/wav"}` or a base64 data URL.
+
+Submit a model-declared canonical task through the native job route. Execution
+still requires an available runtime:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/jobs" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "flux-dev",
+    "task": "image-generation",
+    "prompt": "a small orbital greenhouse",
+    "parameters": {"width": 512, "height": 512, "steps": 20}
+  }'
+```
+
+A completed job stores its inference result in `result`. Download
+`result.outputs[0].id`, or the `data[0].id` from a synchronous response:
+
+```bash
+curl -fsS "$WERK_BASE_URL/v1/outputs/OUTPUT_ID" \
+  -H "Authorization: Bearer $WERK_API_KEY" \
+  --output generated-output.bin
+```
+
+The route expects an output ID, not a job or top-level result ID, and returns
+the persisted file's `Content-Type` and `Content-Length`.
+
+Typed media CLI execution and media/job submission paths use the same resolver,
+defaults, validation, estimator, planner, parameter-support policy, companion
+adapter, and output metadata; they do not invoke one another. Status,
+cancellation, and output downloads operate on persisted records/files. HTTP
+chat currently accepts text and image content, but not video/audio content or
+automatic tool-call orchestration.
+
+The offline companion supports server-local paths and inline base64 and does
+not fetch remote HTTP(S) inputs. OpenAI multipart uploads, HTTP byte ranges,
+and object-storage export are not implemented.
 
 ## End-User Releases
 
-Release artifacts should be produced with the target Cargo alias on the target platform. Each release contains the Cargo-built `werk` binary and documentation, not backend-specific companion runtime packages. Installers install only the Werk1112 CLI; they do not install CUDA, ROCm, Metal, MLX, vLLM, llama.cpp, ONNX Runtime, Python, Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`.
+Release artifacts should be produced with the target Cargo alias on the target
+platform. Each release contains the Cargo-built `werk` binary, its embedded
+media adapter, and documentation, but no third-party backend/runtime packages.
+Installers install only the Werk1112 CLI; they do not install CUDA, ROCm, Metal,
+MLX, vLLM, llama.cpp, ONNX Runtime, Python, Diffusers, Transformers, codecs,
+Rust, Cargo, Visual Studio, CMake, Git, libclang, or `nvcc`.
 
 Do not ship one artifact per backend. Release artifacts are universal runtime-router binaries with the platform accelerator path compiled in; external/server acceleration is discovered from the host system and installed companion runtimes. Legacy in-process llama.cpp FFI CUDA/Vulkan builds are debug/developer features, not the normal release route.
 
@@ -843,7 +1321,12 @@ werk --backend onnx chat model-id
 werk --backend vllm chat model-id
 ```
 
-`auto` is format-aware: GGUF uses llama.cpp server acceleration when discoverable, then CPU and legacy fallbacks according to the planner; safetensors can use vLLM or Candle according to host capabilities and compiled artifact features; MLX-format models use MLX when available. Explicit `onnx`, `vllm`, and GPU requests do not fallback to CPU. `--backend rocm` is strict ROCm/HIP for compatible formats.
+For the text/chat commands above, `auto` is format-aware: GGUF uses llama.cpp
+server acceleration when discoverable, then CPU and legacy fallbacks according
+to the planner; safetensors can use vLLM or Candle according to host
+capabilities and compiled artifact features; MLX-format models use MLX when
+available. Explicit `onnx`, `vllm`, and GPU requests do not fall back to CPU.
+`--backend rocm` is strict ROCm/HIP for compatible text formats.
 
 MLX and Metal are not the same backend. Metal is implemented through Candle. MLX is implemented as an external `mlx-lm` backend. CUDA, Vulkan, and CPU GGUF hot paths are implemented through persistent llama.cpp server backends. `WERK_MLX_PYTHON` can point to a Python environment with `mlx-lm` installed.
 

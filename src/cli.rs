@@ -1,20 +1,20 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-#[cfg(unix)]
-use std::{io::Read, os::fd::AsRawFd};
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "burn-experimental")]
@@ -39,6 +39,18 @@ use crate::{
         vllm_doctor_checks,
     },
     banner::print_banner,
+    capabilities::{InferenceTask, InputModality, OutputModality, RepositoryLayout},
+    inference::{
+        InferenceInput, InferenceInputSource, InferenceRequest, OverrideBool, ParameterPolicy,
+        ParameterValue, RoutingOverrides, WorkloadEstimate, parameter_schema,
+        parameter_schema_for_manifest,
+    },
+    inference_service::{InferenceResult, InferenceService},
+    media_cli::{
+        AudioCommands, ImageCommands, RoutingArgs, VideoCommands, collect_raw_overrides,
+        parse_set_overrides,
+    },
+    media_companion::CompanionClient,
     model_store::{
         ArtifactStatus, ModelArtifact, ModelFormat, ModelManifest, ModelSource, ModelStore,
         PullProgress,
@@ -121,6 +133,22 @@ pub enum DeviceArg {
     Cpu,
     Cuda,
     Metal,
+}
+
+fn parse_inference_task(value: &str) -> std::result::Result<InferenceTask, String> {
+    value.parse()
+}
+
+fn parse_input_modality(value: &str) -> std::result::Result<InputModality, String> {
+    value.parse()
+}
+
+fn parse_output_modality(value: &str) -> std::result::Result<OutputModality, String> {
+    value.parse()
+}
+
+fn parse_repository_layout(value: &str) -> std::result::Result<RepositoryLayout, String> {
+    value.parse()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -209,7 +237,7 @@ pub struct LlamaRuntimeArgs {
         env = "WERK_LLAMA_BATCH",
         help = "llama.cpp logical prompt batch size"
     )]
-    pub batch_size: Option<usize>,
+    pub batch_size: Option<u32>,
 
     #[arg(
         long,
@@ -295,7 +323,7 @@ impl LlamaRuntimeArgs {
     fn to_options(&self) -> LlamaRuntimeOptions {
         LlamaRuntimeOptions {
             ctx_size: self.ctx_size,
-            batch_size: self.batch_size,
+            batch_size: self.batch_size.map(|value| value as usize),
             ubatch_size: self.ubatch_size,
             gpu_layers: self.gpu_layers,
             main_gpu: self.main_gpu,
@@ -371,6 +399,7 @@ impl From<DeviceArg> for CandleDeviceMode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     #[command(about = "Start the OpenAI-compatible HTTP server")]
@@ -413,7 +442,10 @@ pub enum Commands {
         verbose: bool,
     },
 
-    #[command(about = "Run one prompt against an installed model and print the response")]
+    #[command(
+        about = "Run one prompt against an installed model and print the response",
+        hide = true
+    )]
     Run {
         #[arg(help = "Installed model id")]
         model: String,
@@ -511,10 +543,59 @@ pub enum Commands {
         debug: bool,
     },
 
+    #[command(about = "Generate, edit, or upscale images")]
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
+
+    #[command(about = "Generate, animate, transform, or upscale video")]
+    Video {
+        #[command(subcommand)]
+        command: VideoCommands,
+    },
+
+    #[command(about = "Generate audio, synthesize speech, transcribe, or separate stems")]
+    Audio {
+        #[command(subcommand)]
+        command: AudioCommands,
+    },
+
     #[command(about = "Estimate whether a local or Hugging Face model is likely to fit in memory")]
     Estimate {
         #[arg(help = "Installed model id or Hugging Face repo id")]
         model: String,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Estimate an inference task using the canonical media request pipeline"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Requested output width")]
+        width: Option<u32>,
+
+        #[arg(long, help = "Requested output height")]
+        height: Option<u32>,
+
+        #[arg(long, help = "Requested video frame count")]
+        frames: Option<u32>,
+
+        #[arg(long, value_name = "SECONDS", help = "Requested output duration")]
+        duration: Option<f64>,
+
+        #[arg(long, help = "Requested batch size")]
+        batch_size: Option<u32>,
+
+        #[arg(long, help = "Requested audio sample rate")]
+        sample_rate: Option<u32>,
+
+        #[arg(long, help = "Requested audio channel count")]
+        channels: Option<u16>,
+
+        #[arg(long, help = "Requested diffusion or sampling step count")]
+        steps: Option<u32>,
 
         #[arg(
             long,
@@ -580,7 +661,20 @@ pub enum Commands {
     #[command(about = "Inspect Werk runtime diagnostics")]
     Doctor {
         #[command(subcommand)]
-        command: DoctorCommands,
+        command: Option<DoctorCommands>,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Limit media diagnostics to an inference task"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Limit diagnostics to a runtime name")]
+        runtime: Option<String>,
+
+        #[arg(long, help = "Inspect routing for an installed model")]
+        model: Option<String>,
     },
 
     #[command(about = "Manage local runtime backends")]
@@ -636,7 +730,55 @@ pub enum Commands {
     },
 
     #[command(about = "List installed models")]
-    List,
+    List {
+        #[arg(long, value_parser = parse_inference_task, help = "Filter by supported task")]
+        task: Option<InferenceTask>,
+
+        #[arg(
+            long = "input-modality",
+            value_parser = parse_input_modality,
+            help = "Filter by input modality"
+        )]
+        input: Option<InputModality>,
+
+        #[arg(
+            long = "output-modality",
+            value_parser = parse_output_modality,
+            help = "Filter by output modality"
+        )]
+        output: Option<OutputModality>,
+
+        #[arg(long, help = "Filter by model family")]
+        family: Option<String>,
+
+        #[arg(long, value_parser = parse_repository_layout, help = "Filter by repository layout")]
+        layout: Option<RepositoryLayout>,
+
+        #[arg(long, help = "Print manifests as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Describe task parameters, defaults, and resolution sources")]
+    Parameters {
+        #[arg(value_name = "MODEL", help = "Installed model id")]
+        model: Option<String>,
+
+        #[arg(
+            long,
+            value_parser = parse_inference_task,
+            help = "Inference task whose parameter contract should be shown"
+        )]
+        task: Option<InferenceTask>,
+
+        #[arg(long, help = "Print machine-readable parameter information")]
+        json: bool,
+
+        #[arg(long, help = "Print a canonical request example")]
+        example: bool,
+
+        #[arg(long, help = "Resolve and include parameter provenance")]
+        sources: bool,
+    },
 
     #[command(about = "Print a model manifest as JSON")]
     Inspect {
@@ -826,8 +968,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 selection_options,
             )?;
             let prompt_options_resolver = {
-                let backend_choice = backend_choice;
-                let selection_options = selection_options;
                 Arc::new(
                     move |store: &ModelStore, manifest: &ModelManifest, has_images: bool| {
                         let selected_backend = selected_backend_for_request(
@@ -1028,23 +1168,74 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Image { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_image_command(&store, backend_override, device_override, command)
+        }
+        Commands::Video { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_video_command(&store, backend_override, device_override, command)
+        }
+        Commands::Audio { command } => {
+            let store = ModelStore::resolve(model_home)?;
+            run_audio_command(&store, backend_override, device_override, command)
+        }
         Commands::Estimate {
             model,
+            task,
+            width,
+            height,
+            frames,
+            duration,
+            batch_size,
+            sample_rate,
+            channels,
+            steps,
             file,
             json,
             verbose,
         } => {
             let store = ModelStore::resolve(model_home)?;
-            let report = estimate_model_or_huggingface(
-                &store,
-                &model,
-                file.as_deref(),
-                detect_system_memory(),
-            )?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+            if let Some(task) = task {
+                if file.is_some() {
+                    bail!("--file cannot be combined with --task workload estimates");
+                }
+                let service = InferenceService::new(store);
+                let request = workload_estimate_request(
+                    model,
+                    task,
+                    backend_override,
+                    device_override,
+                    WorkloadEstimateArgs {
+                        width,
+                        height,
+                        frames,
+                        duration,
+                        batch_size,
+                        sample_rate,
+                        channels,
+                        steps,
+                    },
+                );
+                let _effective = service.resolve(request.clone())?;
+                let report = service.estimate(request)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_workload_estimate(&report, verbose);
+                }
             } else {
-                print_estimate_report(&report, verbose);
+                let report = estimate_model_or_huggingface(
+                    &store,
+                    &model,
+                    file.as_deref(),
+                    detect_system_memory(),
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_estimate_report(&report, verbose);
+                }
             }
             Ok(())
         }
@@ -1088,20 +1279,35 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Doctor { command } => match command {
-            DoctorCommands::Perf { model } => {
-                let store = ModelStore::resolve(model_home)?;
-                let backend_choice = resolve_backend(backend_override, device_override)?;
-                let manifest = store.get(&model)?;
-                print_perf_doctor(
+        Commands::Doctor {
+            command,
+            task,
+            runtime,
+            model,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            match command {
+                Some(DoctorCommands::Perf { model }) => {
+                    let backend_choice = resolve_backend(backend_override, device_override)?;
+                    let manifest = store.get(&model)?;
+                    print_perf_doctor(
+                        &store,
+                        &manifest,
+                        backend_choice,
+                        &llama_options,
+                        selection_options,
+                    )
+                }
+                None => print_inference_doctor(
                     &store,
-                    &manifest,
-                    backend_choice,
-                    &llama_options,
-                    selection_options,
-                )
+                    backend_override,
+                    device_override,
+                    task,
+                    runtime.as_deref(),
+                    model.as_deref(),
+                ),
             }
-        },
+        }
         Commands::Backend { command } => {
             let store = ModelStore::resolve(model_home)?;
             match command {
@@ -1241,32 +1447,86 @@ pub async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Commands::List => {
+        Commands::List {
+            task,
+            input,
+            output,
+            family,
+            layout,
+            json,
+        } => {
             let store = ModelStore::resolve(model_home)?;
-            let manifests = store.list()?;
+            let backend_filter = (backend_override != BackendArg::Auto)
+                .then(|| requested_backend_label(backend_override));
+            let manifests = store
+                .list()?
+                .into_iter()
+                .filter(|manifest| {
+                    manifest_matches_list_filters(
+                        manifest,
+                        task,
+                        input,
+                        output,
+                        family.as_deref(),
+                        layout,
+                        backend_filter,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifests)?);
+                return Ok(());
+            }
             if manifests.is_empty() {
-                println!("No models installed in {}", store.home().display());
+                println!("No matching models installed in {}", store.home().display());
             } else {
                 println!(
-                    "{:<32} {:<14} {:<18} PATH",
-                    "MODEL", "FORMAT", "ARCHITECTURE"
+                    "{:<26} {:<14} {:<14} {:<18} TASKS",
+                    "MODEL", "LAYOUT", "FAMILY", "ARCHITECTURE"
                 );
                 for manifest in manifests {
                     println!(
-                        "{:<32} {:<14} {:<18} {}",
+                        "{:<26} {:<14} {:<14} {:<18} {}",
                         manifest.id,
-                        format!("{:?}", manifest.format).to_lowercase(),
+                        manifest.metadata.repository_layout,
+                        manifest.metadata.family.as_deref().unwrap_or("-"),
                         manifest.architecture.unwrap_or_else(|| "-".to_string()),
-                        store.model_dir(&manifest.id).display()
+                        join_display(&manifest.metadata.tasks)
                     );
                 }
             }
             Ok(())
         }
+        Commands::Parameters {
+            model,
+            task,
+            json,
+            example,
+            sources,
+        } => {
+            let store = ModelStore::resolve(model_home)?;
+            print_parameters(
+                &store,
+                backend_override,
+                device_override,
+                model.as_deref(),
+                task,
+                json,
+                example,
+                sources,
+            )
+        }
         Commands::Inspect { id } => {
             let store = ModelStore::resolve(model_home)?;
             let manifest = store.get(&id)?;
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            let mut value = serde_json::to_value(&manifest)?;
+            if let Some(fields) = value.as_object_mut() {
+                fields.insert(
+                    "host_resources".to_string(),
+                    serde_json::to_value(crate::inference_service::detect_host_resources())?,
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Commands::SelectFile { id, file } => {
@@ -1280,6 +1540,1407 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkloadEstimateArgs {
+    width: Option<u32>,
+    height: Option<u32>,
+    frames: Option<u32>,
+    duration: Option<f64>,
+    batch_size: Option<u32>,
+    sample_rate: Option<u32>,
+    channels: Option<u16>,
+    steps: Option<u32>,
+}
+
+fn run_image_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: ImageCommands,
+) -> Result<()> {
+    match command {
+        ImageCommands::Generate(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            if args.conditioning.mask.is_some() && args.conditioning.init_image.is_none() {
+                bail!("--mask requires --init-image for image generation");
+            }
+            let task = if args.conditioning.mask.is_some() {
+                InferenceTask::ImageInpainting
+            } else if args.conditioning.init_image.is_some() {
+                InferenceTask::ImageEditing
+            } else {
+                InferenceTask::ImageGeneration
+            };
+            let mut inputs = Vec::new();
+            if let Some(initial_image) = args.conditioning.init_image.as_deref() {
+                inputs.push(string_input(InputModality::Image, "image", initial_image));
+            }
+            if let Some(mask) = args.conditioning.mask.as_deref() {
+                inputs.push(path_input(InputModality::Image, "mask_image", mask));
+            }
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        ImageCommands::Edit(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            let task = if args.conditioning.mask.is_some() {
+                InferenceTask::ImageInpainting
+            } else {
+                InferenceTask::ImageEditing
+            };
+            let mut inputs = vec![path_input(InputModality::Image, "image", &args.image)];
+            if let Some(mask) = args.conditioning.mask.as_deref() {
+                inputs.push(path_input(InputModality::Image, "mask_image", mask));
+            }
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        ImageCommands::Upscale(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                false,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::ImageUpscaling,
+                prompt,
+                negative_prompt,
+                vec![path_input(InputModality::Image, "image", &args.image)],
+                &args.routing,
+                &args,
+            )
+        }
+    }
+}
+
+fn run_video_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: VideoCommands,
+) -> Result<()> {
+    match command {
+        VideoCommands::Generate(args) => {
+            let task = if args.initial_image.is_some() {
+                InferenceTask::ImageToVideo
+            } else {
+                InferenceTask::VideoGeneration
+            };
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            let inputs = args
+                .initial_image
+                .as_deref()
+                .map(|path| vec![path_input(InputModality::Image, "initial_image", path)])
+                .unwrap_or_default();
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Animate(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::ImageToVideo,
+                prompt,
+                negative_prompt,
+                vec![path_input(
+                    InputModality::Image,
+                    "initial_image",
+                    &args.image,
+                )],
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Transform(args) => {
+            let prompt = resolve_primary_text(
+                args.prompt.prompt.as_deref(),
+                args.prompt.prompt_file.as_deref(),
+                true,
+                "prompt",
+            )?;
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::VideoToVideo,
+                prompt,
+                negative_prompt,
+                vec![path_input(
+                    InputModality::Video,
+                    "source_video",
+                    &args.video,
+                )],
+                &args.routing,
+                &args,
+            )
+        }
+        VideoCommands::Upscale(args) => execute_media_args(
+            store,
+            backend,
+            device,
+            &args.model,
+            InferenceTask::VideoUpscaling,
+            None,
+            None,
+            vec![path_input(
+                InputModality::Video,
+                "source_video",
+                &args.video,
+            )],
+            &args.routing,
+            &args,
+        ),
+    }
+}
+
+fn run_audio_command(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    command: AudioCommands,
+) -> Result<()> {
+    match command {
+        AudioCommands::Generate(mut args) => {
+            let task = store
+                .get(&args.model)
+                .map(|manifest| {
+                    if args.conditioning.source_audio.is_some()
+                        && (args.conditioning.continuation_start.is_some()
+                            || args.conditioning.continuation_duration.is_some())
+                        && manifest.supports_task(InferenceTask::SongContinuation)
+                    {
+                        InferenceTask::SongContinuation
+                    } else if args.conditioning.source_audio.is_some()
+                        && manifest.supports_task(InferenceTask::SongVariation)
+                    {
+                        InferenceTask::SongVariation
+                    } else if args.conditioning.source_audio.is_some()
+                        && manifest.supports_task(InferenceTask::SongContinuation)
+                    {
+                        InferenceTask::SongContinuation
+                    } else if manifest.supports_task(InferenceTask::MusicGeneration) {
+                        InferenceTask::MusicGeneration
+                    } else {
+                        InferenceTask::AudioGeneration
+                    }
+                })
+                .unwrap_or(InferenceTask::AudioGeneration);
+            let lyrics = resolve_optional_text(
+                args.lyrics.lyrics.as_deref(),
+                args.lyrics.lyrics_file.as_deref(),
+            )?;
+            let prompt = if lyrics.is_some() {
+                resolve_optional_text(
+                    args.prompt.prompt.as_deref(),
+                    args.prompt.prompt_file.as_deref(),
+                )?
+            } else {
+                resolve_primary_text(
+                    args.prompt.prompt.as_deref(),
+                    args.prompt.prompt_file.as_deref(),
+                    false,
+                    "prompt",
+                )?
+            };
+            args.lyrics.lyrics = lyrics.clone();
+            args.lyrics.lyrics_file = None;
+            let prompt = match (prompt, lyrics.as_deref()) {
+                (Some(prompt), _) => Some(prompt),
+                // The canonical lyrics value remains available as
+                // `audio.lyrics`. Reuse its text as the required generative
+                // prompt without decorating it; the companion can then merge
+                // prompt and lyrics idempotently.
+                (None, Some(lyrics)) => Some(lyrics.to_string()),
+                (None, None) if task.requires_prompt() => {
+                    resolve_primary_text(None, None, true, "prompt")?
+                }
+                (None, None) => None,
+            };
+            let negative_prompt = resolve_optional_text(
+                args.prompt.negative_prompt.as_deref(),
+                args.prompt.negative_prompt_file.as_deref(),
+            )?;
+            let mut inputs = Vec::new();
+            for (role, path) in [
+                ("input_audio", args.conditioning.source_audio.as_deref()),
+                (
+                    "reference_audio",
+                    args.conditioning.reference_audio.as_deref(),
+                ),
+                (
+                    "instrumental_audio",
+                    args.conditioning.instrumental_audio.as_deref(),
+                ),
+                ("vocal_audio", args.conditioning.vocal_audio.as_deref()),
+                ("melody_audio", args.conditioning.melody_audio.as_deref()),
+                ("rhythm_audio", args.conditioning.rhythm_audio.as_deref()),
+                ("chord_audio", args.conditioning.chord_audio.as_deref()),
+            ] {
+                if let Some(path) = path {
+                    inputs.push(path_input(InputModality::Audio, role, path));
+                }
+            }
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                task,
+                prompt,
+                negative_prompt,
+                inputs,
+                &args.routing,
+                &args,
+            )
+        }
+        AudioCommands::Speak(args) => {
+            let text = resolve_primary_text(
+                args.text.text.as_deref(),
+                args.text.text_file.as_deref(),
+                true,
+                "text",
+            )?;
+            execute_media_args(
+                store,
+                backend,
+                device,
+                &args.model,
+                InferenceTask::TextToSpeech,
+                text,
+                None,
+                Vec::new(),
+                &args.routing,
+                &args,
+            )
+        }
+        AudioCommands::Transcribe(args) => execute_media_args(
+            store,
+            backend,
+            device,
+            &args.model,
+            InferenceTask::SpeechToText,
+            None,
+            None,
+            vec![path_input(
+                InputModality::Audio,
+                "input_audio",
+                &args.input_audio,
+            )],
+            &args.routing,
+            &args,
+        ),
+        AudioCommands::Separate(args) => execute_media_args(
+            store,
+            backend,
+            device,
+            &args.model,
+            InferenceTask::StemSeparation,
+            None,
+            None,
+            vec![path_input(
+                InputModality::Audio,
+                "input_audio",
+                &args.input_audio,
+            )],
+            &args.routing,
+            &args,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_media_args<T: Serialize>(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    model: &str,
+    task: InferenceTask,
+    prompt: Option<String>,
+    negative_prompt: Option<String>,
+    inputs: Vec<InferenceInput>,
+    routing_args: &RoutingArgs,
+    args: &T,
+) -> Result<()> {
+    let requested_output = requested_media_output(args)?;
+    let mut request = InferenceRequest::new(model, task);
+    request.prompt = prompt;
+    request.negative_prompt = negative_prompt;
+    request.inputs = inputs;
+    request.parameters = media_parameters(args, routing_args, task)?;
+    request.routing = media_routing(routing_args, backend, device)?;
+
+    let result = InferenceService::new(store.clone()).execute(request)?;
+    print_inference_result(&result);
+    if let Some(destination) = requested_output {
+        for published in publish_cli_outputs(&result, &destination)? {
+            println!("saved> {}", published.display());
+        }
+    }
+    Ok(())
+}
+
+fn requested_media_output<T: Serialize>(args: &T) -> Result<Option<PathBuf>> {
+    let raw = collect_raw_overrides(args)?;
+    Ok(raw.get("output").and_then(Value::as_str).map(PathBuf::from))
+}
+
+fn publish_cli_outputs(result: &InferenceResult, destination: &Path) -> Result<Vec<PathBuf>> {
+    let outputs = result.outputs.iter().collect::<Vec<_>>();
+    if outputs.is_empty() {
+        bail!("inference completed without outputs to publish");
+    }
+    let destination_is_directory = destination.is_dir()
+        || outputs.len() > 1
+        || (!destination.exists() && destination.extension().is_none());
+    if outputs.len() > 1 && destination.exists() && !destination.is_dir() {
+        bail!(
+            "multiple outputs require a destination directory, but {} is a file",
+            destination.display()
+        );
+    }
+    if destination_is_directory {
+        fs::create_dir_all(destination).with_context(|| {
+            format!(
+                "failed to create output directory {}",
+                destination.display()
+            )
+        })?;
+    } else if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+
+    let mut published = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let source = Path::new(&output.path);
+        let target = if destination_is_directory {
+            let filename = source
+                .file_name()
+                .ok_or_else(|| anyhow!("output has no filename: {}", source.display()))?;
+            destination.join(filename)
+        } else {
+            destination.to_path_buf()
+        };
+        if target.exists() {
+            bail!(
+                "refusing to overwrite existing output {}; choose another --output path",
+                target.display()
+            );
+        }
+        fs::copy(source, &target).with_context(|| {
+            format!(
+                "failed to copy managed output {} to {}",
+                source.display(),
+                target.display()
+            )
+        })?;
+        published.push(target);
+    }
+    Ok(published)
+}
+
+fn resolve_primary_text(
+    explicit: Option<&str>,
+    file: Option<&Path>,
+    required: bool,
+    label: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = explicit {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if let Some(path) = file {
+        let value = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {} file {}", label, path.display()))?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if !io::stdin().is_terminal() {
+        let mut value = String::new();
+        io::stdin().lock().read_to_string(&mut value)?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    } else if required {
+        print!("{label}> ");
+        io::stdout().flush()?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    if required {
+        bail!(
+            "{} is required; pass --{}, --{}-file, pipe stdin, or enter it interactively",
+            label,
+            label,
+            label
+        );
+    }
+    Ok(None)
+}
+
+fn resolve_optional_text(explicit: Option<&str>, file: Option<&Path>) -> Result<Option<String>> {
+    if let Some(value) = explicit {
+        return Ok((!value.trim().is_empty()).then(|| value.trim().to_string()));
+    }
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let value = fs::read_to_string(path)
+        .with_context(|| format!("failed to read text file {}", path.display()))?;
+    Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
+}
+
+fn path_input(modality: InputModality, role: &str, path: &Path) -> InferenceInput {
+    string_input(modality, role, &path.to_string_lossy())
+}
+
+fn string_input(modality: InputModality, role: &str, value: &str) -> InferenceInput {
+    let value = value.to_string();
+    let (source, mime_type) = if value.starts_with("http://") || value.starts_with("https://") {
+        (InferenceInputSource::Url { url: value }, None)
+    } else if let Some((header, data)) = value.split_once(";base64,")
+        && value.starts_with("data:")
+    {
+        (
+            InferenceInputSource::Base64 {
+                data: data.to_string(),
+            },
+            header.strip_prefix("data:").map(str::to_string),
+        )
+    } else {
+        (InferenceInputSource::Path { path: value }, None)
+    };
+    InferenceInput {
+        modality,
+        role: role.to_string(),
+        source,
+        mime_type,
+    }
+}
+
+fn media_routing(
+    args: &RoutingArgs,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+) -> Result<RoutingOverrides> {
+    let backend_accelerator = match backend {
+        BackendArg::Cpu => Some("cpu"),
+        BackendArg::Cuda => Some("cuda"),
+        BackendArg::Rocm => Some("rocm"),
+        BackendArg::Metal => Some("metal"),
+        _ => None,
+    };
+    let device_accelerator = device
+        .filter(|device| *device != DeviceArg::Auto)
+        .map(device_arg_label);
+    if let (Some(accelerator), Some(device)) = (args.accelerator.as_deref(), device_accelerator)
+        && !accelerator.eq_ignore_ascii_case(device)
+    {
+        bail!(
+            "conflicting media accelerator selections: --accelerator {accelerator} and --device {device}"
+        );
+    }
+    let accelerator = args
+        .accelerator
+        .clone()
+        .or_else(|| device_accelerator.map(str::to_string))
+        .or_else(|| backend_accelerator.map(str::to_string));
+    let backend = if backend == BackendArg::Auto || backend_accelerator.is_some() {
+        None
+    } else {
+        Some(requested_backend_label(backend).to_string())
+    };
+    Ok(RoutingOverrides {
+        backend,
+        accelerator,
+        device: device.map(device_arg_label).map(str::to_string),
+        precision: args.precision.clone(),
+        quantization: args.quantization.clone(),
+        profile: args.profile.clone(),
+        quality: args.quality.clone(),
+        performance_preference: args.performance_preference.clone(),
+        fallback_policy: args.fallback_policy.clone(),
+        parameter_policy: args
+            .parameter_policy
+            .as_deref()
+            .unwrap_or("strict")
+            .parse::<ParameterPolicy>()
+            .map_err(anyhow::Error::msg)?,
+        allow_cpu_offload: canonical_bool(args.allow_cpu_offload, args.no_allow_cpu_offload),
+        allow_sequential_offload: canonical_bool(
+            args.allow_sequential_offload,
+            args.no_allow_sequential_offload,
+        ),
+        allow_component_offload: canonical_bool(
+            args.allow_component_offload,
+            args.no_allow_component_offload,
+        ),
+        allow_disk_offload: canonical_bool(args.allow_disk_offload, args.no_allow_disk_offload),
+        attention_backend: args.attention_backend.clone(),
+        compile: canonical_bool(args.compile, args.no_compile),
+        timeout_seconds: args.timeout,
+    })
+}
+
+fn canonical_bool(enabled: bool, disabled: bool) -> OverrideBool {
+    match (enabled, disabled) {
+        (true, false) => OverrideBool::Enabled,
+        (false, true) => OverrideBool::Disabled,
+        _ => OverrideBool::Inherit,
+    }
+}
+
+fn device_arg_label(device: DeviceArg) -> &'static str {
+    match device {
+        DeviceArg::Auto => "auto",
+        DeviceArg::Cpu => "cpu",
+        DeviceArg::Cuda => "cuda",
+        DeviceArg::Metal => "metal",
+    }
+}
+
+fn media_parameters<T: Serialize>(
+    args: &T,
+    routing: &RoutingArgs,
+    task: InferenceTask,
+) -> Result<BTreeMap<String, ParameterValue>> {
+    let mut raw = collect_raw_overrides(args)?;
+    for path in MEDIA_TRANSPORT_FIELDS
+        .iter()
+        .chain(MEDIA_ROUTING_FIELDS.iter())
+    {
+        raw.remove(*path);
+    }
+    expand_structured_media_values(&mut raw)?;
+    for (path, value) in parse_set_overrides(&routing.set).map_err(anyhow::Error::msg)? {
+        raw.insert(path, value);
+    }
+    normalize_negative_bool_pairs(&mut raw);
+
+    raw.into_iter()
+        .map(|(path, value)| {
+            let path = normalize_media_parameter_path(task, &path);
+            Ok((path, ParameterValue::from_json(value)?))
+        })
+        .collect()
+}
+
+const MEDIA_TRANSPORT_FIELDS: &[&str] = &[
+    "model",
+    "prompt",
+    "prompt_file",
+    "negative_prompt",
+    "negative_prompt_file",
+    "text",
+    "text_file",
+    "lyrics_file",
+    "image",
+    "init_image",
+    "mask",
+    "video",
+    "input_audio",
+    "initial_image",
+    "output",
+    "output_path",
+];
+
+const MEDIA_ROUTING_FIELDS: &[&str] = &[
+    "accelerator",
+    "precision",
+    "quantization",
+    "profile",
+    "quality",
+    "performance_preference",
+    "fallback_policy",
+    "parameter_policy",
+    "allow_cpu_offload",
+    "no_allow_cpu_offload",
+    "allow_sequential_offload",
+    "no_allow_sequential_offload",
+    "allow_component_offload",
+    "no_allow_component_offload",
+    "allow_disk_offload",
+    "no_allow_disk_offload",
+    "attention_backend",
+    "compile",
+    "no_compile",
+    "timeout",
+    "set",
+];
+
+fn expand_structured_media_values(raw: &mut BTreeMap<String, Value>) -> Result<()> {
+    for path in [
+        "controls",
+        "loras",
+        "adapters",
+        "camera_keyframes",
+        "prompt_keyframes",
+        "guidance_schedule",
+        "denoise_schedule",
+        "adapter_schedule",
+        "instruments",
+        "mix_controls",
+        "mastering_controls",
+    ] {
+        let Some(Value::Array(values)) = raw.get_mut(path) else {
+            continue;
+        };
+        for value in values.iter_mut() {
+            let Value::String(spec) = value else {
+                continue;
+            };
+            if !spec.contains('=') {
+                continue;
+            }
+            *value = parse_structured_spec(spec)
+                .with_context(|| format!("invalid structured value for {path}"))?;
+        }
+    }
+
+    let structured = raw
+        .keys()
+        .filter(|path| path.ends_with("_json") || path.ends_with("_file"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in structured {
+        let Some(source) = raw.remove(&path) else {
+            continue;
+        };
+        let (target, value) = if let Some(target) = path.strip_suffix("_json") {
+            let encoded = source
+                .as_str()
+                .ok_or_else(|| anyhow!("{path} must contain JSON text"))?;
+            let value = serde_json::from_str(encoded)
+                .with_context(|| format!("invalid JSON supplied for {path}"))?;
+            (target.to_string(), value)
+        } else {
+            let target = path.trim_end_matches("_file").to_string();
+            let file = source
+                .as_str()
+                .ok_or_else(|| anyhow!("{path} must contain a file path"))?;
+            let encoded = fs::read_to_string(file)
+                .with_context(|| format!("failed to read structured override file {file}"))?;
+            let value = serde_json::from_str(&encoded)
+                .with_context(|| format!("invalid JSON in structured override file {file}"))?;
+            (target, value)
+        };
+        merge_media_value(raw, target, value);
+    }
+    Ok(())
+}
+
+fn parse_structured_spec(spec: &str) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for field in spec.split(',') {
+        let (name, raw_value) = field
+            .split_once('=')
+            .ok_or_else(|| anyhow!("expected comma-separated key=value fields"))?;
+        let name = name.trim().replace('-', "_");
+        if name.is_empty() {
+            bail!("structured field name must not be empty");
+        }
+        if object.contains_key(&name) {
+            bail!("structured field '{name}' is repeated");
+        }
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            bail!("structured field '{name}' has an empty value");
+        }
+        let value = serde_json::from_str(raw_value)
+            .unwrap_or_else(|_| Value::String(raw_value.to_string()));
+        object.insert(name, value);
+    }
+    if object.is_empty() {
+        bail!("structured value must contain at least one key=value field");
+    }
+    Ok(Value::Object(object))
+}
+
+fn merge_media_value(raw: &mut BTreeMap<String, Value>, path: String, value: Value) {
+    match (raw.remove(&path), value) {
+        (Some(Value::Array(mut current)), Value::Array(additional)) => {
+            current.extend(additional);
+            raw.insert(path, Value::Array(current));
+        }
+        (_, value) => {
+            raw.insert(path, value);
+        }
+    }
+}
+
+fn normalize_negative_bool_pairs(raw: &mut BTreeMap<String, Value>) {
+    if raw.remove("exclude_audio") == Some(Value::Bool(true)) {
+        raw.insert("include_audio".to_string(), Value::Bool(false));
+    }
+    let negative_paths = raw
+        .iter()
+        .filter(|(path, value)| {
+            *value == &Value::Bool(true)
+                && path
+                    .rsplit_once('.')
+                    .map(|(_, name)| name.starts_with("no_"))
+                    .unwrap_or_else(|| path.starts_with("no_"))
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    for negative_path in negative_paths {
+        raw.remove(&negative_path);
+        let positive_path = match negative_path.rsplit_once('.') {
+            Some((prefix, name)) => format!("{prefix}.{}", name.trim_start_matches("no_")),
+            None => negative_path.trim_start_matches("no_").to_string(),
+        };
+        raw.insert(positive_path, Value::Bool(false));
+    }
+}
+
+fn normalize_media_parameter_path(task: InferenceTask, path: &str) -> String {
+    let path = path.replace('-', "_");
+    if path.contains('.') {
+        return path;
+    }
+    let normalized = match (task, path.as_str()) {
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "image_vae_tiling",
+        ) => "vae_tiling",
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "image_vae_slicing",
+        ) => "vae_slicing",
+        (
+            InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling,
+            "post_upscale",
+        ) => "post_upscaling",
+        (
+            InferenceTask::VideoGeneration
+            | InferenceTask::ImageToVideo
+            | InferenceTask::VideoToVideo
+            | InferenceTask::VideoInpainting
+            | InferenceTask::VideoExtension
+            | InferenceTask::VideoUpscaling
+            | InferenceTask::FrameInterpolation,
+            "loop",
+        ) => "looping",
+        (InferenceTask::SpeechToText, "task") => "operation",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "num_variations",
+        ) => "variations",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "bpm_min",
+        ) => "tempo_min",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "bpm_max",
+        ) => "tempo_max",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_register",
+        ) => "register",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_range",
+        ) => "range",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_language",
+        ) => "language",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_accent",
+        ) => "accent",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_delivery",
+        ) => "delivery",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_emotion",
+        ) => "emotion",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation,
+            "vocal_power",
+        ) => "power",
+        (InferenceTask::TextToSpeech, "loudness_lufs") => "loudness",
+        (
+            InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::SongContinuation
+            | InferenceTask::SongVariation
+            | InferenceTask::TextToSpeech
+            | InferenceTask::StemSeparation,
+            "format",
+        ) => "output_format",
+        _ => path.as_str(),
+    };
+    format!("{}.{}", task.parameter_namespace(), normalized)
+}
+
+fn print_inference_result(result: &InferenceResult) {
+    println!(
+        "{} {} via {} ({})",
+        result.task, result.model, result.runtime, result.id
+    );
+    for output in &result.outputs {
+        println!("output> {}", output.path);
+        println!(
+            "  id={} mime={} size={}{}{}{}",
+            output.id,
+            output.mime_type,
+            format_bytes(output.size_bytes),
+            output
+                .width
+                .map(|width| format!(" width={width}"))
+                .unwrap_or_default(),
+            output
+                .height
+                .map(|height| format!(" height={height}"))
+                .unwrap_or_default(),
+            output
+                .duration
+                .map(|duration| format!(" duration={duration:.2}s"))
+                .unwrap_or_default(),
+        );
+    }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn workload_estimate_request(
+    model: String,
+    task: InferenceTask,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    args: WorkloadEstimateArgs,
+) -> InferenceRequest {
+    let mut request = InferenceRequest::new(model, task);
+    if task.requires_prompt() {
+        request.prompt = Some("<estimate>".to_string());
+    }
+    request.inputs = estimate_inputs_for_task(task);
+    let namespace = task.parameter_namespace();
+    let mut insert = |name: &str, value: ParameterValue| {
+        request
+            .parameters
+            .insert(format!("{namespace}.{name}"), value);
+    };
+    if let Some(value) = args.width {
+        insert("width", value.into());
+    }
+    if let Some(value) = args.height {
+        insert("height", value.into());
+    }
+    if let Some(value) = args.frames {
+        insert("frames", value.into());
+    }
+    if let Some(value) = args.duration {
+        insert("duration", value.into());
+    }
+    if let Some(value) = args.batch_size {
+        insert("batch_size", value.into());
+    }
+    if let Some(value) = args.sample_rate {
+        insert("sample_rate", value.into());
+    }
+    if let Some(value) = args.channels {
+        insert("channels", ParameterValue::Integer(i64::from(value)));
+    }
+    if let Some(value) = args.steps {
+        insert("steps", value.into());
+    }
+    request.routing.backend = Some(requested_backend_label(backend).to_string());
+    request.routing.device = device.map(device_arg_label).map(str::to_string);
+    request
+}
+
+fn estimate_inputs_for_task(task: InferenceTask) -> Vec<InferenceInput> {
+    let placeholder = |modality, role: &str| InferenceInput {
+        modality,
+        role: role.to_string(),
+        source: InferenceInputSource::Path {
+            path: "<estimate-input>".to_string(),
+        },
+        mime_type: None,
+    };
+    use InferenceTask::*;
+    match task {
+        ImageUnderstanding | ImageEditing | ImageVariation | ImageUpscaling => {
+            vec![placeholder(InputModality::Image, "image")]
+        }
+        ImageInpainting | ImageOutpainting => vec![
+            placeholder(InputModality::Image, "image"),
+            placeholder(InputModality::Image, "mask_image"),
+        ],
+        ImageToVideo => vec![placeholder(InputModality::Image, "initial_image")],
+        VideoToVideo | VideoExtension | VideoUpscaling | FrameInterpolation => {
+            vec![placeholder(InputModality::Video, "source_video")]
+        }
+        VideoInpainting => vec![
+            placeholder(InputModality::Video, "source_video"),
+            placeholder(InputModality::Video, "mask_video"),
+        ],
+        SongContinuation | SongVariation | SpeechToText | StemGeneration | StemSeparation
+        | AudioEnhancement => vec![placeholder(InputModality::Audio, "input_audio")],
+        VoiceConversion => vec![
+            placeholder(InputModality::Audio, "input_audio"),
+            placeholder(InputModality::Audio, "reference_audio"),
+        ],
+        TextGeneration | TextEmbedding | ImageGeneration | VideoGeneration | AudioGeneration
+        | MusicGeneration | TextToSpeech => Vec::new(),
+    }
+}
+
+fn print_workload_estimate(report: &WorkloadEstimate, verbose: bool) {
+    println!("Task: {}", report.task);
+    println!(
+        "Fit: {} (confidence: {})",
+        format!("{:?}", report.fit).to_ascii_lowercase(),
+        format!("{:?}", report.confidence).to_ascii_lowercase()
+    );
+    for (label, value) in [
+        ("Download", report.download_size_bytes),
+        ("Weights", report.weight_payload_bytes),
+        ("Accelerator peak", report.accelerator_peak_bytes),
+        ("Host peak", report.host_peak_bytes),
+        ("Output", report.output_size_bytes),
+    ] {
+        println!(
+            "{label}: {}",
+            value
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
+    for recommendation in &report.recommendations {
+        println!("Recommendation: {recommendation}");
+    }
+    if verbose {
+        for assumption in &report.assumptions {
+            println!("Assumption: {assumption}");
+        }
+    }
+}
+
+fn manifest_matches_list_filters(
+    manifest: &ModelManifest,
+    task: Option<InferenceTask>,
+    input: Option<InputModality>,
+    output: Option<OutputModality>,
+    family: Option<&str>,
+    layout: Option<RepositoryLayout>,
+    backend: Option<&str>,
+) -> bool {
+    task.is_none_or(|task| manifest.metadata.tasks.contains(&task))
+        && input.is_none_or(|input| manifest.metadata.input_modalities.contains(&input))
+        && output.is_none_or(|output| manifest.metadata.output_modalities.contains(&output))
+        && family.is_none_or(|family| {
+            manifest
+                .metadata
+                .family
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(family))
+        })
+        && layout.is_none_or(|layout| manifest.metadata.repository_layout == layout)
+        && backend.is_none_or(|backend| {
+            manifest.backend.eq_ignore_ascii_case(backend)
+                || manifest.metadata.compatible_runtimes.iter().any(|runtime| {
+                    runtime
+                        .to_ascii_lowercase()
+                        .contains(&backend.to_ascii_lowercase())
+                })
+        })
+}
+
+fn join_display<T: std::fmt::Display>(values: &[T]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_parameters(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    model: Option<&str>,
+    task: Option<InferenceTask>,
+    json_output: bool,
+    example: bool,
+    sources: bool,
+) -> Result<()> {
+    let manifest = model.map(|model| store.get(model)).transpose()?;
+    let task = task
+        .or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|manifest| manifest.metadata.tasks.first().copied())
+        })
+        .ok_or_else(|| anyhow!("provide --task or an installed MODEL with declared tasks"))?;
+    if let Some(manifest) = &manifest
+        && !manifest.supports_task(task)
+    {
+        bail!(
+            "model '{}' does not declare support for task {task}",
+            manifest.id
+        );
+    }
+
+    let descriptors = match manifest.as_ref() {
+        Some(manifest) => parameter_schema_for_manifest(task, manifest)?,
+        None => parameter_schema(task),
+    };
+    let mut runtime_candidates = manifest
+        .as_ref()
+        .map(|manifest| {
+            InferenceService::new(store.clone())
+                .parameter_probe(manifest, task)
+                .map(|probe| probe.candidates)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if backend != BackendArg::Auto {
+        let filter = requested_backend_label(backend);
+        runtime_candidates.retain(|candidate| {
+            candidate.id.eq_ignore_ascii_case(filter)
+                || candidate.backend.eq_ignore_ascii_case(filter)
+                || format!("{:?}", candidate.accelerator).eq_ignore_ascii_case(filter)
+                || (filter == "metal"
+                    && format!("{:?}", candidate.accelerator).eq_ignore_ascii_case("mps"))
+        });
+        if manifest.is_some() && runtime_candidates.is_empty() {
+            bail!("no runtime matching backend '{filter}' supports model/task");
+        }
+    }
+    let parameter_support = runtime_candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .max_by_key(|candidate| candidate.priority)
+        .or_else(|| {
+            runtime_candidates
+                .iter()
+                .max_by_key(|candidate| candidate.priority)
+        })
+        .map(|candidate| candidate.parameter_support.clone());
+    let example_request = workload_estimate_request(
+        manifest
+            .as_ref()
+            .map(|manifest| manifest.id.clone())
+            .unwrap_or_else(|| "MODEL".to_string()),
+        task,
+        backend,
+        device,
+        WorkloadEstimateArgs::default(),
+    );
+    let resolved = if sources {
+        let manifest = manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("--sources requires an installed MODEL"))?;
+        let mut request = example_request.clone();
+        request.model = manifest.id.clone();
+        Some(InferenceService::new(store.clone()).resolve(request)?)
+    } else {
+        None
+    };
+
+    if json_output || example || sources {
+        let payload = json!({
+            "model": manifest.as_ref().map(|manifest| manifest.id.as_str()),
+            "task": task,
+            "backend": requested_backend_label(backend),
+            "parameters": descriptors,
+            "parameter_support": parameter_support,
+            "runtime_candidates": runtime_candidates,
+            "model_constraints": manifest
+                .as_ref()
+                .map(|manifest| &manifest.metadata.parameter_constraints),
+            "example": example.then_some(&example_request),
+            "sources": resolved.as_ref().map(|request| &request.parameters),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("Parameters for {task}");
+    println!(
+        "{:<34} {:<12} {:<16} {:<18} {:<15} DEFAULT",
+        "PATH", "TYPE", "CATEGORY", "CLI FLAG", "SUPPORT"
+    );
+    for descriptor in descriptors {
+        println!(
+            "{:<34} {:<12} {:<16} {:<18} {:<15} {}",
+            descriptor.path,
+            format!("{:?}", descriptor.value_type).to_ascii_lowercase(),
+            descriptor.category,
+            descriptor.cli_flag,
+            parameter_support
+                .as_ref()
+                .and_then(|support| support.get(&descriptor.path))
+                .map(|status| format!("{status:?}").to_ascii_lowercase())
+                .unwrap_or_else(|| "-".to_string()),
+            descriptor
+                .default
+                .as_ref()
+                .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "-".to_string()))
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn print_inference_doctor(
+    store: &ModelStore,
+    backend: BackendArg,
+    device: Option<DeviceArg>,
+    task: Option<InferenceTask>,
+    runtime: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    println!("Werk runtime diagnostics");
+    print_backend_doctor(store, false);
+
+    let report = CompanionClient::discover_doctor_report();
+    println!(
+        "Media companion: {} ({})",
+        if report.available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        report.summary
+    );
+    if let Some(launcher) = report.launcher.as_deref() {
+        println!("Companion launcher: {launcher}");
+    }
+    let runtime_lower = runtime.map(str::to_ascii_lowercase);
+    for check in report.checks.iter().filter(|check| {
+        runtime_lower.as_ref().is_none_or(|runtime| {
+            check.name.to_ascii_lowercase().contains(runtime)
+                || check.detail.to_ascii_lowercase().contains(runtime)
+        })
+    }) {
+        let status = if check.available {
+            "ok"
+        } else if check.required {
+            "missing"
+        } else {
+            "optional"
+        };
+        println!("{:<12} {:<24} {}", status, check.name, check.detail);
+    }
+
+    if let Some(task) = task {
+        let compatible = store
+            .list()?
+            .into_iter()
+            .filter(|manifest| manifest.supports_task(task))
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        println!(
+            "Task {task}: {} installed model(s){}",
+            compatible.len(),
+            if compatible.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", compatible.join(", "))
+            }
+        );
+    }
+
+    if let Some(model) = model {
+        let manifest = store.get(model)?;
+        let selected_task = task
+            .or_else(|| manifest.metadata.tasks.first().copied())
+            .ok_or_else(|| anyhow!("model '{model}' does not declare an inference task"))?;
+        let mut request = workload_estimate_request(
+            manifest.id.clone(),
+            selected_task,
+            backend,
+            device,
+            WorkloadEstimateArgs::default(),
+        );
+        if let Some(runtime) = runtime {
+            request.routing.backend = Some(runtime.to_string());
+            request.routing.fallback_policy = Some("none".to_string());
+        }
+        match InferenceService::new(store.clone()).plan(request) {
+            Ok((_, estimate, plan)) => {
+                println!(
+                    "Model {}: task={}, layout={}, fit={:?}, runtime={}",
+                    manifest.id,
+                    selected_task,
+                    manifest.metadata.repository_layout,
+                    estimate.fit,
+                    plan.selected_runtime.as_deref().unwrap_or("none")
+                );
+                for candidate in plan.candidates {
+                    println!(
+                        "  {:<24} {:?}: {}",
+                        candidate.runtime_id,
+                        candidate.status,
+                        if candidate.reasons.is_empty() {
+                            "eligible".to_string()
+                        } else {
+                            candidate.reasons.join("; ")
+                        }
+                    );
+                }
+            }
+            Err(error) => println!("Model {}: diagnostic warning: {error:#}", manifest.id),
+        }
+    }
+    Ok(())
 }
 
 fn should_print_startup_banner(command: &Commands) -> bool {
@@ -1348,13 +3009,17 @@ fn should_print_startup_banner_for(
         Commands::Import { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
+        | Commands::Image { .. }
+        | Commands::Video { .. }
+        | Commands::Audio { .. }
         | Commands::Estimate { .. }
         | Commands::Bench { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
-        | Commands::List
+        | Commands::List { .. }
+        | Commands::Parameters { .. }
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
     }
@@ -1370,12 +3035,16 @@ fn command_backend_install_verbose(command: &Commands) -> bool {
         Commands::Import { .. }
         | Commands::Pull { .. }
         | Commands::Remove { .. }
+        | Commands::Image { .. }
+        | Commands::Video { .. }
+        | Commands::Audio { .. }
         | Commands::Estimate { .. }
         | Commands::Doctor { .. }
         | Commands::Backend { .. }
         | Commands::Artifacts { .. }
         | Commands::Auth { .. }
-        | Commands::List
+        | Commands::List { .. }
+        | Commands::Parameters { .. }
         | Commands::Inspect { .. }
         | Commands::SelectFile { .. } => false,
     }
@@ -1944,6 +3613,7 @@ fn remote_hf_manifest(remote: &RemoteHfModel, include_file: Option<&str>) -> Res
         created_unix: 0,
         files,
         artifacts: Vec::new(),
+        metadata: Default::default(),
     })
 }
 
@@ -2291,13 +3961,12 @@ fn estimate_model_files_bytes(manifest: &ModelManifest) -> u64 {
 }
 
 fn estimate_weight_accounting(store: &ModelStore, manifest: &ModelManifest) -> WeightAccounting {
-    if manifest.format == ModelFormat::SafeTensors
-        || manifest.format == ModelFormat::Mlx
-        || manifest.format == ModelFormat::PyTorch
+    if matches!(
+        manifest.format,
+        ModelFormat::SafeTensors | ModelFormat::Mlx | ModelFormat::PyTorch
+    ) && let Some(accounting) = safetensors_index_weight_accounting(store, manifest)
     {
-        if let Some(accounting) = safetensors_index_weight_accounting(store, manifest) {
-            return accounting;
-        }
+        return accounting;
     }
     estimate_weight_accounting_without_store(manifest)
 }
@@ -3553,6 +5222,7 @@ impl AssistantPendingSpinner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat_loop(
     backend: Arc<dyn GenerationBackend>,
     manifest: ModelManifest,
@@ -3911,6 +5581,7 @@ struct BenchSample {
     eval_tokens_per_second: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_model(
     store: ModelStore,
     manifest: ModelManifest,
@@ -4009,6 +5680,7 @@ fn bench_model(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_benchmark_choice(
     store: ModelStore,
     manifest: &ModelManifest,
@@ -4244,8 +5916,8 @@ fn print_backend_list(store: &ModelStore) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| managed_vllm_dir(store).join("venv").display().to_string());
     println!(
-        "{:<8} {:<16} {:<10} {:<18} {}",
-        "BACKEND", "SOURCE", "INSTALLED", "HEALTH", "PATH"
+        "{:<8} {:<16} {:<10} {:<18} PATH",
+        "BACKEND", "SOURCE", "INSTALLED", "HEALTH"
     );
     println!(
         "{:<8} {:<16} {:<10} {:<18} {}",
@@ -4525,7 +6197,7 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     }
     values.sort_by(|left, right| left.total_cmp(right));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         Some((values[mid - 1] + values[mid]) / 2.0)
     } else {
         Some(values[mid])
@@ -4680,7 +6352,7 @@ enum BackendChoice {
     VllmRocm,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SelectionOptions {
     provision_missing_backends: bool,
     verbose_backend_installs: bool,
@@ -4699,15 +6371,6 @@ impl SelectionOptions {
         Self {
             verbose_backend_installs: verbose,
             ..self
-        }
-    }
-}
-
-impl Default for SelectionOptions {
-    fn default() -> Self {
-        Self {
-            provision_missing_backends: false,
-            verbose_backend_installs: false,
         }
     }
 }
@@ -5087,6 +6750,10 @@ fn runtime_id_to_backend(id: RuntimeId) -> Option<BackendChoice> {
         RuntimeId::TransformersCompat => Some(BackendChoice::TransformersCompat),
         RuntimeId::VllmCuda => Some(BackendChoice::Vllm),
         RuntimeId::VllmRocm => Some(BackendChoice::VllmRocm),
+        RuntimeId::MediaCompanionCuda
+        | RuntimeId::MediaCompanionRocm
+        | RuntimeId::MediaCompanionMetal
+        | RuntimeId::MediaCompanionCpu => None,
     }
 }
 
@@ -6188,6 +7855,33 @@ fn print_manifest_summary(action: &str, manifest: &ModelManifest) {
         manifest.format,
         manifest.architecture.as_deref().unwrap_or("unknown")
     );
+    println!(
+        "  family={} layout={} tasks={}",
+        manifest.metadata.family.as_deref().unwrap_or("unknown"),
+        manifest.metadata.repository_layout,
+        join_display(&manifest.metadata.tasks)
+    );
+    println!(
+        "  components={} size={} precision={} quantization={}",
+        manifest.metadata.components.len(),
+        format_bytes(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.size)
+                .fold(0_u64, u64::saturating_add)
+        ),
+        manifest.metadata.precision.as_deref().unwrap_or("unknown"),
+        manifest.metadata.quantization.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  compatible runtimes={}",
+        if manifest.metadata.compatible_runtimes.is_empty() {
+            "unknown".to_string()
+        } else {
+            manifest.metadata.compatible_runtimes.join(",")
+        }
+    );
 }
 
 fn print_artifact_result(action: &str, model: &str, artifact: &ModelArtifact) {
@@ -6732,6 +8426,10 @@ mod tests {
             command => panic!("unexpected command: {command:?}"),
         }
 
+        let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--batch-size", "128"]).unwrap();
+        assert_eq!(cli.llama.batch_size, Some(128));
+        assert!(matches!(cli.command, Some(Commands::Chat { .. })));
+
         let cli = Cli::try_parse_from(["werk", "chat", "tiny", "--single-turn"]).unwrap();
         match cli.command.unwrap() {
             Commands::Chat { no_history, .. } => assert!(no_history),
@@ -6857,6 +8555,312 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn parses_media_command_families() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "generate",
+            "flux",
+            "--prompt",
+            "orbital station",
+            "--width",
+            "1024",
+            "--batch-size",
+            "2",
+            "--no-compile",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Image {
+                command: ImageCommands::Generate(args),
+            } => {
+                assert_eq!(args.model, "flux");
+                assert_eq!(args.prompt.prompt.as_deref(), Some("orbital station"));
+                assert_eq!(args.dimensions.width, Some(1024));
+                assert_eq!(args.dimensions.batch_size, Some(2));
+                assert!(args.routing.no_compile);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "edit",
+            "inpaint",
+            "--image",
+            "source.png",
+            "--prompt",
+            "remove the sign",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Image {
+                command: ImageCommands::Edit(_)
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "video",
+            "animate",
+            "wan",
+            "--image",
+            "first.png",
+            "--prompt",
+            "camera moves forward",
+            "--frames",
+            "81",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Video {
+                command: VideoCommands::Animate(args),
+            } => {
+                assert_eq!(args.model, "wan");
+                assert_eq!(args.image, PathBuf::from("first.png"));
+                assert_eq!(args.core.frames, Some(81));
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        for argv in [
+            vec!["werk", "video", "generate", "wan", "--prompt", "clouds"],
+            vec!["werk", "video", "transform", "wan", "--video", "source.mp4"],
+            vec!["werk", "video", "upscale", "wan", "--video", "source.mp4"],
+            vec![
+                "werk",
+                "audio",
+                "generate",
+                "musicgen",
+                "--prompt",
+                "ambient score",
+            ],
+            vec!["werk", "audio", "speak", "kokoro", "--text", "hello"],
+            vec![
+                "werk",
+                "audio",
+                "transcribe",
+                "whisper",
+                "--input",
+                "speech.wav",
+            ],
+            vec!["werk", "audio", "separate", "demucs", "--input", "song.wav"],
+        ] {
+            Cli::try_parse_from(argv).unwrap();
+        }
+    }
+
+    #[test]
+    fn parses_media_horizontal_commands_and_filters() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "estimate",
+            "flux",
+            "--task",
+            "image-generation",
+            "--width",
+            "1024",
+            "--height",
+            "768",
+            "--steps",
+            "30",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Estimate {
+                task,
+                width,
+                height,
+                steps,
+                json,
+                ..
+            } => {
+                assert_eq!(task, Some(InferenceTask::ImageGeneration));
+                assert_eq!(width, Some(1024));
+                assert_eq!(height, Some(768));
+                assert_eq!(steps, Some(30));
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "list",
+            "--task",
+            "image-generation",
+            "--input-modality",
+            "text",
+            "--output-modality",
+            "image",
+            "--family",
+            "flux",
+            "--layout",
+            "diffusers",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::List {
+                task,
+                input,
+                output,
+                family,
+                layout,
+                json,
+            } => {
+                assert_eq!(task, Some(InferenceTask::ImageGeneration));
+                assert_eq!(input, Some(InputModality::Text));
+                assert_eq!(output, Some(OutputModality::Image));
+                assert_eq!(family.as_deref(), Some("flux"));
+                assert_eq!(layout, Some(RepositoryLayout::Diffusers));
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "--backend",
+            "cuda",
+            "parameters",
+            "flux",
+            "--task",
+            "image-generation",
+            "--sources",
+        ])
+        .unwrap();
+        assert_eq!(cli.backend, BackendArg::Cuda);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Parameters {
+                task: Some(InferenceTask::ImageGeneration),
+                sources: true,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "werk",
+            "doctor",
+            "--task",
+            "music-generation",
+            "--runtime",
+            "diffusers-cuda",
+            "--model",
+            "musicgen",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                command: None,
+                task: Some(InferenceTask::MusicGeneration),
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["werk", "doctor", "perf", "tiny"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                command: Some(DoctorCommands::Perf { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn media_arguments_become_canonical_typed_overrides() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "image",
+            "generate",
+            "flux",
+            "--prompt",
+            "test",
+            "--width",
+            "640",
+            "--no-image-vae-tiling",
+            "--image-control-json",
+            r#"[{"type":"depth","weight":0.8}]"#,
+            "--set",
+            "image.seed=17",
+            "--no-allow-cpu-offload",
+        ])
+        .unwrap();
+        let Commands::Image {
+            command: ImageCommands::Generate(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("image command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::ImageGeneration).unwrap();
+        assert_eq!(
+            parameters.get("image.width"),
+            Some(&ParameterValue::Integer(640))
+        );
+        assert_eq!(
+            parameters.get("image.vae_tiling"),
+            Some(&ParameterValue::Boolean(false))
+        );
+        assert!(matches!(
+            parameters.get("image.controls"),
+            Some(ParameterValue::List(values)) if matches!(
+                values.first(),
+                Some(ParameterValue::Object(_))
+            )
+        ));
+        assert_eq!(
+            parameters.get("image.seed"),
+            Some(&ParameterValue::Integer(17))
+        );
+        assert!(!parameters.contains_key("image.prompt"));
+
+        let routing =
+            media_routing(&args.routing, BackendArg::Cuda, Some(DeviceArg::Cuda)).unwrap();
+        assert_eq!(routing.backend, None);
+        assert_eq!(routing.accelerator.as_deref(), Some("cuda"));
+        assert_eq!(routing.device.as_deref(), Some("cuda"));
+        assert_eq!(routing.allow_cpu_offload, OverrideBool::Disabled);
+
+        let mlx = media_routing(&args.routing, BackendArg::Mlx, None).unwrap();
+        assert_eq!(mlx.backend.as_deref(), Some("mlx"));
+        assert_eq!(mlx.accelerator, None);
+    }
+
+    #[test]
+    fn audio_lyrics_remain_a_canonical_parameter_override() {
+        let cli = Cli::try_parse_from([
+            "werk",
+            "audio",
+            "generate",
+            "music",
+            "--prompt",
+            "slow synthwave",
+            "--lyrics",
+            "we cross the night",
+        ])
+        .unwrap();
+        let Commands::Audio {
+            command: AudioCommands::Generate(args),
+        } = cli.command.unwrap()
+        else {
+            panic!("audio generate command expected");
+        };
+        let parameters =
+            media_parameters(&args, &args.routing, InferenceTask::MusicGeneration).unwrap();
+        assert_eq!(
+            parameters.get("audio.lyrics"),
+            Some(&ParameterValue::String("we cross the night".to_string()))
+        );
+        assert!(!parameters.contains_key("audio.prompt"));
     }
 
     #[test]
@@ -7716,7 +9720,14 @@ mod tests {
         assert!(!should_print_startup_banner_for(&bench, true, true));
 
         assert!(!should_print_startup_banner_for(
-            &Commands::List,
+            &Commands::List {
+                task: None,
+                input: None,
+                output: None,
+                family: None,
+                layout: None,
+                json: false,
+            },
             true,
             true
         ));
@@ -8461,6 +10472,7 @@ mod tests {
             created_unix: 1,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 

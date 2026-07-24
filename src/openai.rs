@@ -729,6 +729,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -768,6 +769,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -812,6 +814,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,
@@ -872,6 +875,7 @@ mod tests {
             created_unix: 1,
             files: Vec::<ModelFile>::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         };
         let prompt = messages_to_prompt_for_model(
             &manifest,

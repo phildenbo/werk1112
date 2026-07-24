@@ -706,12 +706,10 @@ fn update_completion_from_event(completion: &mut VllmCompletion, value: &Value) 
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
+        && let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
+        && !reason.is_empty()
     {
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str)
-            && !reason.is_empty()
-        {
-            completion.finish_reason = reason.to_string();
-        }
+        completion.finish_reason = reason.to_string();
     }
     if let Some(usage) = value.get("usage") {
         if let Some(tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
@@ -2030,6 +2028,7 @@ mod tests {
             created_unix: 1,
             files: Vec::new(),
             artifacts: Vec::new(),
+            metadata: Default::default(),
         }
     }
 }

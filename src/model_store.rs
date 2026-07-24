@@ -1,3 +1,7 @@
+use crate::capabilities::{
+    InferenceTask, InputModality, ModelComponent, ModelComponentKind, OutputModality,
+    RepositoryLayout,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use candle_core::quantized::gguf_file;
 use crc32fast::Hasher;
@@ -6,7 +10,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     env,
     ffi::OsStr,
     fs,
@@ -67,16 +71,24 @@ impl ModelFormat {
                 "implemented via persistent llama.cpp server; Candle is legacy/fallback for selected architectures"
             }
             Self::SafeTensors => {
-                "optimized artifacts through ONNX Runtime when available; Candle is compatibility fallback"
+                "text through optimized ONNX/Candle/vLLM/MLX routes; media through the optional Diffusers/Transformers companion"
             }
-            Self::PyTorch => "catalog/import only; PyTorch backend is not wired yet",
-            Self::Onnx => "catalog/import only; ONNX Runtime backend is not wired yet",
+            Self::PyTorch => {
+                "media execution is model-dependent through the optional Diffusers/Transformers companion"
+            }
+            Self::Onnx => {
+                "implemented through managed ONNX Runtime for compatible models; media support is model-dependent"
+            }
             Self::Mlx => "implemented through external mlx-lm backend when configured",
             Self::TensorRt => "catalog/import only; TensorRT backend is not wired yet",
             Self::OpenVino => "catalog/import only; OpenVINO backend is not wired yet",
-            Self::TensorFlow => "catalog/import only; TensorFlow backend is not wired yet",
+            Self::TensorFlow => {
+                "catalog/import plus model-dependent media probing through the optional companion"
+            }
             Self::CoreMl => "catalog/import only; CoreML backend is not wired yet",
-            Self::Unknown => "catalog/import only; format could not be detected",
+            Self::Unknown => {
+                "catalog/import plus model-dependent custom media probing; format could not be detected"
+            }
         }
     }
 }
@@ -117,6 +129,72 @@ pub struct ModelArtifact {
     pub detail: Option<String>,
 }
 
+pub const CURRENT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+
+fn legacy_manifest_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptimizedArtifactInfo {
+    pub kind: String,
+    pub path: String,
+    pub status: String,
+}
+
+/// Extensible manifest fields introduced with schema v2. Flattening this
+/// structure keeps the on-disk JSON easy to inspect while requiring only one
+/// compatibility field on `ModelManifest` constructors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelMetadata {
+    #[serde(default = "legacy_manifest_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub repository_layout: RepositoryLayout,
+    #[serde(default)]
+    pub tasks: Vec<InferenceTask>,
+    #[serde(default)]
+    pub input_modalities: Vec<InputModality>,
+    #[serde(default)]
+    pub output_modalities: Vec<OutputModality>,
+    #[serde(default)]
+    pub components: Vec<ModelComponent>,
+    #[serde(default)]
+    pub precision: Option<String>,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub generation_defaults: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub parameter_constraints: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub compatible_runtimes: Vec<String>,
+    #[serde(default)]
+    pub optimized_artifacts: Vec<OptimizedArtifactInfo>,
+}
+
+impl Default for ModelMetadata {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_MANIFEST_SCHEMA_VERSION,
+            family: None,
+            repository_layout: RepositoryLayout::Custom,
+            tasks: Vec::new(),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+            components: Vec::new(),
+            precision: None,
+            quantization: None,
+            generation_defaults: BTreeMap::new(),
+            parameter_constraints: BTreeMap::new(),
+            compatible_runtimes: Vec::new(),
+            optimized_artifacts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManifest {
     pub id: String,
@@ -131,6 +209,14 @@ pub struct ModelManifest {
     pub files: Vec<ModelFile>,
     #[serde(default)]
     pub artifacts: Vec<ModelArtifact>,
+    #[serde(flatten)]
+    pub metadata: ModelMetadata,
+}
+
+impl ModelManifest {
+    pub fn supports_task(&self, task: InferenceTask) -> bool {
+        self.metadata.tasks.contains(&task)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +263,9 @@ impl ModelStore {
 
     pub fn ensure(&self) -> Result<()> {
         fs::create_dir_all(self.models_dir())?;
+        fs::create_dir_all(self.shared_artifacts_dir())?;
+        fs::create_dir_all(self.home.join("outputs"))?;
+        fs::create_dir_all(self.home.join("jobs"))?;
         fs::create_dir_all(self.tmp_dir())?;
         Ok(())
     }
@@ -243,7 +332,11 @@ impl ModelStore {
     }
 
     pub fn artifacts_dir(&self, id: &str) -> PathBuf {
-        self.model_dir(id).join("artifacts")
+        self.shared_artifacts_dir().join(sanitize_id(id))
+    }
+
+    pub fn shared_artifacts_dir(&self) -> PathBuf {
+        self.home.join("artifacts")
     }
 
     pub fn onnx_artifact_dir(&self, id: &str) -> PathBuf {
@@ -516,6 +609,16 @@ impl ModelStore {
                 dir.display()
             )
         })?;
+        let artifacts = self.artifacts_dir(&manifest.id);
+        if artifacts.is_dir() {
+            fs::remove_dir_all(&artifacts).with_context(|| {
+                format!(
+                    "failed to remove model artifacts for '{}' at {}",
+                    manifest.id,
+                    artifacts.display()
+                )
+            })?;
+        }
         Ok(manifest)
     }
 
@@ -531,7 +634,7 @@ impl ModelStore {
                 artifact.kind == ArtifactKind::Onnx && artifact.status == ArtifactStatus::Ready
             })
             .cloned()
-            .filter(|artifact| self.model_dir(&manifest.id).join(&artifact.path).is_dir())
+            .filter(|artifact| self.absolute_artifact_path(manifest, artifact).is_dir())
     }
 
     pub fn can_build_onnx_artifact(&self, manifest: &ModelManifest) -> bool {
@@ -556,7 +659,7 @@ impl ModelStore {
         }
 
         let artifact_dir = self.onnx_artifact_dir(&manifest.id);
-        let artifact_rel = "artifacts/onnx".to_string();
+        let artifact_rel = "onnx".to_string();
         if artifact_dir.is_dir() && !rebuild && onnx_files_exist(&artifact_dir)? {
             let artifact = ModelArtifact {
                 kind: ArtifactKind::Onnx,
@@ -618,9 +721,27 @@ impl ModelStore {
         self.model_dir(&manifest.id).join(relative_path)
     }
 
+    pub fn absolute_artifact_path(
+        &self,
+        manifest: &ModelManifest,
+        artifact: &ModelArtifact,
+    ) -> PathBuf {
+        let shared = self.artifacts_dir(&manifest.id).join(&artifact.path);
+        if shared.exists() || !artifact.path.starts_with("artifacts/") {
+            shared
+        } else {
+            // Schema-v1 manifests stored optimized artifacts below the model
+            // directory. Keep those readable while all new artifacts use the
+            // top-level `artifacts/` store.
+            self.model_dir(&manifest.id).join(&artifact.path)
+        }
+    }
+
     pub fn set_model_file(&self, id: &str, file: &str) -> Result<ModelManifest> {
         self.ensure()?;
         let mut manifest = self.get(id)?;
+        let model_dir = self.model_dir(&manifest.id);
+        let curated_metadata = curated_metadata_overrides(&model_dir, &manifest);
         let selected_path = normalize_model_file_path(file)?;
         if !manifest
             .files
@@ -634,7 +755,7 @@ impl ModelStore {
             );
         }
 
-        let absolute_path = self.absolute_model_file(&manifest, &selected_path);
+        let absolute_path = model_dir.join(&selected_path);
         if !absolute_path.is_file() {
             bail!("model file does not exist: {}", absolute_path.display());
         }
@@ -644,13 +765,14 @@ impl ModelStore {
         manifest.format = selected_format;
         manifest.model_path = Some(selected_path);
         manifest.architecture = detect_architecture(
-            &self.model_dir(&manifest.id),
+            &model_dir,
             &manifest.format,
             manifest.model_path.as_deref(),
             manifest.config_path.as_deref(),
         );
         manifest.backend = manifest.format.backend_hint().to_string();
-        write_json_pretty(&self.model_dir(&manifest.id).join(MANIFEST_FILE), &manifest)?;
+        refresh_manifest_metadata(&model_dir, &mut manifest, curated_metadata);
+        write_json_pretty(&model_dir.join(MANIFEST_FILE), &manifest)?;
         Ok(manifest)
     }
 
@@ -696,7 +818,7 @@ impl ModelStore {
         );
         let backend = format.backend_hint().to_string();
 
-        Ok(ModelManifest {
+        let mut manifest = ModelManifest {
             id: id.to_string(),
             source,
             format,
@@ -708,7 +830,10 @@ impl ModelStore {
             created_unix: unix_ts(),
             files,
             artifacts: Vec::new(),
-        })
+            metadata: ModelMetadata::default(),
+        };
+        enrich_manifest_metadata(model_dir, &mut manifest);
+        Ok(manifest)
     }
 }
 
@@ -1993,11 +2118,1313 @@ fn detect_config_architecture(path: &Path) -> Result<Option<String>> {
         .map(ToString::to_string))
 }
 
+#[derive(Debug, Default)]
+struct CuratedMetadataOverrides {
+    family: Option<String>,
+    tasks: Vec<InferenceTask>,
+    input_modalities: Vec<InputModality>,
+    output_modalities: Vec<OutputModality>,
+    components: Vec<ModelComponent>,
+    generation_defaults: BTreeMap<String, Value>,
+    parameter_constraints: BTreeMap<String, Value>,
+}
+
+fn curated_metadata_overrides(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+) -> CuratedMetadataOverrides {
+    let current = &manifest.metadata;
+    let mut inferred = manifest.clone();
+    inferred.metadata = ModelMetadata::default();
+    enrich_manifest_metadata(model_dir, &mut inferred);
+    let inferred = &inferred.metadata;
+
+    CuratedMetadataOverrides {
+        family: (current.family != inferred.family)
+            .then(|| current.family.clone())
+            .flatten(),
+        tasks: metadata_extras(&current.tasks, &inferred.tasks),
+        input_modalities: metadata_extras(&current.input_modalities, &inferred.input_modalities),
+        output_modalities: metadata_extras(&current.output_modalities, &inferred.output_modalities),
+        components: metadata_extras(&current.components, &inferred.components),
+        generation_defaults: metadata_map_overrides(
+            &current.generation_defaults,
+            &inferred.generation_defaults,
+        ),
+        parameter_constraints: metadata_map_overrides(
+            &current.parameter_constraints,
+            &inferred.parameter_constraints,
+        ),
+    }
+}
+
+fn metadata_extras<T: Clone + PartialEq>(current: &[T], inferred: &[T]) -> Vec<T> {
+    current
+        .iter()
+        .filter(|value| !inferred.contains(value))
+        .cloned()
+        .collect()
+}
+
+fn metadata_map_overrides(
+    current: &BTreeMap<String, Value>,
+    inferred: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    current
+        .iter()
+        .filter(|(key, value)| inferred.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn refresh_manifest_metadata(
+    model_dir: &Path,
+    manifest: &mut ModelManifest,
+    curated: CuratedMetadataOverrides,
+) {
+    manifest.metadata = ModelMetadata::default();
+    enrich_manifest_metadata(model_dir, manifest);
+
+    if let Some(family) = curated.family {
+        manifest.metadata.family = Some(family);
+    }
+    for task in curated.tasks {
+        push_unique(&mut manifest.metadata.tasks, task);
+    }
+    for component in curated.components {
+        push_unique(&mut manifest.metadata.components, component);
+    }
+    manifest
+        .metadata
+        .generation_defaults
+        .extend(curated.generation_defaults);
+    manifest
+        .metadata
+        .parameter_constraints
+        .extend(curated.parameter_constraints);
+
+    let (mut inputs, mut outputs) = modalities_for_tasks(&manifest.metadata.tasks);
+    for input in curated.input_modalities {
+        push_unique(&mut inputs, input);
+    }
+    for output in curated.output_modalities {
+        push_unique(&mut outputs, output);
+    }
+    manifest.metadata.input_modalities = inputs;
+    manifest.metadata.output_modalities = outputs;
+    manifest.metadata.compatible_runtimes = compatible_runtimes_for_manifest(manifest);
+}
+
+fn enrich_manifest_metadata(model_dir: &Path, manifest: &mut ModelManifest) {
+    manifest.metadata.schema_version = CURRENT_MANIFEST_SCHEMA_VERSION;
+
+    let model_index = find_root_repository_file(manifest, "model_index.json")
+        .and_then(|path| read_repository_json(model_dir, &path));
+    let root_config = find_root_repository_file(manifest, "config.json")
+        .and_then(|path| read_repository_json(model_dir, &path));
+    let layout = detect_repository_layout(manifest);
+
+    if manifest.metadata.repository_layout == RepositoryLayout::Custom {
+        manifest.metadata.repository_layout = layout;
+    }
+
+    if manifest.metadata.repository_layout == RepositoryLayout::Diffusers {
+        if let Some(architecture) =
+            infer_diffusers_architecture(model_dir, manifest, model_index.as_ref())
+        {
+            manifest.architecture = Some(architecture);
+        }
+        if manifest
+            .model_path
+            .as_deref()
+            .is_some_and(|path| diffusers_component_dir_for_path(path).is_some())
+        {
+            // A Diffusers component is not the primary model. The repository
+            // root plus the component inventory is the executable unit.
+            manifest.model_path = None;
+        }
+    }
+
+    if manifest.metadata.family.is_none() {
+        manifest.metadata.family =
+            infer_model_family(manifest, model_index.as_ref(), root_config.as_ref());
+    }
+    if manifest.metadata.tasks.is_empty() {
+        manifest.metadata.tasks =
+            infer_inference_tasks(manifest, model_index.as_ref(), root_config.as_ref());
+    }
+    if manifest.metadata.input_modalities.is_empty()
+        || manifest.metadata.output_modalities.is_empty()
+    {
+        let (inputs, outputs) = modalities_for_tasks(&manifest.metadata.tasks);
+        if manifest.metadata.input_modalities.is_empty() {
+            manifest.metadata.input_modalities = inputs;
+        }
+        if manifest.metadata.output_modalities.is_empty() {
+            manifest.metadata.output_modalities = outputs;
+        }
+    }
+    if manifest.metadata.precision.is_none() {
+        manifest.metadata.precision =
+            infer_precision(manifest, root_config.as_ref(), model_index.as_ref());
+    }
+    if manifest.metadata.quantization.is_none() {
+        manifest.metadata.quantization = infer_quantization(manifest, root_config.as_ref());
+    }
+    if manifest.metadata.components.is_empty() {
+        manifest.metadata.components = detect_model_components(model_dir, manifest);
+    }
+    if manifest.metadata.generation_defaults.is_empty() {
+        manifest.metadata.generation_defaults =
+            infer_generation_defaults(model_dir, manifest, root_config.as_ref());
+    }
+    if manifest.metadata.parameter_constraints.is_empty() {
+        manifest.metadata.parameter_constraints =
+            infer_parameter_constraints(model_dir, manifest, root_config.as_ref());
+    }
+    if manifest.metadata.compatible_runtimes.is_empty() {
+        manifest.metadata.compatible_runtimes = compatible_runtimes_for_manifest(manifest);
+    }
+    if manifest.metadata.optimized_artifacts.is_empty() {
+        manifest.metadata.optimized_artifacts = optimized_artifact_info(&manifest.artifacts);
+    }
+}
+
+fn detect_repository_layout(manifest: &ModelManifest) -> RepositoryLayout {
+    if manifest.format == ModelFormat::Gguf {
+        return RepositoryLayout::Gguf;
+    }
+    if manifest.format == ModelFormat::Mlx {
+        return RepositoryLayout::Mlx;
+    }
+    if is_diffusers_repository(manifest) {
+        return RepositoryLayout::Diffusers;
+    }
+
+    match manifest.format {
+        ModelFormat::Onnx => {
+            let onnx_files = manifest
+                .files
+                .iter()
+                .filter(|file| extension_eq(Path::new(&file.path), "onnx"))
+                .count();
+            if onnx_files > 1
+                || has_repository_file(manifest, "genai_config.json")
+                || has_repository_file(manifest, "tokenizer.json")
+                || manifest.files.iter().any(|file| {
+                    repository_relative_path(&file.path).is_some_and(|path| path.contains('/'))
+                })
+            {
+                RepositoryLayout::OnnxBundle
+            } else {
+                RepositoryLayout::SingleFile
+            }
+        }
+        ModelFormat::TensorRt => RepositoryLayout::TensorRtEngine,
+        ModelFormat::SafeTensors | ModelFormat::PyTorch => {
+            if has_repository_file(manifest, "config.json")
+                || has_repository_file(manifest, "tokenizer.json")
+                || has_repository_file(manifest, "tokenizer_config.json")
+            {
+                RepositoryLayout::Transformers
+            } else if recognized_weight_file_count(manifest) == 1 {
+                RepositoryLayout::SingleFile
+            } else {
+                RepositoryLayout::Custom
+            }
+        }
+        ModelFormat::OpenVino | ModelFormat::TensorFlow | ModelFormat::CoreMl => {
+            if recognized_weight_file_count(manifest) == 1 {
+                RepositoryLayout::SingleFile
+            } else {
+                RepositoryLayout::Custom
+            }
+        }
+        ModelFormat::Unknown => {
+            if manifest.files.len() == 1 {
+                RepositoryLayout::SingleFile
+            } else {
+                RepositoryLayout::Custom
+            }
+        }
+        ModelFormat::Gguf | ModelFormat::Mlx => unreachable!(),
+    }
+}
+
+fn is_diffusers_repository(manifest: &ModelManifest) -> bool {
+    if find_root_repository_file(manifest, "model_index.json").is_some() {
+        return true;
+    }
+
+    let roots = diffusers_component_roots(manifest);
+    let has_denoiser = roots
+        .iter()
+        .any(|root| matches!(*root, "transformer" | "unet"));
+    has_denoiser && roots.len() >= 2
+}
+
+fn diffusers_component_roots(manifest: &ModelManifest) -> Vec<&'static str> {
+    const ROOTS: &[&str] = &[
+        "scheduler",
+        "transformer",
+        "unet",
+        "vae",
+        "text_encoder",
+        "text_encoder_2",
+        "tokenizer",
+        "tokenizer_2",
+        "encoder",
+        "decoder",
+        "vocoder",
+        "feature_extractor",
+        "controlnet",
+        "adapter",
+    ];
+    ROOTS
+        .iter()
+        .copied()
+        .filter(|root| {
+            manifest.files.iter().any(|file| {
+                repository_relative_path(&file.path)
+                    .is_some_and(|path| path.starts_with(&format!("{root}/")))
+            })
+        })
+        .collect()
+}
+
+fn diffusers_component_dir_for_path(path: &str) -> Option<&'static str> {
+    let relative = repository_relative_path(path)?;
+    diffusers_component_names()
+        .iter()
+        .copied()
+        .find(|component| relative.starts_with(&format!("{component}/")))
+}
+
+fn diffusers_component_names() -> &'static [&'static str] {
+    &[
+        "scheduler",
+        "transformer",
+        "unet",
+        "vae",
+        "text_encoder",
+        "text_encoder_2",
+        "tokenizer",
+        "tokenizer_2",
+        "encoder",
+        "decoder",
+        "vocoder",
+        "feature_extractor",
+        "controlnet",
+        "adapter",
+    ]
+}
+
+fn recognized_weight_file_count(manifest: &ModelManifest) -> usize {
+    manifest
+        .files
+        .iter()
+        .filter(|file| is_likely_model_artifact_path(&file.path))
+        .count()
+}
+
+fn detect_model_components(model_dir: &Path, manifest: &ModelManifest) -> Vec<ModelComponent> {
+    let mut components = Vec::new();
+
+    if manifest.metadata.repository_layout == RepositoryLayout::Diffusers {
+        for name in diffusers_component_names() {
+            let prefix = format!("files/{name}/");
+            let mut files = manifest
+                .files
+                .iter()
+                .filter(|file| file.path.starts_with(&prefix))
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                continue;
+            }
+            files.sort();
+            let kind = component_kind_for_name(name);
+            let mut component = ModelComponent::new(kind, format!("files/{name}"));
+            component.format = component_format(&files);
+            let component_config = files
+                .iter()
+                .find(|path| path.ends_with("/config.json"))
+                .and_then(|path| read_repository_json(model_dir, path));
+            component.precision =
+                infer_precision_from_paths_and_json(&files, component_config.as_ref());
+            component.quantization =
+                infer_quantization_from_paths_and_json(&files, component_config.as_ref());
+            component.files = files;
+            components.push(component);
+        }
+
+        let mut root_weights = manifest
+            .files
+            .iter()
+            .filter(|file| {
+                repository_relative_path(&file.path)
+                    .is_some_and(|path| !path.contains('/') && is_likely_model_artifact_path(path))
+            })
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        if !root_weights.is_empty() {
+            root_weights.sort();
+            let mut component = ModelComponent::new(ModelComponentKind::MainModel, "files");
+            component.format = component_format(&root_weights);
+            component.precision = infer_precision_from_paths_and_json(&root_weights, None);
+            component.quantization = infer_quantization_from_paths_and_json(&root_weights, None);
+            component.files = root_weights;
+            components.insert(0, component);
+        }
+    } else if let Some(model_path) = manifest.model_path.as_deref() {
+        let mut component =
+            ModelComponent::new(ModelComponentKind::MainModel, model_path.to_string());
+        component.format = Some(format_name(&manifest.format).to_string());
+        component.precision = manifest.metadata.precision.clone();
+        component.quantization = manifest.metadata.quantization.clone();
+        component.files.push(model_path.to_string());
+        components.push(component);
+    }
+
+    if !components
+        .iter()
+        .any(|component| component.kind == ModelComponentKind::Tokenizer)
+        && let Some(tokenizer_path) = manifest.tokenizer_path.as_deref()
+    {
+        let mut tokenizer =
+            ModelComponent::new(ModelComponentKind::Tokenizer, tokenizer_path.to_string());
+        tokenizer.files.push(tokenizer_path.to_string());
+        components.push(tokenizer);
+    }
+
+    components
+}
+
+fn component_kind_for_name(name: &str) -> ModelComponentKind {
+    match name {
+        "transformer" => ModelComponentKind::Transformer,
+        "unet" => ModelComponentKind::Unet,
+        "vae" => ModelComponentKind::Vae,
+        "text_encoder" => ModelComponentKind::TextEncoder,
+        "text_encoder_2" => ModelComponentKind::TextEncoder2,
+        "tokenizer" => ModelComponentKind::Tokenizer,
+        "tokenizer_2" => ModelComponentKind::Tokenizer2,
+        "scheduler" => ModelComponentKind::Scheduler,
+        "encoder" => ModelComponentKind::Encoder,
+        "decoder" => ModelComponentKind::Decoder,
+        "vocoder" => ModelComponentKind::Vocoder,
+        "feature_extractor" => ModelComponentKind::FeatureExtractor,
+        "controlnet" => ModelComponentKind::ControlNet,
+        "adapter" => ModelComponentKind::Adapter,
+        _ => ModelComponentKind::MainModel,
+    }
+}
+
+fn component_format(files: &[String]) -> Option<String> {
+    [
+        ("gguf", "gguf"),
+        ("safetensors", "safetensors"),
+        ("onnx", "onnx"),
+        ("engine", "tensorrt"),
+        ("plan", "tensorrt"),
+        ("npz", "mlx"),
+        ("pt", "pytorch"),
+        ("pth", "pytorch"),
+        ("bin", "pytorch"),
+    ]
+    .iter()
+    .find_map(|(extension, label)| {
+        files
+            .iter()
+            .any(|path| extension_eq(Path::new(path), extension))
+            .then(|| (*label).to_string())
+    })
+}
+
+fn format_name(format: &ModelFormat) -> &'static str {
+    match format {
+        ModelFormat::Gguf => "gguf",
+        ModelFormat::SafeTensors => "safetensors",
+        ModelFormat::PyTorch => "pytorch",
+        ModelFormat::Onnx => "onnx",
+        ModelFormat::Mlx => "mlx",
+        ModelFormat::TensorRt => "tensorrt",
+        ModelFormat::OpenVino => "openvino",
+        ModelFormat::TensorFlow => "tensorflow",
+        ModelFormat::CoreMl => "coreml",
+        ModelFormat::Unknown => "unknown",
+    }
+}
+
+fn infer_diffusers_architecture(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    model_index: Option<&Value>,
+) -> Option<String> {
+    for component in ["transformer", "unet", "encoder", "decoder"] {
+        let path = format!("files/{component}/config.json");
+        if !manifest.files.iter().any(|file| file.path == path) {
+            continue;
+        }
+        if let Some(value) = read_repository_json(model_dir, &path)
+            && let Some(architecture) = json_model_identifier(&value)
+        {
+            return Some(normalize_model_identifier(&architecture));
+        }
+    }
+    model_index
+        .and_then(json_model_identifier)
+        .map(|architecture| normalize_model_identifier(&architecture))
+}
+
+fn infer_model_family(
+    manifest: &ModelManifest,
+    model_index: Option<&Value>,
+    root_config: Option<&Value>,
+) -> Option<String> {
+    let mut hints = vec![manifest.id.to_ascii_lowercase()];
+    if let Some(architecture) = manifest.architecture.as_deref() {
+        hints.push(architecture.to_ascii_lowercase());
+    }
+    hints.extend(
+        manifest
+            .files
+            .iter()
+            .map(|file| file.path.to_ascii_lowercase()),
+    );
+    for value in [model_index, root_config].into_iter().flatten() {
+        if let Some(identifier) = json_model_identifier(value) {
+            hints.push(identifier.to_ascii_lowercase());
+        }
+    }
+    let hint = hints.join(" ");
+
+    let known = [
+        (
+            &[
+                "stable diffusion xl",
+                "stable-diffusion-xl",
+                "stable_diffusion_xl",
+                "stablediffusionxl",
+                "sdxl",
+                "sd_xl",
+            ][..],
+            "stable-diffusion-xl",
+        ),
+        (
+            &[
+                "stable diffusion 3",
+                "stable-diffusion-3",
+                "stable_diffusion_3",
+                "stablediffusion3",
+                "sd3",
+                "sd_3",
+            ][..],
+            "stable-diffusion-3",
+        ),
+        (
+            &[
+                "stable diffusion",
+                "stable-diffusion",
+                "stable_diffusion",
+                "stablediffusion",
+                "sd1.5",
+                "sd-1.5",
+                "sd_1.5",
+                "sd15",
+                "v1-5-pruned",
+            ][..],
+            "stable-diffusion",
+        ),
+        (&["flux"][..], "flux"),
+        (&["hunyuanvideo", "hunyuan-video"][..], "hunyuan-video"),
+        (&["cogvideo"][..], "cogvideo"),
+        (&["ltxvideo", "ltx-video"][..], "ltx-video"),
+        (&["animatediff"][..], "animatediff"),
+        (&["stableaudio", "stable-audio"][..], "stable-audio"),
+        (&["audioldm"][..], "audioldm"),
+        (&["musicgen"][..], "musicgen"),
+        (&["whisper"][..], "whisper"),
+        (&["speecht5"][..], "speecht5"),
+        (&["parler"][..], "parler-tts"),
+        (&["bark"][..], "bark"),
+        (&["demucs"][..], "demucs"),
+        (&["llava"][..], "llava"),
+        (&["paligemma"][..], "paligemma"),
+        (&["qwen2_vl", "qwen2-vl"][..], "qwen2-vl"),
+        (&["gemma4"][..], "gemma4"),
+        (&["gemma3"][..], "gemma3"),
+        (&["qwen3"][..], "qwen3"),
+        (&["qwen2"][..], "qwen2"),
+        (&["phi3", "phi-3"][..], "phi3"),
+        (&["mistral"][..], "mistral"),
+        (&["llama"][..], "llama"),
+    ];
+    if let Some((_, family)) = known
+        .iter()
+        .find(|(needles, _)| needles.iter().any(|needle| hint.contains(needle)))
+    {
+        return Some((*family).to_string());
+    }
+
+    root_config
+        .and_then(json_model_identifier)
+        .or_else(|| manifest.architecture.clone())
+        .map(|identifier| normalize_model_identifier(&identifier))
+}
+
+fn infer_inference_tasks(
+    manifest: &ModelManifest,
+    model_index: Option<&Value>,
+    root_config: Option<&Value>,
+) -> Vec<InferenceTask> {
+    let mut hints = vec![
+        manifest.id.to_ascii_lowercase(),
+        manifest
+            .architecture
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        manifest
+            .metadata
+            .family
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    ];
+    for value in [model_index, root_config].into_iter().flatten() {
+        for key in [
+            "_class_name",
+            "model_type",
+            "pipeline_tag",
+            "task",
+            "architectures",
+        ] {
+            if let Some(value) = value.get(key) {
+                hints.push(value.to_string().to_ascii_lowercase());
+            }
+        }
+    }
+    hints.extend(
+        manifest
+            .files
+            .iter()
+            .map(|file| file.path.to_ascii_lowercase()),
+    );
+    let hint = hints.join(" ");
+    let mut tasks = Vec::new();
+
+    let video = contains_any(
+        &hint,
+        &[
+            "video",
+            "image-to-video",
+            "image_to_video",
+            "i2v",
+            "cogvideo",
+            "hunyuanvideo",
+            "ltxvideo",
+            "animatediff",
+        ],
+    );
+    let audio = contains_any(
+        &hint,
+        &[
+            "audio", "music", "speech", "whisper", "bark", "vocoder", "tts",
+        ],
+    );
+
+    if contains_any(
+        &hint,
+        &[
+            "whisper",
+            "speech-to-text",
+            "speech_to_text",
+            "automatic-speech-recognition",
+            "asr",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::SpeechToText);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "text-to-speech",
+            "text_to_speech",
+            "speecht5",
+            "parler",
+            "bark",
+            " tts",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::TextToSpeech);
+    }
+    if contains_any(&hint, &["voice-conversion", "voice_conversion", "rvc"]) {
+        push_unique(&mut tasks, InferenceTask::VoiceConversion);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "stem-separation",
+            "stem_separation",
+            "source-separation",
+            "demucs",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::StemSeparation);
+    }
+    if contains_any(&hint, &["stem-generation", "stem_generation"]) {
+        push_unique(&mut tasks, InferenceTask::StemGeneration);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "audio-enhancement",
+            "audio_enhancement",
+            "speech-enhancement",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::AudioEnhancement);
+    }
+    if contains_any(&hint, &["song-continuation", "song_continuation"]) {
+        push_unique(&mut tasks, InferenceTask::SongContinuation);
+    }
+    if contains_any(&hint, &["song-variation", "song_variation"]) {
+        push_unique(&mut tasks, InferenceTask::SongVariation);
+    }
+    if contains_any(
+        &hint,
+        &[
+            "musicgen",
+            "music-generation",
+            "music_generation",
+            "stable-audio",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::AudioGeneration);
+        push_unique(&mut tasks, InferenceTask::MusicGeneration);
+    } else if contains_any(
+        &hint,
+        &[
+            "audiogen",
+            "audio-generation",
+            "audio_generation",
+            "text-to-audio",
+            "text_to_audio",
+        ],
+    ) || (audio
+        && manifest.metadata.repository_layout == RepositoryLayout::Diffusers
+        && tasks.is_empty())
+    {
+        push_unique(&mut tasks, InferenceTask::AudioGeneration);
+    }
+
+    if video {
+        if contains_any(&hint, &["frame-interpolation", "frame_interpolation"]) {
+            push_unique(&mut tasks, InferenceTask::FrameInterpolation);
+        } else if contains_any(&hint, &["video-upscal", "video_upscal"]) {
+            push_unique(&mut tasks, InferenceTask::VideoUpscaling);
+        } else if contains_any(&hint, &["video-inpaint", "video_inpaint"]) {
+            push_unique(&mut tasks, InferenceTask::VideoInpainting);
+        } else if contains_any(&hint, &["video-extension", "video_extension"]) {
+            push_unique(&mut tasks, InferenceTask::VideoExtension);
+        } else if contains_any(&hint, &["video-to-video", "video_to_video", "vid2vid"]) {
+            push_unique(&mut tasks, InferenceTask::VideoToVideo);
+        } else if contains_any(
+            &hint,
+            &[
+                "image-to-video",
+                "image_to_video",
+                "i2v",
+                "stablevideodiffusion",
+            ],
+        ) {
+            push_unique(&mut tasks, InferenceTask::ImageToVideo);
+        } else {
+            push_unique(&mut tasks, InferenceTask::VideoGeneration);
+        }
+    } else if manifest.metadata.repository_layout == RepositoryLayout::Diffusers && !audio {
+        if contains_any(&hint, &["inpaint", "in-paint"]) {
+            push_unique(&mut tasks, InferenceTask::ImageEditing);
+            push_unique(&mut tasks, InferenceTask::ImageInpainting);
+        } else if contains_any(&hint, &["outpaint", "out-paint"]) {
+            push_unique(&mut tasks, InferenceTask::ImageEditing);
+            push_unique(&mut tasks, InferenceTask::ImageOutpainting);
+        } else if contains_any(&hint, &["upscal", "super-resolution"]) {
+            push_unique(&mut tasks, InferenceTask::ImageUpscaling);
+        } else if contains_any(&hint, &["variation", "image-variation"]) {
+            push_unique(&mut tasks, InferenceTask::ImageVariation);
+        } else if contains_any(
+            &hint,
+            &["img2img", "image-to-image", "image_edit", "pix2pix"],
+        ) {
+            push_unique(&mut tasks, InferenceTask::ImageEditing);
+        } else {
+            push_unique(&mut tasks, InferenceTask::ImageGeneration);
+        }
+    } else if is_known_single_file_image_checkpoint(manifest) {
+        push_unique(&mut tasks, InferenceTask::ImageGeneration);
+    }
+
+    if contains_any(
+        &hint,
+        &[
+            "vision-language",
+            "vision_language",
+            "vision2seq",
+            "vlm",
+            "llava",
+            "paligemma",
+            "idefics",
+            "qwen2_vl",
+            "qwen2-vl",
+            "gemma4",
+        ],
+    ) || root_config.is_some_and(|config| config.get("vision_config").is_some())
+    {
+        push_unique(&mut tasks, InferenceTask::TextGeneration);
+        push_unique(&mut tasks, InferenceTask::ImageUnderstanding);
+    } else if contains_any(
+        &hint,
+        &[
+            "sentence-transformers",
+            "sentence_transformers",
+            "text-embedding",
+            "text_embedding",
+            "embedding-model",
+        ],
+    ) {
+        push_unique(&mut tasks, InferenceTask::TextEmbedding);
+    }
+
+    if tasks.is_empty()
+        && matches!(
+            manifest.metadata.repository_layout,
+            RepositoryLayout::Gguf
+                | RepositoryLayout::Transformers
+                | RepositoryLayout::Mlx
+                | RepositoryLayout::OnnxBundle
+        )
+    {
+        push_unique(&mut tasks, InferenceTask::TextGeneration);
+    }
+
+    tasks
+}
+
+fn is_known_single_file_image_checkpoint(manifest: &ModelManifest) -> bool {
+    manifest.format == ModelFormat::SafeTensors
+        && manifest.metadata.repository_layout == RepositoryLayout::SingleFile
+        && manifest.metadata.family.as_deref().is_some_and(|family| {
+            matches!(
+                family,
+                "stable-diffusion" | "stable-diffusion-xl" | "stable-diffusion-3" | "flux"
+            )
+        })
+}
+
+fn modalities_for_tasks(tasks: &[InferenceTask]) -> (Vec<InputModality>, Vec<OutputModality>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for task in tasks {
+        match task {
+            InferenceTask::TextGeneration => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Text);
+            }
+            InferenceTask::TextEmbedding => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Embedding);
+            }
+            InferenceTask::ImageUnderstanding => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Image);
+                push_unique(&mut outputs, OutputModality::Text);
+            }
+            InferenceTask::ImageGeneration => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Image);
+            }
+            InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Image);
+                push_unique(&mut outputs, OutputModality::Image);
+            }
+            InferenceTask::VideoGeneration => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Video);
+            }
+            InferenceTask::ImageToVideo => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Image);
+                push_unique(&mut outputs, OutputModality::Video);
+            }
+            InferenceTask::VideoToVideo
+            | InferenceTask::VideoInpainting
+            | InferenceTask::VideoExtension
+            | InferenceTask::VideoUpscaling
+            | InferenceTask::FrameInterpolation => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Video);
+                push_unique(&mut outputs, OutputModality::Video);
+            }
+            InferenceTask::AudioGeneration | InferenceTask::MusicGeneration => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Audio);
+            }
+            InferenceTask::SongContinuation | InferenceTask::SongVariation => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Audio);
+                push_unique(&mut outputs, OutputModality::Audio);
+            }
+            InferenceTask::TextToSpeech => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut outputs, OutputModality::Audio);
+            }
+            InferenceTask::SpeechToText => {
+                push_unique(&mut inputs, InputModality::Audio);
+                push_unique(&mut outputs, OutputModality::Text);
+            }
+            InferenceTask::VoiceConversion
+            | InferenceTask::StemSeparation
+            | InferenceTask::AudioEnhancement => {
+                push_unique(&mut inputs, InputModality::Audio);
+                push_unique(&mut outputs, OutputModality::Audio);
+            }
+            InferenceTask::StemGeneration => {
+                push_unique(&mut inputs, InputModality::Text);
+                push_unique(&mut inputs, InputModality::Audio);
+                push_unique(&mut outputs, OutputModality::Audio);
+            }
+        }
+    }
+    (inputs, outputs)
+}
+
+fn infer_precision(
+    manifest: &ModelManifest,
+    root_config: Option<&Value>,
+    model_index: Option<&Value>,
+) -> Option<String> {
+    let paths = selection_sensitive_weight_paths(manifest);
+    infer_precision_from_paths_and_json(&paths, root_config.or(model_index))
+}
+
+fn infer_precision_from_paths_and_json(paths: &[String], config: Option<&Value>) -> Option<String> {
+    if let Some(config) = config {
+        for key in ["torch_dtype", "dtype", "weight_dtype", "variant"] {
+            if let Some(value) = config.get(key).and_then(Value::as_str) {
+                let normalized = normalize_precision(value);
+                if !normalized.is_empty() {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+    let hint = paths.join(" ").to_ascii_lowercase();
+    [
+        (&["bfloat16", "bf16"][..], "bf16"),
+        (&["float16", "fp16", "f16"][..], "fp16"),
+        (&["float32", "fp32", "f32"][..], "fp32"),
+        (&["float8", "fp8"][..], "fp8"),
+        (&["int8"][..], "int8"),
+        (&["int4"][..], "int4"),
+    ]
+    .iter()
+    .find(|(needles, _)| needles.iter().any(|needle| hint.contains(needle)))
+    .map(|(_, precision)| (*precision).to_string())
+}
+
+fn normalize_precision(value: &str) -> String {
+    let value = value.to_ascii_lowercase();
+    if value.contains("bfloat16") || value.contains("bf16") {
+        "bf16".to_string()
+    } else if value.contains("float16") || value.contains("fp16") || value == "f16" {
+        "fp16".to_string()
+    } else if value.contains("float32") || value.contains("fp32") || value == "f32" {
+        "fp32".to_string()
+    } else if value.contains("float8") || value.contains("fp8") {
+        "fp8".to_string()
+    } else {
+        value
+    }
+}
+
+fn infer_quantization(manifest: &ModelManifest, root_config: Option<&Value>) -> Option<String> {
+    let paths = selection_sensitive_weight_paths(manifest);
+    infer_quantization_from_paths_and_json(&paths, root_config)
+}
+
+fn selection_sensitive_weight_paths(manifest: &ModelManifest) -> Vec<String> {
+    if manifest.metadata.repository_layout != RepositoryLayout::Diffusers
+        && let Some(model_path) = manifest.model_path.as_ref()
+    {
+        return vec![model_path.clone()];
+    }
+    manifest
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn infer_quantization_from_paths_and_json(
+    paths: &[String],
+    config: Option<&Value>,
+) -> Option<String> {
+    if let Some(quantization) = config.and_then(|config| config.get("quantization_config")) {
+        let method = quantization
+            .get("quant_method")
+            .or_else(|| quantization.get("quantization_method"))
+            .and_then(Value::as_str)
+            .map(|value| value.to_ascii_lowercase());
+        let bits = quantization.get("bits").and_then(Value::as_u64);
+        if let Some(method) = method {
+            return Some(match bits {
+                Some(bits) => format!("{method}-{bits}bit"),
+                None => method,
+            });
+        }
+    }
+
+    let hint = paths.join(" ").to_ascii_lowercase();
+    for quantization in [
+        "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_k_s", "q4_k_m", "q5_0", "q5_k_s",
+        "q5_k_m", "q6_k", "q8_0", "awq", "gptq", "nf4", "int4", "int8", "fp8",
+    ] {
+        if hint.contains(quantization) {
+            return Some(quantization.to_string());
+        }
+    }
+    None
+}
+
+fn infer_generation_defaults(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    root_config: Option<&Value>,
+) -> BTreeMap<String, Value> {
+    let mut defaults = BTreeMap::new();
+    if let Some(path) = find_repository_file(manifest, "generation_config.json")
+        && let Some(Value::Object(values)) = read_repository_json(model_dir, &path)
+    {
+        defaults.extend(values);
+    }
+    copy_known_json_fields(
+        &mut defaults,
+        root_config,
+        &[
+            "width",
+            "height",
+            "num_frames",
+            "frames",
+            "fps",
+            "duration",
+            "sample_rate",
+            "audio_channels",
+            "max_length",
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+        ],
+    );
+    if let Some(path) = find_component_file(manifest, "scheduler", "scheduler_config.json")
+        && let Some(config) = read_repository_json(model_dir, &path)
+    {
+        copy_known_json_fields(
+            &mut defaults,
+            Some(&config),
+            &["prediction_type", "beta_schedule", "timestep_spacing"],
+        );
+    }
+    defaults
+}
+
+fn infer_parameter_constraints(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    root_config: Option<&Value>,
+) -> BTreeMap<String, Value> {
+    let mut constraints = BTreeMap::new();
+    copy_known_json_fields(
+        &mut constraints,
+        root_config,
+        &[
+            "sample_size",
+            "max_position_embeddings",
+            "max_sequence_length",
+            "max_seq_len",
+            "max_text_len",
+            "num_frames",
+            "sample_rate",
+            "in_channels",
+            "out_channels",
+        ],
+    );
+    if let Some(path) = find_repository_file(manifest, "tokenizer_config.json")
+        && let Some(config) = read_repository_json(model_dir, &path)
+    {
+        copy_known_json_fields(&mut constraints, Some(&config), &["model_max_length"]);
+    }
+    constraints
+}
+
+fn copy_known_json_fields(
+    target: &mut BTreeMap<String, Value>,
+    source: Option<&Value>,
+    keys: &[&str],
+) {
+    let Some(source) = source else {
+        return;
+    };
+    for key in keys {
+        if let Some(value) = source.get(*key) {
+            target
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+fn compatible_runtimes_for_manifest(manifest: &ModelManifest) -> Vec<String> {
+    let has_media_task = manifest.metadata.tasks.iter().copied().any(is_media_task);
+    if has_media_task {
+        if manifest
+            .metadata
+            .tasks
+            .iter()
+            .copied()
+            .any(is_executable_media_companion_task)
+            && matches!(
+                manifest.metadata.repository_layout,
+                RepositoryLayout::Diffusers
+                    | RepositoryLayout::Transformers
+                    | RepositoryLayout::SingleFile
+                    | RepositoryLayout::Custom
+            )
+            && matches!(
+                manifest.format,
+                ModelFormat::SafeTensors | ModelFormat::PyTorch
+            )
+        {
+            return [
+                "media-companion-cuda",
+                "media-companion-rocm",
+                "media-companion-metal",
+                "media-companion-cpu",
+            ]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        }
+        if manifest.metadata.tasks.iter().copied().all(is_media_task) {
+            return Vec::new();
+        }
+    }
+
+    match manifest.metadata.repository_layout {
+        RepositoryLayout::Gguf => vec![
+            "llama-server-cuda",
+            "llama-server-rocm",
+            "llama-server-vulkan",
+            "llama-server-metal",
+            "llama-server-cpu",
+        ],
+        RepositoryLayout::Diffusers => Vec::new(),
+        RepositoryLayout::Mlx => {
+            if manifest.metadata.tasks.iter().any(|task| {
+                matches!(
+                    task,
+                    InferenceTask::ImageGeneration
+                        | InferenceTask::ImageEditing
+                        | InferenceTask::ImageUpscaling
+                )
+            }) {
+                vec!["mlx-image"]
+            } else if manifest.metadata.tasks.iter().any(|task| {
+                matches!(
+                    task,
+                    InferenceTask::AudioGeneration
+                        | InferenceTask::MusicGeneration
+                        | InferenceTask::TextToSpeech
+                        | InferenceTask::SpeechToText
+                )
+            }) {
+                vec!["mlx-audio"]
+            } else {
+                vec!["mlx"]
+            }
+        }
+        RepositoryLayout::OnnxBundle => {
+            vec!["onnxruntime-cuda", "onnxruntime-rocm", "onnxruntime-cpu"]
+        }
+        RepositoryLayout::TensorRtEngine => vec!["tensorrt-cuda"],
+        RepositoryLayout::Transformers => vec![
+            "vllm-cuda",
+            "vllm-rocm",
+            "transformers",
+            "candle-cuda",
+            "candle-metal",
+            "candle-cpu",
+        ],
+        RepositoryLayout::SingleFile | RepositoryLayout::Custom => match manifest.format {
+            ModelFormat::Onnx => vec!["onnxruntime-cuda", "onnxruntime-rocm", "onnxruntime-cpu"],
+            ModelFormat::TensorRt => vec!["tensorrt-cuda"],
+            _ => Vec::new(),
+        },
+    }
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn is_media_task(task: InferenceTask) -> bool {
+    !matches!(
+        task,
+        InferenceTask::TextGeneration
+            | InferenceTask::TextEmbedding
+            | InferenceTask::ImageUnderstanding
+    )
+}
+
+fn is_executable_media_companion_task(task: InferenceTask) -> bool {
+    matches!(
+        task,
+        InferenceTask::ImageGeneration
+            | InferenceTask::ImageEditing
+            | InferenceTask::ImageVariation
+            | InferenceTask::ImageInpainting
+            | InferenceTask::ImageOutpainting
+            | InferenceTask::ImageUpscaling
+            | InferenceTask::VideoGeneration
+            | InferenceTask::ImageToVideo
+            | InferenceTask::VideoToVideo
+            | InferenceTask::VideoInpainting
+            | InferenceTask::VideoExtension
+            | InferenceTask::VideoUpscaling
+            | InferenceTask::FrameInterpolation
+            | InferenceTask::AudioGeneration
+            | InferenceTask::MusicGeneration
+            | InferenceTask::TextToSpeech
+            | InferenceTask::SpeechToText
+    )
+}
+
+fn optimized_artifact_info(artifacts: &[ModelArtifact]) -> Vec<OptimizedArtifactInfo> {
+    artifacts
+        .iter()
+        .map(|artifact| OptimizedArtifactInfo {
+            kind: match &artifact.kind {
+                ArtifactKind::Onnx => "onnx".to_string(),
+            },
+            path: artifact.path.clone(),
+            status: match &artifact.status {
+                ArtifactStatus::Ready => "ready".to_string(),
+                ArtifactStatus::Failed => "failed".to_string(),
+            },
+        })
+        .collect()
+}
+
+fn find_repository_file(manifest: &ModelManifest, name: &str) -> Option<String> {
+    manifest
+        .files
+        .iter()
+        .filter(|file| Path::new(&file.path).file_name().and_then(OsStr::to_str) == Some(name))
+        .min_by_key(|file| file.path.matches('/').count())
+        .map(|file| file.path.clone())
+}
+
+fn find_root_repository_file(manifest: &ModelManifest, name: &str) -> Option<String> {
+    let expected = format!("files/{name}");
+    manifest
+        .files
+        .iter()
+        .find(|file| file.path == expected)
+        .map(|file| file.path.clone())
+}
+
+fn find_component_file(manifest: &ModelManifest, component: &str, name: &str) -> Option<String> {
+    let expected = format!("files/{component}/{name}");
+    manifest
+        .files
+        .iter()
+        .find(|file| file.path == expected)
+        .map(|file| file.path.clone())
+}
+
+fn has_repository_file(manifest: &ModelManifest, name: &str) -> bool {
+    find_repository_file(manifest, name).is_some()
+}
+
+fn read_repository_json(model_dir: &Path, relative_path: &str) -> Option<Value> {
+    let data = fs::read_to_string(model_dir.join(relative_path)).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn repository_relative_path(path: &str) -> Option<&str> {
+    path.strip_prefix("files/")
+}
+
+fn json_model_identifier(value: &Value) -> Option<String> {
+    value
+        .get("_class_name")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("model_type").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("architectures")
+                .and_then(Value::as_array)
+                .and_then(|architectures| architectures.first())
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string)
+}
+
+fn normalize_model_identifier(identifier: &str) -> String {
+    let mut normalized = String::with_capacity(identifier.len());
+    let mut previous_was_separator = false;
+    for (index, ch) in identifier.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 && !previous_was_separator {
+                normalized.push('_');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            normalized.push('_');
+            previous_was_separator = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn read_manifest(path: &Path) -> Result<ModelManifest> {
     let data = fs::read_to_string(path)?;
     let mut manifest = serde_json::from_str::<ModelManifest>(&data)
         .with_context(|| format!("invalid manifest {}", path.display()))?;
     reconcile_mlx_safetensors_manifest(path, &mut manifest);
+    if let Some(model_dir) = path.parent() {
+        enrich_manifest_metadata(model_dir, &mut manifest);
+    }
     Ok(manifest)
 }
 
@@ -2054,10 +3481,7 @@ fn is_supported_onnx_architecture(architecture: Option<&str>) -> bool {
     let Some(architecture) = architecture else {
         return false;
     };
-    let normalized = architecture
-        .to_ascii_lowercase()
-        .replace('-', "")
-        .replace('_', "");
+    let normalized = architecture.to_ascii_lowercase().replace(['-', '_'], "");
     matches!(
         normalized.as_str(),
         "phi3"
@@ -2087,6 +3511,7 @@ fn upsert_artifact(manifest: &mut ModelManifest, artifact: ModelArtifact) {
         .artifacts
         .retain(|existing| existing.kind != artifact.kind);
     manifest.artifacts.push(artifact);
+    manifest.metadata.optimized_artifacts = optimized_artifact_info(&manifest.artifacts);
 }
 
 fn onnx_files_exist(dir: &Path) -> Result<bool> {
@@ -2243,6 +3668,431 @@ mod tests {
         assert_eq!(
             manifest.model_path.as_deref(),
             Some("files/model.safetensors")
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn old_text_manifest_is_migrated_and_enriched_in_memory() {
+        let tmp = test_dir("legacy-text-manifest-v1");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let model_dir = store.model_dir("legacy-llama");
+        fs::create_dir_all(model_dir.join("files")).unwrap();
+        fs::write(
+            model_dir.join("files/config.json"),
+            r#"{"model_type":"llama","torch_dtype":"float16"}"#,
+        )
+        .unwrap();
+        fs::write(
+            model_dir.join("files/tokenizer.json"),
+            r#"{"version":"1.0"}"#,
+        )
+        .unwrap();
+        fs::write(model_dir.join("files/model.safetensors"), b"weights").unwrap();
+        fs::write(
+            model_dir.join(MANIFEST_FILE),
+            r#"{
+                "id": "legacy-llama",
+                "source": {"kind": "local_path", "path": "/tmp/legacy"},
+                "format": "safe_tensors",
+                "architecture": "llama",
+                "tokenizer_path": "files/tokenizer.json",
+                "config_path": "files/config.json",
+                "model_path": "files/model.safetensors",
+                "backend": "onnxruntime",
+                "created_unix": 1,
+                "files": [
+                    {"path":"files/config.json","size":48,"checksum":"crc32:0"},
+                    {"path":"files/tokenizer.json","size":17,"checksum":"crc32:0"},
+                    {"path":"files/model.safetensors","size":7,"checksum":"crc32:0"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = store.get("legacy-llama").unwrap();
+
+        assert_eq!(
+            manifest.metadata.schema_version,
+            CURRENT_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            manifest.metadata.repository_layout,
+            RepositoryLayout::Transformers
+        );
+        assert_eq!(manifest.metadata.family.as_deref(), Some("llama"));
+        assert_eq!(manifest.metadata.precision.as_deref(), Some("fp16"));
+        assert!(
+            manifest
+                .metadata
+                .tasks
+                .contains(&InferenceTask::TextGeneration)
+        );
+        assert!(manifest.supports_task(InferenceTask::TextGeneration));
+        assert!(!manifest.supports_task(InferenceTask::ImageGeneration));
+        assert_eq!(
+            manifest.metadata.input_modalities,
+            vec![InputModality::Text]
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Text]
+        );
+        assert_eq!(manifest.id, "legacy-llama");
+        assert_eq!(
+            manifest.model_path.as_deref(),
+            Some("files/model.safetensors")
+        );
+
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(model_dir.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert!(persisted.get("schema_version").is_none());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn known_single_file_image_checkpoints_get_image_capabilities() {
+        let tmp = test_dir("single-file-image-capabilities");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let expected_runtimes = vec![
+            "media-companion-cuda".to_string(),
+            "media-companion-rocm".to_string(),
+            "media-companion-metal".to_string(),
+            "media-companion-cpu".to_string(),
+        ];
+
+        for (index, file_name, family) in [
+            (0, "v1-5-pruned-emaonly.safetensors", "stable-diffusion"),
+            (1, "sd_xl_base_1.0.safetensors", "stable-diffusion-xl"),
+            (2, "flux1-dev.safetensors", "flux"),
+        ] {
+            let source = tmp.join(format!("source-{index}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join(file_name), b"checkpoint").unwrap();
+
+            let manifest = store
+                .import_path(&source, &format!("checkpoint-{index}"))
+                .unwrap();
+
+            assert_eq!(manifest.format, ModelFormat::SafeTensors);
+            assert_eq!(
+                manifest.metadata.repository_layout,
+                RepositoryLayout::SingleFile
+            );
+            assert_eq!(manifest.metadata.family.as_deref(), Some(family));
+            assert_eq!(
+                manifest.metadata.tasks,
+                vec![InferenceTask::ImageGeneration]
+            );
+            assert_eq!(
+                manifest.metadata.input_modalities,
+                vec![InputModality::Text]
+            );
+            assert_eq!(
+                manifest.metadata.output_modalities,
+                vec![OutputModality::Image]
+            );
+            assert_eq!(manifest.metadata.compatible_runtimes, expected_runtimes);
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn transformers_audio_tags_do_not_fall_back_to_text_generation() {
+        let tmp = test_dir("transformers-audio-tasks");
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let expected_runtimes = vec![
+            "media-companion-cuda".to_string(),
+            "media-companion-rocm".to_string(),
+            "media-companion-metal".to_string(),
+            "media-companion-cpu".to_string(),
+        ];
+
+        let audiogen_source = tmp.join("audiogen");
+        fs::create_dir_all(&audiogen_source).unwrap();
+        fs::write(
+            audiogen_source.join("config.json"),
+            r#"{
+                "model_type":"audiogen",
+                "architectures":["AudioGenForConditionalGeneration"],
+                "pipeline_tag":"text-to-audio"
+            }"#,
+        )
+        .unwrap();
+        fs::write(audiogen_source.join("model.safetensors"), b"weights").unwrap();
+        let audiogen = store
+            .import_path(&audiogen_source, "generic-audio-model")
+            .unwrap();
+
+        assert_eq!(
+            audiogen.metadata.repository_layout,
+            RepositoryLayout::Transformers
+        );
+        assert!(
+            audiogen
+                .metadata
+                .tasks
+                .contains(&InferenceTask::AudioGeneration)
+        );
+        assert!(
+            !audiogen
+                .metadata
+                .tasks
+                .contains(&InferenceTask::TextGeneration)
+        );
+        assert_eq!(audiogen.metadata.compatible_runtimes, expected_runtimes);
+
+        let musicgen_source = tmp.join("musicgen");
+        fs::create_dir_all(&musicgen_source).unwrap();
+        fs::write(
+            musicgen_source.join("config.json"),
+            r#"{"model_type":"musicgen","pipeline_tag":"text-to-audio"}"#,
+        )
+        .unwrap();
+        fs::write(musicgen_source.join("model.safetensors"), b"weights").unwrap();
+        let musicgen = store
+            .import_path(&musicgen_source, "generic-music-model")
+            .unwrap();
+
+        assert!(
+            musicgen
+                .metadata
+                .tasks
+                .contains(&InferenceTask::AudioGeneration)
+        );
+        assert!(
+            musicgen
+                .metadata
+                .tasks
+                .contains(&InferenceTask::MusicGeneration)
+        );
+        assert!(
+            !musicgen
+                .metadata
+                .tasks
+                .contains(&InferenceTask::TextGeneration)
+        );
+        assert_eq!(musicgen.metadata.compatible_runtimes, expected_runtimes);
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn diffusers_repository_detects_layout_components_and_image_task() {
+        let tmp = test_dir("diffusers-components");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("scheduler")).unwrap();
+        fs::create_dir_all(source.join("transformer")).unwrap();
+        fs::create_dir_all(source.join("vae")).unwrap();
+        fs::create_dir_all(source.join("text_encoder")).unwrap();
+        fs::create_dir_all(source.join("tokenizer")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            r#"{"_class_name":"FluxPipeline","_diffusers_version":"0.33.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("scheduler/scheduler_config.json"),
+            r#"{"prediction_type":"epsilon","beta_schedule":"scaled_linear"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("transformer/config.json"),
+            r#"{"_class_name":"FluxTransformer2DModel","torch_dtype":"float16"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("transformer/diffusion_pytorch_model.fp16.safetensors"),
+            b"transformer",
+        )
+        .unwrap();
+        fs::write(
+            source.join("vae/config.json"),
+            r#"{"_class_name":"AutoencoderKL"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("vae/diffusion_pytorch_model.fp16.safetensors"),
+            b"vae",
+        )
+        .unwrap();
+        fs::write(
+            source.join("text_encoder/model.fp16.safetensors"),
+            b"text encoder",
+        )
+        .unwrap();
+        fs::write(source.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "flux-dev").unwrap();
+
+        assert_eq!(
+            manifest.metadata.repository_layout,
+            RepositoryLayout::Diffusers
+        );
+        assert_eq!(manifest.metadata.family.as_deref(), Some("flux"));
+        assert!(
+            manifest
+                .architecture
+                .as_deref()
+                .is_some_and(|architecture| architecture.contains("flux"))
+        );
+        assert!(
+            manifest
+                .metadata
+                .tasks
+                .contains(&InferenceTask::ImageGeneration)
+        );
+        assert_eq!(
+            manifest.metadata.input_modalities,
+            vec![InputModality::Text]
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Image]
+        );
+        assert_eq!(manifest.metadata.precision.as_deref(), Some("fp16"));
+        assert!(manifest.model_path.is_none());
+        for kind in [
+            ModelComponentKind::Scheduler,
+            ModelComponentKind::Transformer,
+            ModelComponentKind::Vae,
+            ModelComponentKind::TextEncoder,
+            ModelComponentKind::Tokenizer,
+        ] {
+            assert!(
+                manifest
+                    .metadata
+                    .components
+                    .iter()
+                    .any(|component| component.kind == kind),
+                "missing component {kind:?}"
+            );
+        }
+        assert_eq!(
+            manifest.metadata.generation_defaults.get("prediction_type"),
+            Some(&Value::String("epsilon".to_string()))
+        );
+        let persisted: Value = serde_json::from_str(
+            &fs::read_to_string(store.model_dir("flux-dev").join(MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["schema_version"], CURRENT_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(persisted["repository_layout"], "diffusers");
+        assert!(persisted.get("metadata").is_none());
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn diffusers_inpaint_pipeline_resolves_editing_and_inpainting_tasks() {
+        let tmp = test_dir("diffusers-inpaint-task");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("unet")).unwrap();
+        fs::create_dir_all(source.join("vae")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            r#"{"_class_name":"StableDiffusionXLInpaintPipeline"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("unet/diffusion_pytorch_model.safetensors"),
+            b"unet",
+        )
+        .unwrap();
+        fs::write(
+            source.join("vae/diffusion_pytorch_model.safetensors"),
+            b"vae",
+        )
+        .unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "sdxl-inpaint").unwrap();
+
+        assert_eq!(
+            manifest.metadata.repository_layout,
+            RepositoryLayout::Diffusers
+        );
+        assert_eq!(
+            manifest.metadata.family.as_deref(),
+            Some("stable-diffusion-xl")
+        );
+        assert!(
+            manifest
+                .metadata
+                .tasks
+                .contains(&InferenceTask::ImageEditing)
+        );
+        assert!(
+            manifest
+                .metadata
+                .tasks
+                .contains(&InferenceTask::ImageInpainting)
+        );
+        assert!(
+            manifest
+                .metadata
+                .input_modalities
+                .contains(&InputModality::Image)
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Image]
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn diffusers_image_to_video_pipeline_resolves_modalities() {
+        let tmp = test_dir("diffusers-image-to-video-task");
+        let source = tmp.join("source");
+        fs::create_dir_all(source.join("unet")).unwrap();
+        fs::create_dir_all(source.join("vae")).unwrap();
+        fs::write(
+            source.join("model_index.json"),
+            r#"{"_class_name":"StableVideoDiffusionPipeline"}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("unet/diffusion_pytorch_model.safetensors"),
+            b"unet",
+        )
+        .unwrap();
+        fs::write(
+            source.join("vae/diffusion_pytorch_model.safetensors"),
+            b"vae",
+        )
+        .unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let manifest = store.import_path(&source, "stable-video-i2v").unwrap();
+
+        assert!(
+            manifest
+                .metadata
+                .tasks
+                .contains(&InferenceTask::ImageToVideo)
+        );
+        assert!(
+            manifest
+                .metadata
+                .input_modalities
+                .contains(&InputModality::Text)
+        );
+        assert!(
+            manifest
+                .metadata
+                .input_modalities
+                .contains(&InputModality::Image)
+        );
+        assert_eq!(
+            manifest.metadata.output_modalities,
+            vec![OutputModality::Video]
         );
 
         let _ = fs::remove_dir_all(tmp);
@@ -2795,6 +4645,133 @@ mod tests {
             manifest.model_path.as_deref(),
             Some("files/model.Q4_0.gguf")
         );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn set_model_file_preserves_curated_metadata_and_refreshes_selection_fields() {
+        let tmp = test_dir("selection-metadata-merge");
+        let source = tmp.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("config.json"),
+            r#"{
+                "model_type":"llama",
+                "torch_dtype":"float16",
+                "temperature":0.7,
+                "max_position_embeddings":2048
+            }"#,
+        )
+        .unwrap();
+        fs::write(source.join("model.fp16.safetensors"), b"safe").unwrap();
+        fs::write(source.join("model.Q4_K_M.gguf"), b"gguf").unwrap();
+
+        let store = ModelStore::resolve(Some(tmp.join("store"))).unwrap();
+        let mut manifest = store.import_path(&source, "curated-mixed").unwrap();
+        assert_eq!(manifest.format, ModelFormat::Gguf);
+        assert_eq!(manifest.metadata.quantization.as_deref(), Some("q4_k_m"));
+
+        manifest
+            .metadata
+            .tasks
+            .push(InferenceTask::AudioEnhancement);
+        manifest
+            .metadata
+            .generation_defaults
+            .insert("temperature".to_string(), Value::from(0.2));
+        manifest.metadata.generation_defaults.insert(
+            "curated.prompt_prefix".to_string(),
+            Value::String("studio".to_string()),
+        );
+        manifest
+            .metadata
+            .parameter_constraints
+            .insert("max_position_embeddings".to_string(), Value::from(4096));
+        manifest
+            .metadata
+            .parameter_constraints
+            .insert("curated.max_duration".to_string(), Value::from(90));
+        manifest.metadata.components.push(ModelComponent::new(
+            ModelComponentKind::Adapter,
+            "files/custom",
+        ));
+        manifest.metadata.precision = Some("bf16".to_string());
+        manifest.metadata.quantization = Some("curated-quantization".to_string());
+        manifest.metadata.compatible_runtimes = vec!["stale-runtime".to_string()];
+        store.write_manifest(&manifest).unwrap();
+
+        let selected = store
+            .set_model_file("curated-mixed", "model.fp16.safetensors")
+            .unwrap();
+
+        assert_eq!(selected.format, ModelFormat::SafeTensors);
+        assert_eq!(
+            selected.metadata.repository_layout,
+            RepositoryLayout::Transformers
+        );
+        assert_eq!(selected.metadata.precision.as_deref(), Some("fp16"));
+        assert_eq!(selected.metadata.quantization, None);
+        assert!(
+            selected
+                .metadata
+                .tasks
+                .contains(&InferenceTask::TextGeneration)
+        );
+        assert!(
+            selected
+                .metadata
+                .tasks
+                .contains(&InferenceTask::AudioEnhancement)
+        );
+        assert!(
+            selected
+                .metadata
+                .output_modalities
+                .contains(&OutputModality::Audio)
+        );
+        assert_eq!(
+            selected.metadata.generation_defaults.get("temperature"),
+            Some(&Value::from(0.2))
+        );
+        assert_eq!(
+            selected
+                .metadata
+                .generation_defaults
+                .get("curated.prompt_prefix"),
+            Some(&Value::String("studio".to_string()))
+        );
+        assert_eq!(
+            selected
+                .metadata
+                .parameter_constraints
+                .get("max_position_embeddings"),
+            Some(&Value::from(4096))
+        );
+        assert_eq!(
+            selected
+                .metadata
+                .parameter_constraints
+                .get("curated.max_duration"),
+            Some(&Value::from(90))
+        );
+        assert!(selected.metadata.components.iter().any(|component| {
+            component.kind == ModelComponentKind::Adapter && component.path == "files/custom"
+        }));
+        assert_eq!(
+            selected.metadata.compatible_runtimes,
+            vec![
+                "vllm-cuda",
+                "vllm-rocm",
+                "transformers",
+                "candle-cuda",
+                "candle-metal",
+                "candle-cpu",
+            ]
+        );
+
+        let persisted = store.get("curated-mixed").unwrap();
+        assert_eq!(persisted.metadata, selected.metadata);
 
         let _ = fs::remove_dir_all(tmp);
     }

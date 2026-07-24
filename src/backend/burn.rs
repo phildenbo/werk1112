@@ -311,8 +311,7 @@ impl BurnBackend {
     }
 
     fn prepare_model(&self, manifest: &ModelManifest) -> Result<BurnPreparedModel> {
-        Self::probe(&self.store, manifest, self.mode)
-            .map_err(|err| anyhow!("{}", err.to_string()))?;
+        Self::probe(&self.store, manifest, self.mode).map_err(|err| anyhow!("{err}"))?;
 
         let tokenizer = load_tokenizer(&self.store, manifest)?;
         let prompt_smoke = prompt_smoke(manifest, &tokenizer)?;
